@@ -1430,10 +1430,8 @@ mod tests {
         assert_eq!(sanitized_raw.Format, DXGI_FORMAT_R32_TYPELESS);
         assert_eq!(sanitized_raw.ViewDimension, D3D12_UAV_DIMENSION_BUFFER);
         // SAFETY: ViewDimension is BUFFER.
-        assert_eq!(
-            unsafe { sanitized_raw.Anonymous.Buffer.CounterOffsetInBytes },
-            0
-        );
+        let counter_offset = unsafe { sanitized_raw.Anonymous.Buffer.CounterOffsetInBytes };
+        assert_eq!(counter_offset, 0);
         assert!(make_on(
             &device,
             &View::Unordered(0, 0, Some(raw_uav_words)),
@@ -1476,10 +1474,8 @@ mod tests {
         let sanitized_raw_srv = sanitize_null_srv(srv_desc(&raw_srv_words));
         assert_eq!(sanitized_raw_srv.Format, DXGI_FORMAT_R32_TYPELESS);
         // SAFETY: ViewDimension is BUFFER.
-        assert_eq!(
-            unsafe { sanitized_raw_srv.Anonymous.Buffer.Flags },
-            D3D12_BUFFER_SRV_FLAG_RAW
-        );
+        let srv_flags = unsafe { sanitized_raw_srv.Anonymous.Buffer.Flags };
+        assert_eq!(srv_flags, D3D12_BUFFER_SRV_FLAG_RAW);
         assert!(make_on(
             &device,
             &View::Shader(0, Some(raw_srv_words)),
