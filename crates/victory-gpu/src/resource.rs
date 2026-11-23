@@ -788,6 +788,54 @@ pub(crate) fn host_resource<'a>(
     resource(this).host.as_ref()
 }
 
+/// Whether `format` is a 16-bit packed color format (`B5G6R5_UNORM`,
+/// `B5G5R5A1_UNORM`, `B4G4R4A4_UNORM`) that console GPUs allow as render
+/// targets / UAVs but many PC D3D12 devices reject for RT/UAV usage.
+#[cfg(windows)]
+pub(crate) fn is_packed_16bit_color(format: u32) -> bool {
+    matches!(format, 85 | 86 | 115)
+}
+
+/// Maps `format` to a host-supported DXGI format for `flags` using the host
+/// device's `D3D12_FEATURE_FORMAT_SUPPORT`. Unsupported GPU-written (`RT`/
+/// `UAV`) 16-bit packed color formats are promoted consistently to
+/// `DXGI_FORMAT_B8G8R8A8_UNORM (87)`; SRV-only textures stay native when
+/// supported.
+#[cfg(windows)]
+pub(crate) fn host_format_for(host: &crate::host::Host, format: u32, flags: u32) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let f = pc_format(format);
+    if !is_packed_16bit_color(f) {
+        return f;
+    }
+    const RENDER_TARGET: u32 = 1;
+    const UNORDERED: u32 = 4;
+    let (s1, _) = host.format_support(DXGI_FORMAT(f as i32));
+    let required = if flags & (RENDER_TARGET | UNORDERED) != 0 {
+        D3D12_FORMAT_SUPPORT1_TEXTURE2D.0
+            | D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+            | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0
+    } else {
+        D3D12_FORMAT_SUPPORT1_TEXTURE2D.0 | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE.0
+    };
+    if s1.0 & required == required {
+        f
+    } else {
+        87 // DXGI_FORMAT_B8G8R8A8_UNORM
+    }
+}
+
+/// Render-target format matching [`host_format_for`] for graphics PSO
+/// `RTVFormats`.
+#[cfg(windows)]
+pub(crate) fn host_rt_format(format: u32) -> u32 {
+    match crate::host::host() {
+        Some(host) => host_format_for(host, format, 1 | 4),
+        None => pc_format(format),
+    }
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -815,7 +863,18 @@ fn host_texture(
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    let title_format = pc_format(d.format);
+    d.format = host_format_for(host, d.format, d.flags);
+    if d.format != title_format {
+        tracing::debug!(
+            from = title_format,
+            to = d.format,
+            flags = d.flags,
+            width = d.width,
+            height = d.height,
+            "promoted unsupported 16-bit texture format on host"
+        );
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -832,7 +891,7 @@ fn host_texture(
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = host_format_for(host, value[0], d.flags);
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {
@@ -860,7 +919,10 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture
@@ -931,7 +993,9 @@ fn hand_out_resource(
         #[cfg(windows)]
         host_state: host
             .as_ref()
-            .map_or(0, |t| crate::host::legal_state(t, crate::host::texture_state(state)))
+            .map_or(0, |t| {
+                crate::host::legal_state(t, crate::host::texture_state(state))
+            })
             .into(),
         #[cfg(windows)]
         host,
@@ -1812,5 +1876,105 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn unsupported_16bit_rt_uav_textures_promote_consistently() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let heap = crate::descriptor::host::HostHeap::new_capped_for_test(
+            host_gpu.device.clone(),
+            16,
+            16,
+            4,
+        )
+        .expect("host heap");
+
+        // Formats & flags observed failing CreateCommittedResource with 0x80070057:
+        // 86 (B5G5R5A1_UNORM, RT|UAV) and 115 (B4G4R4A4_UNORM, RT).
+        for (format, flags) in [(86u32, 5u32), (115u32, 1u32)] {
+            let desc = ResourceDesc {
+                dimension: 3, // TEXTURE2D
+                alignment: 0,
+                width: 64,
+                height: 64,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format,
+                sample_count: 1,
+                sample_quality: 0,
+                layout: 0,
+                flags,
+            };
+            let clear = [format, 0, 0, 0, 0x3f80_0000];
+            let mut tex: This = std::ptr::null();
+            let hr = create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                clear.as_ptr().cast(),
+                &RESOURCE_IIDS[0],
+                &mut tex,
+            );
+            assert_eq!(hr, S_OK);
+            let host_tex = host_resource(tex).expect("16-bit RT/UAV texture must get a host copy");
+            // SAFETY: live texture.
+            let actual_fmt = unsafe { host_tex.GetDesc() }.Format.0 as u32;
+            assert_eq!(
+                actual_fmt,
+                host_rt_format(format),
+                "PSO RTFormat must match promoted host texture format"
+            );
+
+            // Explicit RTV with title's original 16-bit format must succeed cleanly.
+            let mut rtv_slot = [0u8; 128];
+            let rtv_desc = [format, 4, 0, 0, 0, 0]; // TEXTURE2D
+            crate::descriptor::create_rtv(
+                std::ptr::null(),
+                tex,
+                &rtv_desc,
+                rtv_slot.as_mut_ptr() as u64,
+            );
+            let record = crate::descriptor::rtv_record(rtv_slot.as_ptr() as u64).unwrap();
+            let _ = host_gpu.rtv(host_tex, record.desc().as_ref());
+
+            // Explicit SRV with title's original 16-bit format must succeed without null fallback.
+            // Layout: [0]=Format, [1]=ViewDimension, [2]=Mapping, [3]=pad,
+            // [4]=MostDetailedMip, [5]=MipLevels.
+            let srv_words = [
+                format,
+                4, // TEXTURE2D
+                windows::Win32::Graphics::Direct3D12::D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                0, // MostDetailedMip
+                1, // MipLevels
+                0,
+                0,
+                0,
+                0,
+            ];
+            heap.make_at(
+                0,
+                &crate::descriptor::View::Shader(tex as usize, Some(srv_words)),
+            );
+            if flags & 4 != 0 {
+                let uav_words = [format, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+                heap.make_at(
+                    1,
+                    &crate::descriptor::View::Unordered(tex as usize, 0, Some(uav_words)),
+                );
+            }
+            assert!(
+                heap.stats().contains("null_fallbacks=0"),
+                "promoted 16-bit views must not fall back to null: {}",
+                heap.stats()
+            );
+            crate::host::assert_no_debug_errors(&host_gpu.device);
+            assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
+        }
     }
 }

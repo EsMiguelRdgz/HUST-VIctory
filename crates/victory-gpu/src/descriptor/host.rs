@@ -547,7 +547,15 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
+    let (addr, len, _) = buffer_access(view)?;
+    Some((addr, len))
+}
+
+/// The title memory range and element alignment `(address, len, element_size)`
+/// of a buffer SRV/UAV view.
+pub(crate) fn buffer_access(view: &View) -> Option<(u64, u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => (
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
@@ -559,26 +567,30 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         ),
         View::Unordered(r, _, Some(desc)) => {
             let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
-            return unordered_range(base, desc);
+            return unordered_access(base, desc);
         }
         View::Placed(true, resource, desc) if resource[0] == 1 => {
             let base = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            return unordered_range(base, desc[..10].try_into().ok()?);
+            return unordered_access(base, desc[..10].try_into().ok()?);
         }
         _ => return None,
     };
     let desc = srv_desc(words);
     let element = element_size(&desc);
+    if element == 0 {
+        return None;
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
     Some((
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
+        element,
     ))
 }
 
-/// [`buffer_range`] of an unordered access view of memory at `base`.
-fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
+/// [`buffer_access`] of an unordered access view of memory at `base`.
+fn unordered_access(base: u64, words: &[u32; 10]) -> Option<(u64, u64, u64)> {
     let desc = uav_desc(words);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
@@ -589,9 +601,13 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
+    if element == 0 {
+        return None;
+    }
     Some((
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
+        element,
     ))
 }
 
@@ -602,14 +618,23 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> bool {
-    let Some(shadow) = crate::shadow::find(address, len) else {
-        return false;
-    };
     let element = element_size(&desc);
+    if element == 0 {
+        once!(element, "buffer view with zero element size");
+        return false;
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let view_end = buffer
+        .FirstElement
+        .saturating_add(u64::from(buffer.NumElements))
+        .saturating_mul(element);
+    let needed = len.max(view_end).max(element);
+    let Some(shadow) = crate::shadow::find_aligned(address, needed, element) else {
+        return false;
+    };
     let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
+    if !offset.is_multiple_of(element) {
         once!(
             offset,
             element,
@@ -635,15 +660,6 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> bool {
-    let Some(shadow) = crate::shadow::find(address, len) else {
-        return false;
-    };
-    // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        once!("unordered access to a buffer whose host copy shaders cannot write");
-        return false;
-    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -653,8 +669,26 @@ fn buffer_uav(
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
+    if element == 0 {
+        once!(element, "unordered buffer view with zero element size");
+        return false;
+    }
+    let view_end = buffer
+        .FirstElement
+        .saturating_add(u64::from(buffer.NumElements))
+        .saturating_mul(element);
+    let needed = len.max(view_end).max(element);
+    let Some(shadow) = crate::shadow::find_aligned(address, needed, element) else {
+        return false;
+    };
+    // SAFETY: a live buffer.
+    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        once!("unordered access to a buffer whose host copy shaders cannot write");
+        return false;
+    }
     let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
+    if !offset.is_multiple_of(element) {
         once!(
             offset,
             element,
@@ -712,12 +746,13 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
-    if family(view) != family(own) {
+    let promoted_16bit = own == 87 && crate::resource::is_packed_16bit_color(view);
+    if family(view) != family(own) && !promoted_16bit {
         once!(view, own, "view format of another family");
         return false;
     }
     if let Some(format) = format
-        && !typeless
+        && (!typeless || promoted_16bit)
     {
         *format = d.Format;
     }
@@ -1521,5 +1556,75 @@ mod tests {
         // SAFETY: plain device health check.
         assert!(unsafe { device.GetDeviceRemovedReason() }.is_ok());
         crate::host::assert_no_debug_errors(&device);
+    }
+
+    #[test]
+    fn misaligned_structured_buffer_srv_and_uav_succeed_via_aligned_shadow() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let heap =
+            HostHeap::new_capped_for_test(host_gpu.device.clone(), 16, 16, 4).expect("host heap");
+
+        // Backing title buffer of 64 KiB; create structured buffer views at
+        // offset 16 with element stride 32 (16 % 32 != 0, matching console.txt).
+        let backing = vec![0x5Au8; 64 * 1024];
+        let base = backing.as_ptr() as u64;
+        let fake_res_id = (base as usize) ^ 0xDEAD_BEEF;
+        crate::shadow::register(fake_res_id, base, backing.len() as u64);
+
+        let view_addr = base + 16;
+        let mut res_desc = [0u32; 14];
+        res_desc[0] = 1; // BUFFER
+        res_desc[4] = 4096; // width low
+
+        // Placed structured SRV: FirstElement=2, NumElements=32, StructureByteStride=32.
+        let mut srv_desc_words = [0u32; 16];
+        srv_desc_words[0] = DXGI_FORMAT_UNKNOWN.0 as u32;
+        srv_desc_words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        srv_desc_words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc_words[4] = 2; // FirstElement low
+        srv_desc_words[6] = 32; // NumElements
+        srv_desc_words[7] = 32; // StructureByteStride
+        srv_desc_words[10] = view_addr as u32;
+        srv_desc_words[11] = (view_addr >> 32) as u32;
+        let srv_view = View::Placed(false, res_desc, srv_desc_words);
+
+        // Placed structured UAV: FirstElement=2, NumElements=32, StructureByteStride=32.
+        let mut uav_desc_words = [0u32; 16];
+        uav_desc_words[0] = DXGI_FORMAT_UNKNOWN.0 as u32;
+        uav_desc_words[1] = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
+        uav_desc_words[2] = 2; // FirstElement low
+        uav_desc_words[4] = 32; // NumElements
+        uav_desc_words[5] = 32; // StructureByteStride
+        uav_desc_words[10] = view_addr as u32;
+        uav_desc_words[11] = (view_addr >> 32) as u32;
+        let uav_view = View::Placed(true, res_desc, uav_desc_words);
+
+        assert!(
+            make_on(&host_gpu.device, &srv_view, heap.cpu(0)),
+            "misaligned structured buffer SRV must succeed via aligned shadow"
+        );
+        assert!(
+            make_on(&host_gpu.device, &uav_view, heap.cpu(1)),
+            "misaligned structured buffer UAV must succeed via aligned shadow"
+        );
+
+        let (srv_start, srv_len, srv_align) = buffer_access(&srv_view).expect("buffer access");
+        assert_eq!(
+            (srv_start, srv_len, srv_align),
+            (view_addr + 64, 32 * 32, 32)
+        );
+        let base_shadow = crate::shadow::find_aligned(view_addr, 4096, 32).expect("base aligned");
+        let range_shadow =
+            crate::shadow::find_aligned(srv_start, srv_len, srv_align).expect("range aligned");
+        assert_eq!(base_shadow.offset(view_addr) % 32, 0);
+        assert!(
+            std::sync::Arc::ptr_eq(&base_shadow, &range_shadow),
+            "descriptor creation and draw::readable must resolve to the same aligned shadow"
+        );
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+
+        crate::shadow::unregister(fake_res_id, base);
     }
 }

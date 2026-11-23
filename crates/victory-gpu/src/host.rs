@@ -1490,6 +1490,7 @@ impl Host {
             }
         }
         let state = D3D12_RESOURCE_STATES(state as i32);
+        let need_src_transition = state != D3D12_RESOURCE_STATE_COPY_SOURCE;
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -1498,14 +1499,16 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            let mut before = Vec::with_capacity(2);
+            if need_src_transition {
+                before.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            }
+            before.push(transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ));
+            list.ResourceBarrier(&before);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -1515,14 +1518,16 @@ impl Host {
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let mut after = Vec::with_capacity(2);
+            if need_src_transition {
+                after.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+            }
+            after.push(transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            ));
+            list.ResourceBarrier(&after);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]

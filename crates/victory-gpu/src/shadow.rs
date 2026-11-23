@@ -309,6 +309,53 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Dedicated aligned copies for buffer views whose offset inside their
+/// enclosing title buffer is not a multiple of their element stride, keyed by
+/// `(start, len)`.
+static ALIGNED: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// Returns a host copy holding `[address, address + len)` whose offset for
+/// `address` is a multiple of `align` (required for structured/typed buffer
+/// views whose `FirstElement` cannot express sub-element byte offsets).
+/// Uses the enclosing buffer shadow on the fast path when already aligned.
+pub(crate) fn find_aligned(address: u64, len: u64, align: u64) -> Option<Arc<Shadow>> {
+    let shadow = find(address, len)?;
+    if align <= 1 || shadow.offset(address).is_multiple_of(align) {
+        return Some(shadow);
+    }
+    let end = address.checked_add(len.max(1))?;
+    let mut map = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = map
+        .range(..=(address, u64::MAX))
+        .rev()
+        .take(32)
+        .find(|&(&(start, slen), _)| {
+            start <= address
+                && start.saturating_add(slen) >= end
+                && (address - start).is_multiple_of(align)
+        })
+        .map(|(_, s)| s.clone())
+    {
+        return Some(existing);
+    }
+    let bytes = len.max(align).next_multiple_of(1 << 16);
+    let (buffer, data) = host()?.shared_buffer(bytes)?;
+    crate::host::name(&buffer, || {
+        format!("aligned buffer {address:#x}+{bytes:#x} (align {align})")
+    });
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    tracing::debug!(
+        start = format_args!("{address:#x}"),
+        len = bytes,
+        align,
+        "aligned sub-buffer shadow created"
+    );
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, bytes));
+    map.insert((address, bytes), shadow.clone());
+    Some(shadow)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
@@ -339,6 +386,13 @@ pub(crate) fn near(va: u64) -> String {
         .collect();
     all.extend(
         LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|s| (s.gpu, s.start, s.len)),
+    );
+    all.extend(
+        ALIGNED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()

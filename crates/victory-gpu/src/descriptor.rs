@@ -244,6 +244,13 @@ impl RtvRecord {
             ]
         };
         words[0] = crate::resource::pc_format(words[0]);
+        if crate::resource::is_packed_16bit_color(words[0])
+            && let Some(tex) = crate::resource::host_resource(self.resource)
+            // SAFETY: a live host texture.
+            && unsafe { tex.GetDesc() }.Format.0 as u32 == 87
+        {
+            words[0] = 87;
+        }
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
