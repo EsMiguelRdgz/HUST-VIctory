@@ -290,6 +290,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
         }
+        text.push_str(&format!("; host caps: {}", host.caps.summary()));
+        let heaps = crate::descriptor::shader_heap_stats();
+        if !heaps.is_empty() {
+            text.push_str(&format!("; descriptor heaps: {heaps}"));
+        }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => {
@@ -366,6 +371,7 @@ fn create() -> windows::core::Result<Host> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
+        name(&queue, || "victory direct queue".to_owned());
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -544,8 +550,10 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         // SAFETY: plain object creation.
         unsafe {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let allocator: ID3D12CommandAllocator = self
                 .device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
@@ -555,6 +563,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
+            name(&list, || format!("victory list #{id}"));
             let prelude_allocator: ID3D12CommandAllocator = self
                 .device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
@@ -564,6 +573,7 @@ impl Host {
                 &prelude_allocator,
                 None,
             )?;
+            name(&prelude, || format!("victory prelude #{id}"));
             prelude.Close()?;
             Ok(HostList {
                 allocator,
@@ -671,7 +681,38 @@ impl Host {
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
         unsafe {
+            let mut fault_reported = false;
             if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+                && fault.PageFaultVA != 0
+            {
+                fault_reported = true;
+                let va = fault.PageFaultVA;
+                text.push_str(&format!("; page fault at {va:#x}"));
+                for (what, head) in [
+                    ("inside", fault.pHeadExistingAllocationNode),
+                    ("inside freed", fault.pHeadRecentFreedAllocationNode),
+                ] {
+                    let mut names = Vec::new();
+                    let mut node = head;
+                    while let Some(n) = node.as_ref()
+                        && names.len() < 8
+                    {
+                        let name = if n.ObjectNameW.is_null() {
+                            "unnamed".to_owned()
+                        } else {
+                            n.ObjectNameW.to_string().unwrap_or_default()
+                        };
+                        names.push(format!("{name} (type {})", n.AllocationType.0));
+                        node = n.pNext;
+                    }
+                    if !names.is_empty() {
+                        text.push_str(&format!("; {what} {names:?}"));
+                    }
+                }
+                text.push_str(&crate::shadow::near(va));
+            }
+            if !fault_reported
+                && let Ok(fault) = dred.GetPageFaultAllocationOutput()
                 && fault.PageFaultVA != 0
             {
                 let va = fault.PageFaultVA;
@@ -710,9 +751,17 @@ impl Host {
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                    let list_name = if p.pCommandListDebugNameW.is_null() {
+                        "unnamed".to_owned()
+                    } else {
+                        p.pCommandListDebugNameW.to_string().unwrap_or_default()
+                    };
+                    let op = history[done as usize];
                     text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
+                        "; list \"{list_name}\" stopped at command {done} of {} ({} [op {}])",
+                        p.BreadcrumbCount,
+                        breadcrumb_op_name(op),
+                        op.0
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
@@ -1715,6 +1764,39 @@ fn last_notes(runs: &[&HostList]) -> String {
     }
 }
 
+/// Human-readable name for a D3D12 auto-breadcrumb opcode.
+pub(crate) fn breadcrumb_op_name(op: D3D12_AUTO_BREADCRUMB_OP) -> &'static str {
+    match op {
+        D3D12_AUTO_BREADCRUMB_OP_SETMARKER => "SetMarker",
+        D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT => "BeginEvent",
+        D3D12_AUTO_BREADCRUMB_OP_ENDEVENT => "EndEvent",
+        D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED => "DrawInstanced",
+        D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED => "DrawIndexedInstanced",
+        D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT => "ExecuteIndirect",
+        D3D12_AUTO_BREADCRUMB_OP_DISPATCH => "Dispatch",
+        D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION => "CopyBufferRegion",
+        D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION => "CopyTextureRegion",
+        D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE => "CopyResource",
+        D3D12_AUTO_BREADCRUMB_OP_COPYTILES => "CopyTiles",
+        D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE => "ResolveSubresource",
+        D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW => "ClearRenderTargetView",
+        D3D12_AUTO_BREADCRUMB_OP_CLEARUNORDEREDACCESSVIEW => "ClearUnorderedAccessView",
+        D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW => "ClearDepthStencilView",
+        D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER => "ResourceBarrier",
+        D3D12_AUTO_BREADCRUMB_OP_EXECUTEBUNDLE => "ExecuteBundle",
+        D3D12_AUTO_BREADCRUMB_OP_PRESENT => "Present",
+        D3D12_AUTO_BREADCRUMB_OP_RESOLVEQUERYDATA => "ResolveQueryData",
+        D3D12_AUTO_BREADCRUMB_OP_BEGINSUBMISSION => "BeginSubmission",
+        D3D12_AUTO_BREADCRUMB_OP_ENDSUBMISSION => "EndSubmission",
+        D3D12_AUTO_BREADCRUMB_OP_DISPATCHRAYS => "DispatchRays",
+        D3D12_AUTO_BREADCRUMB_OP_BUILDRAYTRACINGACCELERATIONSTRUCTURE => {
+            "BuildRaytracingAccelerationStructure"
+        }
+        D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH => "DispatchMesh",
+        _ => "UnknownOp",
+    }
+}
+
 /// The commands that may have been running where a list stopped at
 /// command `done`: those between the barriers around it (work between
 /// barriers overlaps on the GPU), by kind, and what the markers just
@@ -1747,7 +1829,11 @@ fn in_flight(
             .filter(|&m| history[m] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
             .and_then(|m| markers.iter().find(|(at, _)| *at as usize == m))
             .map_or("no marker", |(_, s)| s.as_str());
-        text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
+        text.push_str(&format!(
+            "; command {i} ({} [op {}]): {marker}",
+            breadcrumb_op_name(op),
+            op.0
+        ));
     }
     text
 }
@@ -1979,5 +2065,37 @@ mod tests {
         assert!(caps.warp);
         assert!(caps.supports_shader_model_6_6());
         assert!(caps.summary().contains("warp=true"));
+    }
+
+    #[test]
+    fn dred_breadcrumb_names_and_in_flight_formatting() {
+        assert_eq!(
+            breadcrumb_op_name(D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED),
+            "DrawIndexedInstanced"
+        );
+        assert_eq!(
+            breadcrumb_op_name(D3D12_AUTO_BREADCRUMB_OP_DISPATCH),
+            "Dispatch"
+        );
+        assert_eq!(
+            breadcrumb_op_name(D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH),
+            "DispatchMesh"
+        );
+        assert_eq!(
+            breadcrumb_op_name(D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER),
+            "ResourceBarrier"
+        );
+
+        let history = [
+            D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER,
+            D3D12_AUTO_BREADCRUMB_OP_SETMARKER,
+            D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED,
+            D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER,
+        ];
+        let markers = [(1, "indexed 36x1 [vertex vs, pixel ps]".to_owned())];
+        let report = in_flight(&history, &markers, 2);
+        assert!(report.contains("commands 1..3 between its barriers"));
+        assert!(report.contains("DrawIndexedInstanced [op 4]"));
+        assert!(report.contains("indexed 36x1 [vertex vs, pixel ps]"));
     }
 }

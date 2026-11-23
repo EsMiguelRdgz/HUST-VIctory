@@ -173,6 +173,21 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Compact summary of live shader-visible host heaps for DRED / GPU failure
+/// reports (bounded to at most 8 heaps).
+#[cfg(windows)]
+pub(crate) fn shader_heap_stats() -> String {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut parts = Vec::new();
+    for &(_, _, at) in heaps.iter().take(8) {
+        // SAFETY: registered heaps are live (removed when dropped).
+        if let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() {
+            parts.push(host.stats());
+        }
+    }
+    parts.join("; ")
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

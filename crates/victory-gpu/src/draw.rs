@@ -569,6 +569,27 @@ impl State {
                 }
             }
         }
+        if !compute && (!self.targets.is_empty() || self.depth != 0) {
+            let rts: Vec<String> = self
+                .targets
+                .iter()
+                .filter_map(|&t| crate::resource::host_resource(t as This))
+                .map(|t| {
+                    // SAFETY: a live host resource.
+                    let d = unsafe { t.GetDesc() };
+                    format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+                })
+                .collect();
+            let dsv = (self.depth != 0)
+                .then(|| crate::resource::host_resource(self.depth as This))
+                .flatten()
+                .map(|t| {
+                    // SAFETY: a live host resource.
+                    let d = unsafe { t.GetDesc() };
+                    format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+                });
+            let _ = write!(text, " rt={rts:?} dsv={dsv:?}");
+        }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         text
     }
