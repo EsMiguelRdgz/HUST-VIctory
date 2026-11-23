@@ -5,7 +5,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -419,6 +419,9 @@ pub(crate) struct HostList {
     states: Mutex<std::collections::HashMap<usize, (u32, u32)>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// Incremented whenever a deferred title-memory copy or write is recorded,
+    /// so cached fresh descriptor tables in `draw` do not reuse pre-copy CBVs.
+    copy_epoch: AtomicU64,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -466,8 +469,9 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    /// A copy of title memory into the list's own upload memory, with optional
+    /// zero-padding up to `padded` bytes (for 256-byte aligned CBV tails).
+    Fill(usize, usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -568,6 +572,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
+                copy_epoch: AtomicU64::new(0),
                 pipelines: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -942,6 +947,12 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Monotonic counter bumped whenever this list records a title-memory copy
+    /// or deferred CPU write.
+    pub(crate) fn copy_epoch(&self) -> u64 {
+        self.copy_epoch.load(Ordering::Relaxed)
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
@@ -949,14 +960,28 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.defer_fill_padded(dst, src, len, len);
+    }
+
+    /// Copies `len` bytes of title memory at `src` into upload memory at `dst`
+    /// and zero-fills `[len, padded)` so reused upload chunks never expose
+    /// stale tail bytes to constant buffer views.
+    pub(crate) fn defer_fill_padded(
+        &self,
+        dst: *mut u8,
+        src: *const u8,
+        len: usize,
+        padded: usize,
+    ) {
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+            .push(Step::Fill(dst as usize, src as usize, len, padded.max(len)));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -1047,6 +1072,7 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -1073,13 +1099,22 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                &Step::Fill(dst, src, len, padded) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    if len > 0 {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    }
+                    if padded > len {
+                        // SAFETY: `dst` points into our live mapped upload buffer
+                        // allocated with at least `padded` bytes.
+                        unsafe {
+                            std::ptr::write_bytes((dst as *mut u8).add(len), 0, padded - len);
+                        }
+                    }
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -1815,12 +1850,55 @@ fn pump() {
 pub(crate) fn warp_device() -> Option<ID3D12Device> {
     // SAFETY: creates an isolated WARP software adapter device for deterministic tests.
     unsafe {
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            let mut layer: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut layer).is_ok()
+                && let Some(l) = layer
+            {
+                l.EnableDebugLayer();
+            }
+        }
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
         let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
         let mut device: Option<ID3D12Device> = None;
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
         device
     }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_no_debug_errors(device: &ID3D12Device) {
+    let Ok(queue) = device.cast::<ID3D12InfoQueue>() else {
+        return;
+    };
+    let mut errors = Vec::new();
+    // SAFETY: reads stored D3D12 debug-layer messages into a sized buffer.
+    unsafe {
+        for i in 0..queue.GetNumStoredMessages() {
+            let mut size = 0;
+            if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u64; size.div_ceil(8)];
+            let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            if queue.GetMessage(i, Some(message), &mut size).is_ok() {
+                let m = &*message;
+                if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                    let text = String::from_utf8_lossy(bytes)
+                        .trim_end_matches('\0')
+                        .to_owned();
+                    errors.push(format!("[id={} sev={}] {text}", m.ID.0, m.Severity.0));
+                }
+            }
+        }
+        queue.ClearStoredMessages();
+    }
+    assert!(
+        errors.is_empty(),
+        "D3D12 Debug Layer reported errors:\n{}",
+        errors.join("\n")
+    );
 }
 
 #[cfg(test)]

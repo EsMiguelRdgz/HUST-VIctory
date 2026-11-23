@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -14,123 +15,274 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
+    device: ID3D12Device,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have [`DYNAMIC`] more.
+    /// Slots mirroring the title's; view heaps have `dynamic_count` more.
     count: u32,
+    /// Title's originally requested descriptor count (may exceed `count` when
+    /// capped to the host's shader-visible heap limit).
+    requested: u32,
+    /// Number of dynamic slots appended after `count` (0 for sampler heaps).
+    dynamic_count: u32,
+    /// Whether `count < requested` because the host capped the shader-visible
+    /// view heap.
+    capped: bool,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// Diagnostic counters for capped heap activity and fallbacks.
+    capped_mirrors: AtomicU64,
+    dynamic_exhausted: AtomicU64,
+    null_fallbacks: AtomicU64,
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
+/// tiers 1 and 2, and on drivers (such as NVIDIA) that enforce 1,000,000
+/// shader-visible CBV/SRV/UAV descriptors even on tier 3.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
-/// afresh (constant buffers copied per draw). A list holds the slots it
-/// took until it is reset (its submissions have run) or released.
+/// afresh (constant buffers copied per draw, and descriptor tables whose
+/// indices exceed a capped host heap). A list holds the slots it took
+/// until it is reset (its submissions have run) or released.
 const DYNAMIC: u32 = 1 << 16;
+
+/// Logs `what` the first time it happens.
+macro_rules! once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
+        Self::new_on_device(host.device.clone(), sampler, count, PORTABLE_VIEWS, DYNAMIC)
+    }
+
+    /// Creates a shader-visible host heap on `device`, capping view heaps at
+    /// `max_views` if `device` rejects `requested + dynamic_count` (or if
+    /// `force_cap` is true in tests).
+    fn new_on_device(
+        device: ID3D12Device,
+        sampler: bool,
+        requested: u32,
+        max_views: u32,
+        dynamic_slots: u32,
+    ) -> Option<Self> {
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
         } else {
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         };
-        let make = |count: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
+        let make = |num: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
             // SAFETY: plain heap creation.
             unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: kind,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: num,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
+        let extra = if sampler { 0 } else { dynamic_slots };
+        let desired = requested.saturating_add(extra);
+        let (heap, count, capped) = match make(desired) {
+            Ok(heap) => (heap, requested, false),
+            Err(e) if !sampler && desired > max_views && max_views > extra => {
+                let capped_count = max_views - extra;
+                tracing::warn!(
+                    error = %e,
+                    requested,
+                    host_limit = max_views,
+                    mirrored = capped_count,
+                    dynamic = extra,
+                    "host view heap capped; tables past mirrored limit will remap into dynamic slots"
+                );
+                (make(max_views).ok()?, capped_count, true)
             }
             Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                tracing::warn!(error = %e, requested, sampler, "no host descriptor heap");
                 return None;
             }
         };
+        Self::finish_init(device, heap, kind, sampler, requested, count, extra, capped)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_capped_for_test(
+        device: ID3D12Device,
+        requested: u32,
+        host_limit: u32,
+        dynamic_slots: u32,
+    ) -> Option<Self> {
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        assert!(host_limit > dynamic_slots);
+        // SAFETY: plain heap creation on the test device.
+        let heap = unsafe {
+            device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: host_limit,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .ok()?
+        };
+        let count = (host_limit - dynamic_slots).min(requested);
+        let capped = count < requested;
+        Self::finish_init(
+            device,
+            heap,
+            kind,
+            false,
+            requested,
+            count,
+            dynamic_slots,
+            capped,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_init(
+        device: ID3D12Device,
+        heap: ID3D12DescriptorHeap,
+        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+        sampler: bool,
+        requested: u32,
+        count: u32,
+        dynamic_count: u32,
+        capped: bool,
+    ) -> Option<Self> {
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
                 heap.GetCPUDescriptorHandleForHeapStart().ptr,
-                host.device.GetDescriptorHandleIncrementSize(kind),
+                device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
+        tracing::debug!(
+            count,
+            requested,
+            dynamic_count,
+            capped,
+            sampler,
+            "host descriptor heap"
+        );
         let h = HostHeap {
+            device,
             heap,
             cpu,
             step,
             count,
+            requested,
+            dynamic_count,
+            capped,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            next: Mutex::new((0, vec![false; dynamic_count as usize])),
+            capped_mirrors: AtomicU64::new(0),
+            dynamic_exhausted: AtomicU64::new(0),
+            null_fallbacks: AtomicU64::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, count + dynamic_count) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
-        tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        tracing::debug!(
+            ms = started.elapsed().as_millis(),
+            "host descriptor heap made null"
+        );
         Some(h)
+    }
+
+    /// Number of directly mirrored slots (`0..count`). View indices `>= count`
+    /// must be remapped into dynamic slots (`count..count + dynamic_count`).
+    pub(crate) fn count(&self) -> u32 {
+        self.count
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn requested(&self) -> u32 {
+        self.requested
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn capped(&self) -> bool {
+        self.capped
+    }
+
+    /// Number of dynamic slots currently held by in-flight command lists.
+    pub(crate) fn dynamic_in_use(&self) -> u32 {
+        let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        guard.1.iter().filter(|&&used| used).count() as u32
+    }
+
+    /// Concise summary of heap bounds and counters for diagnostics / DRED.
+    #[allow(dead_code)]
+    pub(crate) fn stats(&self) -> String {
+        format!(
+            "kind={} mirrored={} requested={} dynamic={}/{} capped={} capped_mirrors={} dynamic_exhausted={} null_fallbacks={}",
+            if self.sampler { "sampler" } else { "view" },
+            self.count,
+            self.requested,
+            self.dynamic_in_use(),
+            self.dynamic_count,
+            self.capped,
+            self.capped_mirrors.load(Ordering::Relaxed),
+            self.dynamic_exhausted.load(Ordering::Relaxed),
+            self.null_fallbacks.load(Ordering::Relaxed),
+        )
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
-        const BLOCK: u32 = 1 << 16;
-        let Some(host) = host() else { return Ok(()) };
+        if total == 0 {
+            return Ok(());
+        }
+        let block_size = total.min(1 << 16);
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
-                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: BLOCK,
-                    ..Default::default()
-                })?;
+                self.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: block_size,
+                        ..Default::default()
+                    })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
             let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: start.ptr + (i * self.step) as usize,
             };
             if self.sampler {
-                null_sampler(start);
+                null_sampler_on(&self.device, start);
             } else {
-                null_view(start);
+                null_view_on(&self.device, start);
             }
             let mut filled = 1;
-            while filled < BLOCK {
-                let n = filled.min(BLOCK - filled);
-                host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
+            while filled < block_size {
+                let n = filled.min(block_size - filled);
+                self.device
+                    .CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
             let mut done = 0;
             while done < total {
-                let n = BLOCK.min(total - done);
-                host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
+                let n = block_size.min(total - done);
+                self.device
+                    .CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }
         }
@@ -140,13 +292,12 @@ impl HostHeap {
     /// A plain point sampler at slot `index`, for sampler slots without a
     /// view.
     fn null_sampler(&self, index: u32) {
-        null_sampler(self.cpu(index));
+        null_sampler_on(&self.device, self.cpu(index));
     }
 }
 
 /// A plain point sampler at `at`.
-fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+fn null_sampler_on(device: &ID3D12Device, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let desc = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -157,21 +308,22 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         ..Default::default()
     };
     // SAFETY: a slot of a sampler heap of ours.
-    unsafe { host.device.CreateSampler(&desc, at) };
+    unsafe { device.CreateSampler(&desc, at) };
 }
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > DYNAMIC {
+        if self.sampler || n == 0 || n > self.dynamic_count {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
+        let dyn_len = self.dynamic_count as usize;
         let n = n as usize;
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..DYNAMIC as usize).chain(0..*next as usize);
+        let starts = (*next as usize..dyn_len).chain(0..*next as usize);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -188,36 +340,56 @@ impl HostHeap {
             }
         }
         let Some(first) = found else {
+            self.dynamic_exhausted.fetch_add(1, Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    n,
+                    dynamic = self.dynamic_count,
+                    "no free dynamic descriptor slots: draw cannot bind remapped table"
+                )
+            });
             return None;
         };
         taken[first..first + n].fill(true);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % dyn_len) as u32;
         Some(self.count + first as u32)
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), re-nulling them before making them available again so stale
+    /// descriptors never linger across frames.
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
+        let end = at.saturating_add(n).min(self.dynamic_count);
+        // Re-null before clearing `taken` so no concurrent allocator observes
+        // a partially cleared slot.
+        for slot in at..end {
+            self.make_null(self.count + slot);
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(DYNAMIC) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
+        if let Some(slots) = guard.1.get_mut(at as usize..end as usize) {
             slots.fill(false);
         }
     }
 
-    /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
+    /// Makes slot `index` (a dynamic one) from `view`; a type-compatible null
+    /// view if the host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        if !make(view, self.cpu(index)) {
-            null_for(view, self.cpu(index));
+        if !make_on(&self.device, view, self.cpu(index)) {
+            self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
+            null_for_on(&self.device, view, self.cpu(index));
         }
+    }
+
+    /// Makes slot `index` a type-compatible null view for `view`.
+    pub(crate) fn make_null_for(&self, view: &View, index: u32) {
+        self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
+        null_for_on(&self.device, view, self.cpu(index));
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -225,26 +397,26 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.cpu(index));
+            null_view_on(&self.device, self.cpu(index));
         }
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory.
+    /// memory, clamping `size` to D3D12's valid 256-byte-aligned `[256, 65536]`
+    /// range.
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: cbv_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
-            host.device
+            self.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
     }
 
-    fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    pub(crate) fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
@@ -256,6 +428,15 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
+            self.capped_mirrors.fetch_add(1, Ordering::Relaxed);
+            if for_draw {
+                once!(
+                    index,
+                    count = self.count,
+                    requested = self.requested,
+                    "descriptor mirror requested past capped host heap limit"
+                );
+            }
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
@@ -276,8 +457,11 @@ impl HostHeap {
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
-            if (later || !make(&view, self.cpu(index))) && !self.sampler {
-                null_for(&view, self.cpu(index));
+            if (later || !make_on(&self.device, &view, self.cpu(index))) && !self.sampler {
+                if !later {
+                    self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
+                }
+                null_for_on(&self.device, &view, self.cpu(index));
             }
         }
         Some(view)
@@ -288,7 +472,23 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        if index >= self.count {
+            if !self.sampler && index < self.count + self.dynamic_count {
+                return Some(format!(
+                    "dynamic slot +{} (in-flight remapped table)",
+                    index - self.count
+                ));
+            }
+            return Some(format!(
+                "OOB past host heap (count={}, requested={})",
+                self.count, self.requested
+            ));
+        }
+        let key = *self
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)?;
         if key == 0 {
             return Some("null".into());
         }
@@ -302,12 +502,9 @@ impl HostHeap {
     }
 }
 
-/// Logs `what` the first time it happens.
-macro_rules! once {
-    ($($arg:tt)*) => {{
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!($($arg)*));
-    }};
+/// Valid D3D12 CBV `SizeInBytes`: 256-byte aligned and in `[256, 65536]`.
+pub(crate) fn cbv_size(size: u32) -> u32 {
+    size.clamp(1, 65_536).next_multiple_of(256)
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -399,6 +596,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 }
 
 fn buffer_srv(
+    device: &ID3D12Device,
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
@@ -420,12 +618,8 @@ fn buffer_srv(
         return false;
     }
     buffer.FirstElement += offset / element;
-    let Some(host) = host() else { return false };
     // SAFETY: a live buffer and a slot of our heap.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
-    };
+    unsafe { device.CreateShaderResourceView(&shadow.buffer, Some(&desc), at) };
     true
 }
 
@@ -435,6 +629,7 @@ fn buffer_srv(
 /// shortcut: what shaders write stays in the host copy; title memory (and
 /// so the CPU, and copies run on the CPU) does not see it.
 fn buffer_uav(
+    device: &ID3D12Device,
     address: u64,
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
@@ -460,16 +655,18 @@ fn buffer_uav(
     };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
+        once!(
+            offset,
+            element,
+            "unordered buffer view not on an element of its host copy"
+        );
         return false;
     }
     buffer.FirstElement += offset / element;
     buffer.CounterOffsetInBytes = 0;
-    let Some(host) = host() else { return false };
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+        device.CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
     true
 }
@@ -527,13 +724,11 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
-/// Makes the host descriptor for `view` at `at`; false if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
-    let Some(host) = host() else { return false };
-    let device = &host.device;
+/// Makes the host descriptor for `view` at `at` on `device`; false if it cannot.
+fn make_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
     match view {
         &View::Constant(address, size) => {
-            let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+            let Some(shadow) = crate::shadow::find(address, u64::from(size.max(1))) else {
                 return false;
             };
             let gpu = shadow.gpu(address);
@@ -546,10 +741,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: cbv_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            true
+        }
+        View::Shader(0, Some(words)) => {
+            // Standard D3D12 typed NULL SRV (pResource == NULL, pDesc != NULL).
+            let desc = sanitize_null_srv(srv_desc(words));
+            // SAFETY: a slot of our heap; null resource is valid with a sanitized desc.
+            unsafe { device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at) };
             true
         }
         View::Shader(resource, desc) => {
@@ -571,17 +773,32 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                buffer_srv(device, data as u64, len, srv_desc(desc), at)
             } else {
                 false
             }
+        }
+        View::Unordered(0, _, Some(words)) => {
+            // Standard D3D12 typed NULL UAV (pResource == NULL, pDesc != NULL),
+            // preserving the title's exact ViewDimension (e.g. Texture1D) and format.
+            let desc = sanitize_null_uav(uav_desc(words));
+            // SAFETY: a slot of our heap; null resource is valid with a sanitized desc.
+            unsafe {
+                device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    at,
+                )
+            };
+            true
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
+                        buffer_uav(device, data as u64, len, uav_desc(desc), at)
                     }
                     _ => false,
                 };
@@ -620,14 +837,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make_on(device, &view, at);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                once!(
+                    dimension = resource[0],
+                    "placed unordered texture view not mirrored"
+                );
                 return false;
             }
             // The resource description's width, after the alignment.
@@ -635,9 +855,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav(device, address, len, uav_desc(words), at)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(device, address, len, srv_desc(words), at)
             }
         }
     }
@@ -658,39 +878,401 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
-/// A null view of the kind `view` is, for a slot whose view the host
-/// cannot make: unordered access (to a buffer or a 2D texture) or a shader
-/// view. Writes to it are dropped, reads give zeros.
-fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let buffer = match view {
-        View::Unordered(r, _, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_some(),
-        View::Placed(true, resource, _) => resource[0] == 1,
-        _ => return null_view(at),
+/// Concrete SRV format acceptable for a D3D12 NULL SRV descriptor.
+fn concrete_null_srv_format(fmt: DXGI_FORMAT) -> DXGI_FORMAT {
+    let f = fmt.0 as u32;
+    match f {
+        40 => DXGI_FORMAT_R32_FLOAT,                // D32_FLOAT
+        45 => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,    // D24_UNORM_S8_UINT
+        55 => DXGI_FORMAT_R16_UNORM,                // D16_UNORM
+        20 => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, // D32_FLOAT_S8X24_UINT
+        1 => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        9 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        15 => DXGI_FORMAT_R32G32_FLOAT,
+        27 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        33 => DXGI_FORMAT_R16G16_FLOAT,
+        39 => DXGI_FORMAT_R32_FLOAT,
+        48 => DXGI_FORMAT_R8G8_UNORM,
+        53 => DXGI_FORMAT_R16_UNORM,
+        60 => DXGI_FORMAT_R8_UNORM,
+        90 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        0 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        _ => {
+            let fam = crate::resource::family(f);
+            if fam == f && crate::resource::family(f + 1) == f {
+                DXGI_FORMAT_R8G8B8A8_UNORM
+            } else {
+                fmt
+            }
+        }
+    }
+}
+
+/// Concrete UAV format acceptable for a D3D12 NULL UAV descriptor.
+fn concrete_null_uav_format(fmt: DXGI_FORMAT) -> DXGI_FORMAT {
+    let mut f = fmt.0 as u32;
+    if let Some(&(_, linear)) = crate::resource::SRGB.iter().find(|&&(s, _)| s == f) {
+        f = linear;
+    }
+    match f {
+        2 | 3 | 4          // R32G32B32A32_{FLOAT,UINT,SINT}
+        | 10 | 11 | 12 | 13 | 14 // R16G16B16A16_{FLOAT,UNORM,UINT,SNORM,SINT}
+        | 16 | 17 | 18     // R32G32_{FLOAT,UINT,SINT}
+        | 24 | 25          // R10G10B10A2_{UNORM,UINT}
+        | 26               // R11G11B10_FLOAT
+        | 28 | 30 | 31 | 32 // R8G8B8A8_{UNORM,UINT,SNORM,SINT}
+        | 34 | 35 | 36 | 37 | 38 // R16G16_{FLOAT,UNORM,UINT,SNORM,SINT}
+        | 41 | 42 | 43     // R32_{FLOAT,UINT,SINT}
+        | 49 | 50 | 51 | 52 // R8G8_{UNORM,UINT,SNORM,SINT}
+        | 54 | 56 | 57 | 58 | 59 // R16_{FLOAT,UNORM,UINT,SNORM,SINT}
+        | 61 | 62 | 63 | 64 // R8_{UNORM,UINT,SNORM,SINT}
+        | 87 => DXGI_FORMAT(f as i32), // B8G8R8A8_UNORM
+        _ => DXGI_FORMAT_R32_UINT,
+    }
+}
+
+/// Sanitizes an SRV description so `CreateShaderResourceView(None, Some(&desc), at)`
+/// is valid under D3D12 while preserving the shader's expected descriptor dimension
+/// and buffer kind (raw / structured / typed).
+fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let mapping = if desc.Shader4ComponentMapping & 0x1000 != 0 {
+        desc.Shader4ComponentMapping
+    } else {
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
     };
-    let Some(host) = host() else { return };
-    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-        Format: DXGI_FORMAT_R32_UINT,
-        ViewDimension: if buffer {
-            D3D12_UAV_DIMENSION_BUFFER
-        } else {
-            D3D12_UAV_DIMENSION_TEXTURE2D
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_BUFFER => {
+            // SAFETY: ViewDimension is BUFFER.
+            let b = unsafe { desc.Anonymous.Buffer };
+            let (format, flags, stride) = if b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
+                (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_SRV_FLAG_RAW, 0)
+            } else if b.StructureByteStride > 0 {
+                (
+                    DXGI_FORMAT_UNKNOWN,
+                    D3D12_BUFFER_SRV_FLAG_NONE,
+                    b.StructureByteStride,
+                )
+            } else {
+                (
+                    concrete_null_srv_format(desc.Format),
+                    D3D12_BUFFER_SRV_FLAG_NONE,
+                    0,
+                )
+            };
+            D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: mapping,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: 0,
+                        NumElements: 0,
+                        StructureByteStride: stride,
+                        Flags: flags,
+                    },
+                },
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURE1D => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: concrete_null_srv_format(desc.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE1D,
+            Shader4ComponentMapping: mapping,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
         },
-        ..Default::default()
-    };
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device.CreateUnorderedAccessView(
-            None::<&ID3D12Resource>,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
-    };
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: concrete_null_srv_format(desc.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
+            Shader4ComponentMapping: mapping,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        D3D12_SRV_DIMENSION_TEXTURE2D => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: concrete_null_srv_format(desc.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: mapping,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: concrete_null_srv_format(desc.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: mapping,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        D3D12_SRV_DIMENSION_TEXTURE2DMS => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: concrete_null_srv_format(desc.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
+            Shader4ComponentMapping: mapping,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMS: D3D12_TEX2DMS_SRV::default(),
+            },
+        },
+        D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: concrete_null_srv_format(desc.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+            Shader4ComponentMapping: mapping,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV {
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        D3D12_SRV_DIMENSION_TEXTURE3D => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: concrete_null_srv_format(desc.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE3D,
+            Shader4ComponentMapping: mapping,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        D3D12_SRV_DIMENSION_TEXTURECUBE => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: concrete_null_srv_format(desc.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+            Shader4ComponentMapping: mapping,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: concrete_null_srv_format(desc.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+            Shader4ComponentMapping: mapping,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
+                    MipLevels: 1,
+                    NumCubes: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        _ => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        },
+    }
+}
+
+/// Sanitizes a UAV description so `CreateUnorderedAccessView(None, None, Some(&desc), at)`
+/// is valid under D3D12 while preserving the shader's expected descriptor dimension
+/// and buffer kind.
+fn sanitize_null_uav(desc: D3D12_UNORDERED_ACCESS_VIEW_DESC) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    match desc.ViewDimension {
+        D3D12_UAV_DIMENSION_BUFFER => {
+            // SAFETY: ViewDimension is BUFFER.
+            let b = unsafe { desc.Anonymous.Buffer };
+            let (format, flags, stride) = if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+                (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_UAV_FLAG_RAW, 0)
+            } else if b.StructureByteStride > 0 {
+                (
+                    DXGI_FORMAT_UNKNOWN,
+                    D3D12_BUFFER_UAV_FLAG_NONE,
+                    b.StructureByteStride,
+                )
+            } else {
+                (
+                    concrete_null_uav_format(desc.Format),
+                    D3D12_BUFFER_UAV_FLAG_NONE,
+                    0,
+                )
+            };
+            D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: 0,
+                        NumElements: 0,
+                        StructureByteStride: stride,
+                        CounterOffsetInBytes: 0,
+                        Flags: flags,
+                    },
+                },
+            }
+        }
+        D3D12_UAV_DIMENSION_TEXTURE1D => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: concrete_null_uav_format(desc.Format),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_UAV::default(),
+            },
+        },
+        D3D12_UAV_DIMENSION_TEXTURE1DARRAY => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: concrete_null_uav_format(desc.Format),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        D3D12_UAV_DIMENSION_TEXTURE2D => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: concrete_null_uav_format(desc.Format),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV::default(),
+            },
+        },
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: concrete_null_uav_format(desc.Format),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        D3D12_UAV_DIMENSION_TEXTURE3D => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: concrete_null_uav_format(desc.Format),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_UAV {
+                    WSize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        _ => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        },
+    }
+}
+
+/// A type- and dimension-compatible null descriptor matching `view`, for a
+/// slot whose view the host cannot make. Reads return zeros and writes are
+/// dropped without causing a SM 6.6 `ResourceDescriptorHeap` type mismatch.
+fn null_for_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    match view {
+        View::Constant(..) => {
+            // SAFETY: null CBV description is valid in D3D12.
+            unsafe { device.CreateConstantBufferView(None, at) };
+        }
+        View::Shader(_, Some(words)) => {
+            let desc = sanitize_null_srv(srv_desc(words));
+            // SAFETY: null SRV with sanitized desc is valid in D3D12.
+            unsafe { device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at) };
+        }
+        View::Shader(_, None) => null_view_on(device, at),
+        View::Placed(false, resource, desc) => {
+            let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+            let parsed = srv_desc(words);
+            let sanitized = if parsed.ViewDimension != D3D12_SRV_DIMENSION_UNKNOWN {
+                sanitize_null_srv(parsed)
+            } else if resource[0] == 1 {
+                D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                }
+            } else {
+                sanitize_null_srv(parsed)
+            };
+            // SAFETY: null SRV with sanitized desc is valid in D3D12.
+            unsafe {
+                device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&sanitized), at)
+            };
+        }
+        View::Unordered(r, _, desc) => {
+            let sanitized = match desc {
+                Some(words) => sanitize_null_uav(uav_desc(words)),
+                None => {
+                    let buffer = crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_UINT,
+                        ViewDimension: if buffer {
+                            D3D12_UAV_DIMENSION_BUFFER
+                        } else {
+                            D3D12_UAV_DIMENSION_TEXTURE2D
+                        },
+                        ..Default::default()
+                    }
+                }
+            };
+            // SAFETY: null UAV with sanitized desc is valid in D3D12.
+            unsafe {
+                device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&sanitized),
+                    at,
+                )
+            };
+        }
+        View::Placed(true, resource, desc) => {
+            let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+            let parsed = uav_desc(words);
+            let sanitized = if parsed.ViewDimension != D3D12_UAV_DIMENSION_UNKNOWN {
+                sanitize_null_uav(parsed)
+            } else {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_UINT,
+                    ViewDimension: if resource[0] == 1 {
+                        D3D12_UAV_DIMENSION_BUFFER
+                    } else {
+                        D3D12_UAV_DIMENSION_TEXTURE2D
+                    },
+                    ..Default::default()
+                }
+            };
+            // SAFETY: null UAV with sanitized desc is valid in D3D12.
+            unsafe {
+                device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&sanitized),
+                    at,
+                )
+            };
+        }
+        View::Sampler(_) | View::ConsoleSampler(_) => null_sampler_on(device, at),
+    }
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
-fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+fn null_view_on(device: &ID3D12Device, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -703,10 +1285,7 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         },
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    unsafe { device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at) };
 }
 
 #[cfg(test)]
@@ -727,5 +1306,220 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    #[test]
+    fn cbv_size_clamps_and_aligns_to_d3d12_limits() {
+        assert_eq!(cbv_size(0), 256);
+        assert_eq!(cbv_size(1), 256);
+        assert_eq!(cbv_size(256), 256);
+        assert_eq!(cbv_size(257), 512);
+        assert_eq!(cbv_size(65_536), 65_536);
+        assert_eq!(cbv_size(128_000), 65_536);
+    }
+
+    #[test]
+    fn capped_heap_tracks_bounds_and_dynamic_exhaustion_on_warp() {
+        let Some(device) = crate::host::warp_device() else {
+            return;
+        };
+        let heap =
+            HostHeap::new_capped_for_test(device, 128, 64, 16).expect("capped WARP host heap");
+        assert!(heap.capped());
+        assert_eq!(heap.requested(), 128);
+        assert_eq!(heap.count(), 48);
+        assert_eq!(heap.dynamic_in_use(), 0);
+
+        // Mirroring past the capped mirrored range must fail cleanly and record a counter.
+        assert!(heap.mirror(50, 0, true).is_none());
+        assert!(heap.stats().contains("capped=true"));
+        assert!(heap.stats().contains("capped_mirrors=1"));
+
+        // Dynamic slots live in [48..64) and are re-nulled on release.
+        let a = heap.dynamic(10).expect("10 dynamic slots");
+        assert_eq!(a, 48);
+        assert_eq!(heap.dynamic_in_use(), 10);
+        let b = heap.dynamic(6).expect("remaining 6 dynamic slots");
+        assert_eq!(b, 58);
+        assert_eq!(heap.dynamic_in_use(), 16);
+
+        // Exhaustion returns None and increments counter instead of wrapping.
+        assert_eq!(heap.dynamic(1), None);
+        assert!(heap.stats().contains("dynamic_exhausted=1"));
+
+        heap.release(a, 10);
+        assert_eq!(heap.dynamic_in_use(), 6);
+        let c = heap.dynamic(10).expect("reclaimed 10 dynamic slots");
+        assert_eq!(c, 48);
+        heap.release(c, 10);
+        heap.release(b, 6);
+        assert_eq!(heap.dynamic_in_use(), 0);
+    }
+
+    #[test]
+    fn typed_null_descriptors_and_fallbacks_preserve_dimensions_on_warp() {
+        let Some(device) = crate::host::warp_device() else {
+            return;
+        };
+        let heap =
+            HostHeap::new_capped_for_test(device.clone(), 32, 32, 8).expect("WARP host heap");
+
+        // Exact typed NULL UAV observed in crash logs: R32_UINT (42), TEXTURE1D (2).
+        let tex1d_uav_words = [42, 2, 0, 0, 0, 0, 0, 0, 0, 0];
+        let sanitized_uav = sanitize_null_uav(uav_desc(&tex1d_uav_words));
+        assert_eq!(sanitized_uav.Format, DXGI_FORMAT_R32_UINT);
+        assert_eq!(sanitized_uav.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE1D);
+        assert!(make_on(
+            &device,
+            &View::Unordered(0, 0, Some(tex1d_uav_words)),
+            heap.cpu(0),
+        ));
+
+        // Raw buffer NULL UAV & Structured buffer NULL UAV.
+        // Layout: [0]=Format, [1]=ViewDimension, [2..4]=FirstElement(u64),
+        // [4]=NumElements, [5]=StructureByteStride, [6..8]=CounterOffsetInBytes(u64),
+        // [8]=Flags.
+        let raw_uav_words = [
+            DXGI_FORMAT_R32_TYPELESS.0 as u32,
+            D3D12_UAV_DIMENSION_BUFFER.0 as u32,
+            0,
+            0,
+            64,
+            0,
+            128, // non-zero CounterOffsetInBytes must be cleared for NULL UAV
+            0,
+            D3D12_BUFFER_UAV_FLAG_RAW.0 as u32,
+            0,
+        ];
+        let sanitized_raw = sanitize_null_uav(uav_desc(&raw_uav_words));
+        assert_eq!(sanitized_raw.Format, DXGI_FORMAT_R32_TYPELESS);
+        assert_eq!(sanitized_raw.ViewDimension, D3D12_UAV_DIMENSION_BUFFER);
+        // SAFETY: ViewDimension is BUFFER.
+        assert_eq!(
+            unsafe { sanitized_raw.Anonymous.Buffer.CounterOffsetInBytes },
+            0
+        );
+        assert!(make_on(
+            &device,
+            &View::Unordered(0, 0, Some(raw_uav_words)),
+            heap.cpu(1),
+        ));
+
+        let structured_uav_words = [
+            DXGI_FORMAT_UNKNOWN.0 as u32,
+            D3D12_UAV_DIMENSION_BUFFER.0 as u32,
+            0,
+            0,
+            16,
+            32, // StructureByteStride
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert!(make_on(
+            &device,
+            &View::Unordered(0, 0, Some(structured_uav_words)),
+            heap.cpu(2),
+        ));
+
+        // Typed NULL SRVs: raw buffer, structured buffer, depth format, typeless, cube, 3D.
+        // Layout: [0]=Format, [1]=ViewDimension, [2]=Mapping, [3]=pad,
+        // [4..6]=FirstElement(u64), [6]=NumElements, [7]=StructureByteStride, [8]=Flags.
+        let raw_srv_words = [
+            DXGI_FORMAT_R32_TYPELESS.0 as u32,
+            D3D12_SRV_DIMENSION_BUFFER.0 as u32,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            0,
+            0,
+            16,
+            0,
+            D3D12_BUFFER_SRV_FLAG_RAW.0 as u32,
+            0,
+        ];
+        let sanitized_raw_srv = sanitize_null_srv(srv_desc(&raw_srv_words));
+        assert_eq!(sanitized_raw_srv.Format, DXGI_FORMAT_R32_TYPELESS);
+        // SAFETY: ViewDimension is BUFFER.
+        assert_eq!(
+            unsafe { sanitized_raw_srv.Anonymous.Buffer.Flags },
+            D3D12_BUFFER_SRV_FLAG_RAW
+        );
+        assert!(make_on(
+            &device,
+            &View::Shader(0, Some(raw_srv_words)),
+            heap.cpu(3),
+        ));
+
+        let depth_srv_words = [
+            DXGI_FORMAT_D32_FLOAT.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+            0, // missing force-set bit should be sanitized
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let sanitized_depth = sanitize_null_srv(srv_desc(&depth_srv_words));
+        assert_eq!(sanitized_depth.Format, DXGI_FORMAT_R32_FLOAT);
+        assert_eq!(
+            sanitized_depth.Shader4ComponentMapping,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+        );
+        assert!(make_on(
+            &device,
+            &View::Shader(0, Some(depth_srv_words)),
+            heap.cpu(4),
+        ));
+
+        let cube_srv_words = [
+            DXGI_FORMAT_R8G8B8A8_TYPELESS.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURECUBE.0 as u32,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let sanitized_cube = sanitize_null_srv(srv_desc(&cube_srv_words));
+        assert_eq!(sanitized_cube.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(
+            sanitized_cube.ViewDimension,
+            D3D12_SRV_DIMENSION_TEXTURECUBE
+        );
+        assert!(make_on(
+            &device,
+            &View::Shader(0, Some(cube_srv_words)),
+            heap.cpu(5),
+        ));
+
+        // Null fallbacks for CBV, placed buffer SRV, and placed texture UAV.
+        null_for_on(&device, &View::Constant(0x1000, 0), heap.cpu(6));
+        let mut placed_res = [0u32; 14];
+        placed_res[0] = 1; // buffer
+        let mut placed_desc = [0u32; 16];
+        placed_desc[..10].copy_from_slice(&raw_srv_words);
+        null_for_on(
+            &device,
+            &View::Placed(false, placed_res, placed_desc),
+            heap.cpu(7),
+        );
+        placed_res[0] = 3; // texture2d
+        placed_desc[..10].copy_from_slice(&tex1d_uav_words);
+        null_for_on(
+            &device,
+            &View::Placed(true, placed_res, placed_desc),
+            heap.cpu(8),
+        );
+
+        // SAFETY: plain device health check.
+        assert!(unsafe { device.GetDeviceRemovedReason() }.is_ok());
+        crate::host::assert_no_debug_errors(&device);
     }
 }

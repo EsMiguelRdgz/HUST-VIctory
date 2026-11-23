@@ -71,12 +71,16 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Tables made afresh in this list: (table, entry count, copy epoch,
+    /// record hash) → first dynamic slot.
+    fresh_tables: std::collections::HashMap<(u64, u32, u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Remapped `(root_slot, host_byte_offset)` tables bound by the most
+    /// recent `bind()` call, per pipeline stage (for diagnostics / DRED).
+    #[cfg(feature = "diagnostics")]
+    last_tables: Vec<Vec<(u8, u32)>>,
 }
 
 impl Drop for State {
@@ -329,10 +333,15 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -390,8 +399,11 @@ impl State {
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    /// descriptors its tables hold. Returns `false` if a required descriptor
+    /// table remap cannot be satisfied (for example, dynamic descriptor slots
+    /// exhausted on a capped heap) so the caller refuses to record an invalid
+    /// GPU command.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -426,9 +438,13 @@ impl State {
             self.host_pipeline = self.pipeline;
             list.used_pipeline(&p.name);
         }
+        #[cfg(feature = "diagnostics")]
+        self.last_tables.clear();
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, compute);
+            let Some(made) = self.tables(list, &t.used, &t.host.user_data, compute) else {
+                return false;
+            };
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -449,6 +465,8 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            self.last_tables.push(made);
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
@@ -471,6 +489,7 @@ impl State {
                 }
             }
         }
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -486,7 +505,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -508,13 +529,34 @@ impl State {
         let views = (self.heaps[0] != 0)
             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
             .flatten();
-        for stage in &p.stages {
+        for (stage_idx, stage) in p.stages.iter().enumerate() {
             let t = stage.translated();
+            let remapped = self
+                .last_tables
+                .get(stage_idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
-                let _ = write!(text, " u{}={v:#x}", u.index);
-                let index = if u.root == RootType::Table { v / 32 } else { v };
+                let title_v = self.user_value(compute, u.slot, u.root, u.dword);
+                let host_v = remapped
+                    .iter()
+                    .find(|m| m.0 == u.slot && u.root == RootType::Table)
+                    .map(|&(_, offset)| offset);
+                match host_v {
+                    Some(hv) if hv != title_v => {
+                        let _ = write!(text, " u{}={hv:#x}(title={title_v:#x})", u.index);
+                    }
+                    _ => {
+                        let _ = write!(text, " u{}={title_v:#x}", u.index);
+                    }
+                }
+                let bound = host_v.unwrap_or(title_v);
+                let index = if u.root == RootType::Table {
+                    bound / 32
+                } else {
+                    bound
+                };
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
@@ -581,39 +623,49 @@ impl State {
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// constant buffer OR tables whose descriptor indices exceed a capped host
+    /// view heap (`base_index + n > host.count()`) are remade afresh for the
+    /// draw in dynamic slots, with constant data copied to 256-byte aligned
+    /// upload memory when the list is submitted. Returns those tables' new
+    /// byte offsets by root parameter, or `None` if a required remap failed
+    /// (for example, dynamic slots exhausted).
     ///
-    /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
-        let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
+    /// Within a list, the same table holding the same descriptors (with the
+    /// same length and copy epoch) is made once: its constant data is copied
+    /// at submission either way, and the big tables the world binds would
+    /// otherwise take hundreds of slots per draw, wrapping the dynamic slots
+    /// onto lists not yet submitted.
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        user_data: &[victory_shader::emit::UserData],
+        compute: bool,
+    ) -> Option<Vec<(u8, u32)>> {
+        let is_table = |u: &&UsedResource| u.root == RootType::Table;
+        let mut slots: Vec<u8> = used
             .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(is_table)
             .map(|u| u.slot)
+            .chain(
+                user_data
+                    .iter()
+                    .filter(|u| u.root == RootType::Table)
+                    .map(|u| u.slot),
+            )
             .collect();
-        fresh.sort_unstable();
-        fresh.dedup();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
-            }
-        }
+        slots.sort_unstable();
+        slots.dedup();
+
+        let copy_epoch = list.copy_epoch();
         let mut made = Vec::new();
-        for slot in fresh {
+        for slot in slots {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
             let entries: Vec<&UsedResource> = used
                 .iter()
-                .filter(tables)
+                .filter(is_table)
                 .filter(|u| u.slot == slot)
                 .collect();
             let Some(heap) = self.heap_of(table) else {
@@ -622,11 +674,24 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
+            let Some(base_index) = heap.index(table) else {
+                continue;
+            };
+            let max_used = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            let remaining = heap.count().saturating_sub(base_index).max(1);
+            let n = max_used.min(remaining);
+            let has_cbv = entries.iter().any(|u| u.kind == ResourceType::Cbv);
+            let exceeds_host = !heap.samplers() && base_index.saturating_add(n) > host.count();
+            if !has_cbv && !exceeds_host {
+                for u in entries {
+                    self.table_entry(list, u, compute);
+                }
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -636,7 +701,7 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (table, h.finish())
+                (table, n, copy_epoch, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -649,7 +714,16 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
-                continue;
+                once!(
+                    slot,
+                    base_index,
+                    n,
+                    host_count = host.count(),
+                    exceeds_host,
+                    has_cbv,
+                    "cannot allocate dynamic slots for remapped table; dropping draw"
+                );
+                return None;
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
@@ -658,25 +732,36 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let matching: Vec<&UsedResource> = entries
+                    .iter()
+                    .copied()
+                    .filter(|u| u.table_offset_dwords / 8 == k)
+                    .collect();
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                        let copy_len = size.min(65_536);
+                        let padded = crate::descriptor::host::cbv_size(copy_len);
+                        let Some((gpu, to)) = list.scratch(u64::from(padded)) else {
+                            host.make_null_for(&View::Constant(address, size), index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
+                        list.defer_fill_padded(
+                            to,
+                            address as *const u8,
+                            copy_len as usize,
+                            padded as usize,
+                        );
+                        host.constant_at(index, gpu, copy_len);
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        if let Some(u) = used {
+                        for u in &matching {
                             readable(list, u, &view);
                         }
                     }
                     None => {
                         host.make_null(index);
-                        if used.is_some() {
+                        if !matching.is_empty() {
                             once!(slot, "a table entry without a view");
                         }
                     }
@@ -684,7 +769,7 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        Some(made)
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -929,7 +1014,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {
@@ -984,4 +1072,161 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{Iid, release};
+
+    const HEAP_IID: Iid = crate::object::guid(
+        0x8efb471d,
+        0x616c,
+        0x4f49,
+        [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+    );
+
+    #[test]
+    fn capped_srv_table_remaps_caches_invalidates_and_refuses_on_exhaustion() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let Ok(list) = host_gpu.new_list() else {
+            return;
+        };
+
+        // Title view heap of 128 descriptors, backed by a host heap capped at
+        // 64 total slots (48 mirrored + 16 dynamic at [48..64)), reproducing
+        // NVIDIA's 1,245,184 -> 1,000,000 cap where transient tables collide
+        // with the dynamic pool.
+        #[repr(C)]
+        struct Desc {
+            kind: u32,
+            count: u32,
+            flags: u32,
+            node_mask: u32,
+        }
+        let desc = Desc {
+            kind: 0, // CBV/SRV/UAV
+            count: 128,
+            flags: 1, // SHADER_VISIBLE
+            node_mask: 0,
+        };
+        let mut heap_ptr: This = std::ptr::null_mut();
+        let hr = crate::descriptor::create_heap(
+            std::ptr::null_mut(),
+            std::ptr::from_ref(&desc).cast(),
+            &HEAP_IID,
+            &mut heap_ptr,
+        );
+        assert_eq!(hr, 0);
+        let heap = crate::descriptor::heap(heap_ptr);
+        let capped = crate::descriptor::host::HostHeap::new_capped_for_test(
+            host_gpu.device.clone(),
+            128,
+            64,
+            16,
+        )
+        .expect("capped host heap");
+        heap.set_host_for_test(capped);
+        let host_heap = heap.host().expect("attached host heap");
+
+        // Write a typed NULL SRV into title slot 52 (inside the capped range
+        // >= 48 that previously collided with dynamic slots).
+        let base_handle = heap.start_for_test();
+        let srv_words = [
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        crate::descriptor::create_srv(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &srv_words,
+            base_handle + 52 * 32,
+        );
+
+        let mut state = State::default();
+        state.set_heaps(&[heap_ptr]);
+        state.set_table(false, 3, base_handle + 52 * 32);
+
+        let used_one = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 8,
+            slot: 3,
+        }];
+        let user_data = vec![victory_shader::emit::UserData {
+            index: 8,
+            slot: 3,
+            root: RootType::Table,
+            dword: 0,
+        }];
+
+        // 1. SRV-only table past mirrored limit (52 >= 48) MUST remap into dynamic slot 48.
+        let remapped = state
+            .tables(&list, &used_one, &user_data, false)
+            .expect("capped SRV-only table remaps");
+        assert_eq!(remapped, vec![(3, 48 * 32)]);
+        assert_eq!(host_heap.dynamic_in_use(), 1);
+
+        // 2. Identical table & copy_epoch hits `fresh_tables` cache without consuming more slots.
+        let cached = state
+            .tables(&list, &used_one, &user_data, false)
+            .expect("cached table reuse");
+        assert_eq!(cached, vec![(3, 48 * 32)]);
+        assert_eq!(host_heap.dynamic_in_use(), 1);
+
+        // 3. A deferred buffer copy bumps copy_epoch and invalidates the cache entry.
+        let mut dummy = [0u8; 16];
+        list.defer_copy(dummy.as_mut_ptr(), dummy.as_ptr(), 16);
+        let after_copy = state
+            .tables(&list, &used_one, &user_data, false)
+            .expect("remapped after copy_epoch bump");
+        assert_eq!(after_copy, vec![(3, 49 * 32)]);
+        assert_eq!(host_heap.dynamic_in_use(), 2);
+
+        // 4. Larger table span `n = 2` at the same base address misses the `n = 1` cache entry.
+        let used_two = vec![
+            used_one[0],
+            UsedResource {
+                table_offset_dwords: 8,
+                ..used_one[0]
+            },
+        ];
+        let wider = state
+            .tables(&list, &used_two, &user_data, false)
+            .expect("wider table span allocates 2 slots");
+        assert_eq!(wider, vec![(3, 50 * 32)]);
+        assert_eq!(host_heap.dynamic_in_use(), 4);
+
+        // 5. Exhaust remaining 12 dynamic slots; a new capped table MUST return None
+        //    rather than falling back to the unremapped colliding title offset.
+        let held = host_heap.dynamic(12).expect("fill remaining dynamic pool");
+        assert_eq!(host_heap.dynamic_in_use(), 16);
+        state.set_table(false, 3, base_handle + 60 * 32);
+        assert!(
+            state.tables(&list, &used_one, &user_data, false).is_none(),
+            "exhausted dynamic pool must refuse draw instead of colliding"
+        );
+
+        // 6. Resetting draw state releases and re-nulls only the 4 slots it owned.
+        state.reset(std::ptr::null_mut());
+        assert_eq!(host_heap.dynamic_in_use(), 12);
+        host_heap.release(held, 12);
+        assert_eq!(host_heap.dynamic_in_use(), 0);
+
+        release(heap_ptr);
+    }
 }

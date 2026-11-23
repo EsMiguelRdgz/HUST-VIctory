@@ -72,6 +72,21 @@ impl Heap {
         self.desc.kind == SAMPLERS
     }
 
+    /// Number of descriptor slots requested by the title.
+    pub(crate) fn count(&self) -> u32 {
+        self.desc.count
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_host_for_test(&self, host: host::HostHeap) {
+        let _ = self.host.set(Some(host));
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn start_for_test(&self) -> u64 {
+        self.start
+    }
+
     /// The host heap, made on first use from what the title wrote so far.
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
