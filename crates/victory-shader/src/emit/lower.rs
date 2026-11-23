@@ -37,6 +37,8 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Required wave size declared in DXIL / PSV0 (compute shaders only).
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -374,8 +376,17 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
-            let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            let group_threads = cs.threads.iter().product::<u32>();
+            // When the entire thread group fits in 32 threads, lanes 32..63
+            // are permanently inactive even for a console wave64 shader, so a
+            // 32-lane host wave is an exact bijection and runs on Wave32-only
+            // GPUs (such as NVIDIA Ampere) as well as AMD/WARP.
+            let wave = if x.native.wave64 && group_threads > 32 {
+                64
+            } else {
+                32
+            };
+            let one_wave = group_threads <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
@@ -877,6 +888,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        let wave_size = self.s.wave_size;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -884,6 +896,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            wave_size,
         })
     }
 
@@ -6496,5 +6509,64 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    #[test]
+    fn wave64_small_compute_group_uses_wave32() {
+        use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+
+        let make = |threads: [u32; 3]| {
+            // `v_readlane_b32 s2, v0, 3` triggers console lane layout, then `s_endpgm`.
+            let words: [u32; 3] = [0xD760_0002, 0x0001_0700, 0xBF81_0000];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 4,
+                layout: Vec::new(),
+                used: Vec::new(),
+                io: StageIo::Cs(ComputeIo { rsrc2: 0, threads }),
+                code,
+            };
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            super::lower(&super::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .expect("compute shader lowers")
+        };
+
+        let small = make([32, 1, 1]);
+        assert_eq!(
+            small.wave_size,
+            Some(32),
+            "wave64 compute shader with <=32 threads must lower to WaveSize(32)"
+        );
+        let wide = make([64, 1, 1]);
+        assert_eq!(
+            wide.wave_size,
+            Some(64),
+            "wave64 compute shader with >32 threads keeps WaveSize(64)"
+        );
+
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut small.dxil.clone())
+                .expect("WaveSize(32) compute DXIL validates");
+            v.validate(&mut wide.dxil.clone())
+                .expect("WaveSize(64) compute DXIL validates");
+        }
     }
 }

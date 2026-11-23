@@ -119,7 +119,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -198,6 +198,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.wave_size.unwrap_or(0));
     out
 }
 
@@ -254,6 +255,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let wave_size = match r.word()? {
+        0 => None,
+        n => Some(n),
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -262,6 +267,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        wave_size,
     })
 }
 
@@ -288,6 +294,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            wave_size: Some(32),
         }
     }
 
@@ -312,7 +319,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -340,8 +347,12 @@ mod tests {
     fn entries_round_trip_and_reject_damage() {
         let bytes = encode(&shader());
         assert_eq!(decode(&bytes), Some(shader()));
+        let mut no_wave = shader();
+        no_wave.wave_size = None;
+        assert_eq!(decode(&encode(&no_wave)), Some(no_wave));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
+        assert_eq!(decode(b"VSH1"), None);
         assert_eq!(decode(b"VSH0"), None);
     }
 }

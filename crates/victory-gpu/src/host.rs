@@ -4,6 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -35,8 +36,199 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// Host D3D12 adapter and feature capabilities, queried once when the host
+/// device is created. Compatibility decisions branch on these detected
+/// capabilities rather than assuming console and PC GPUs are identical.
+#[derive(Debug, Clone)]
+pub(crate) struct HostCaps {
+    pub(crate) adapter_name: String,
+    pub(crate) vendor_id: u32,
+    pub(crate) device_id: u32,
+    pub(crate) dedicated_vram: u64,
+    pub(crate) warp: bool,
+    pub(crate) highest_shader_model: D3D_SHADER_MODEL,
+    pub(crate) resource_binding_tier: D3D12_RESOURCE_BINDING_TIER,
+    pub(crate) resource_heap_tier: D3D12_RESOURCE_HEAP_TIER,
+    pub(crate) typed_uav_load_additional_formats: bool,
+    pub(crate) wave_ops: bool,
+    pub(crate) wave_lane_count_min: u32,
+    pub(crate) wave_lane_count_max: u32,
+    pub(crate) mesh_shader_tier: D3D12_MESH_SHADER_TIER,
+    pub(crate) enhanced_barriers: bool,
+    pub(crate) max_gpu_va_bits_per_resource: u32,
+    pub(crate) max_gpu_va_bits_per_process: u32,
+    pub(crate) uma: bool,
+}
+
+impl HostCaps {
+    pub(crate) fn query(device: &ID3D12Device, warp_requested: bool) -> Self {
+        // SAFETY: each CheckFeatureSupport call passes a properly sized struct
+        // matching its D3D12_FEATURE discriminator.
+        unsafe {
+            let (adapter_name, vendor_id, device_id, dedicated_vram, software) =
+                adapter_info(device).unwrap_or_else(|| ("unknown".to_owned(), 0, 0, 0, false));
+
+            let mut highest_shader_model = D3D_SHADER_MODEL_5_1;
+            for candidate in [
+                D3D_SHADER_MODEL_6_7,
+                D3D_SHADER_MODEL_6_6,
+                D3D_SHADER_MODEL_6_5,
+                D3D_SHADER_MODEL_6_0,
+            ] {
+                let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+                    HighestShaderModel: candidate,
+                };
+                if device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut model).cast(),
+                        size_of_val(&model) as u32,
+                    )
+                    .is_ok()
+                {
+                    highest_shader_model = model.HighestShaderModel;
+                    break;
+                }
+            }
+
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            let _ = device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut opts).cast(),
+                size_of_val(&opts) as u32,
+            );
+
+            let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            let _ = device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opts1).cast(),
+                size_of_val(&opts1) as u32,
+            );
+
+            let mut opts7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            let _ = device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut opts7).cast(),
+                size_of_val(&opts7) as u32,
+            );
+
+            let mut opts12 = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+            let enhanced_barriers = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS12,
+                    (&raw mut opts12).cast(),
+                    size_of_val(&opts12) as u32,
+                )
+                .is_ok()
+                && opts12.EnhancedBarriersSupported.as_bool();
+
+            let mut va = D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT::default();
+            let _ = device.CheckFeatureSupport(
+                D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT,
+                (&raw mut va).cast(),
+                size_of_val(&va) as u32,
+            );
+
+            let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE1::default();
+            let _ = device.CheckFeatureSupport(
+                D3D12_FEATURE_ARCHITECTURE1,
+                (&raw mut arch).cast(),
+                size_of_val(&arch) as u32,
+            );
+
+            HostCaps {
+                adapter_name,
+                vendor_id,
+                device_id,
+                dedicated_vram,
+                warp: warp_requested || software,
+                highest_shader_model,
+                resource_binding_tier: opts.ResourceBindingTier,
+                resource_heap_tier: opts.ResourceHeapTier,
+                typed_uav_load_additional_formats: opts.TypedUAVLoadAdditionalFormats.as_bool(),
+                wave_ops: opts1.WaveOps.as_bool(),
+                wave_lane_count_min: opts1.WaveLaneCountMin,
+                wave_lane_count_max: opts1.WaveLaneCountMax,
+                mesh_shader_tier: opts7.MeshShaderTier,
+                enhanced_barriers,
+                max_gpu_va_bits_per_resource: va.MaxGPUVirtualAddressBitsPerResource,
+                max_gpu_va_bits_per_process: va.MaxGPUVirtualAddressBitsPerProcess,
+                uma: arch.UMA.as_bool(),
+            }
+        }
+    }
+
+    pub(crate) fn supports_shader_model_6_6(&self) -> bool {
+        self.highest_shader_model.0 >= D3D_SHADER_MODEL_6_6.0
+    }
+
+    pub(crate) fn supports_mesh_shaders(&self) -> bool {
+        self.supports_shader_model_6_6()
+            && self.mesh_shader_tier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+    }
+
+    pub(crate) fn supports_wave_size(&self, required: Option<u32>) -> bool {
+        match required {
+            None => true,
+            Some(n) => {
+                self.wave_ops && self.wave_lane_count_min <= n && n <= self.wave_lane_count_max
+            }
+        }
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        let sm_major = (self.highest_shader_model.0 >> 4) & 0xf;
+        let sm_minor = self.highest_shader_model.0 & 0xf;
+        format!(
+            "adapter=\"{}\" ({:04x}:{:04x}, vram={}MiB, warp={}) sm={sm_major}.{sm_minor} bind_tier={} heap_tier={} wave={}..{}(ops={}) mesh_tier={} typed_uav={} enhanced_barriers={} va={}/{}b uma={}",
+            self.adapter_name,
+            self.vendor_id,
+            self.device_id,
+            self.dedicated_vram >> 20,
+            self.warp,
+            self.resource_binding_tier.0,
+            self.resource_heap_tier.0,
+            self.wave_lane_count_min,
+            self.wave_lane_count_max,
+            self.wave_ops,
+            self.mesh_shader_tier.0,
+            self.typed_uav_load_additional_formats,
+            self.enhanced_barriers,
+            self.max_gpu_va_bits_per_resource,
+            self.max_gpu_va_bits_per_process,
+            self.uma,
+        )
+    }
+}
+
+unsafe fn adapter_info(device: &ID3D12Device) -> Option<(String, u32, u32, u64, bool)> {
+    // SAFETY: GetAdapterLuid and DXGI adapter lookup by LUID are plain queries.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        let end = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..end]);
+        let software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0;
+        Some((
+            name,
+            desc.VendorId,
+            desc.DeviceId,
+            desc.DedicatedVideoMemory as u64,
+            software,
+        ))
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) caps: HostCaps,
+    format_support: Mutex<HashMap<i32, (D3D12_FORMAT_SUPPORT1, D3D12_FORMAT_SUPPORT2)>>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -64,8 +256,10 @@ unsafe impl Sync for Host {}
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
-static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
@@ -98,9 +292,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
-            ),
+            None if host.messages.is_none() => {
+                text.push_str("; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command")
+            }
             None => {}
         }
     }
@@ -153,7 +347,9 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        let warp =
+            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some();
+        if warp {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
@@ -162,6 +358,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let caps = HostCaps::query(&device, warp);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -185,9 +382,11 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        tracing::info!("host D3D12 device ready");
+        tracing::info!(caps = %caps.summary(), "host D3D12 device ready");
         Ok(Host {
             device,
+            caps,
+            format_support: Mutex::new(HashMap::new()),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -301,37 +500,41 @@ struct Deferred {
 
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
-    /// mesh shaders need both); logged once.
+    /// mesh shaders need both).
     pub(crate) fn mesh_shaders(&self) -> bool {
-        static MESH: OnceLock<bool> = OnceLock::new();
-        *MESH.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        self.caps.supports_mesh_shaders()
+    }
+
+    /// Cached `D3D12_FEATURE_FORMAT_SUPPORT` query for `format`.
+    #[allow(dead_code)]
+    pub(crate) fn format_support(
+        &self,
+        format: DXGI_FORMAT,
+    ) -> (D3D12_FORMAT_SUPPORT1, D3D12_FORMAT_SUPPORT2) {
+        let mut cache = self
+            .format_support
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache.entry(format.0).or_insert_with(|| {
+            let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: format,
+                ..Default::default()
             };
-            // SAFETY: each query writes its own structure of the given size.
+            // SAFETY: CheckFeatureSupport writes only into `data`.
             let ok = unsafe {
                 self.device
                     .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut data).cast(),
+                        size_of_val(&data) as u32,
                     )
                     .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut model).cast(),
-                            size_of_val(&model) as u32,
-                        )
-                        .is_ok()
             };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
-            mesh
+            if ok {
+                (data.Support1, data.Support2)
+            } else {
+                (D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE)
+            }
         })
     }
 
@@ -411,9 +614,19 @@ impl Host {
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .flat_map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
                 .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            tracing::warn!(
+                ms = gpu.as_millis(),
+                lists = runs.len(),
+                ?pipelines,
+                "slow host submission"
+            );
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -607,8 +820,14 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -701,9 +920,13 @@ impl HostList {
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
             unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                self.list
+                    .SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes.lock().unwrap_or_else(|e| e.into_inner()).push(what);
+            self.notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(what);
         }
     }
 
@@ -902,7 +1125,11 @@ struct Batch(Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>);
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
-        match self.0.iter_mut().find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow)) {
+        match self
+            .0
+            .iter_mut()
+            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+        {
             Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
             None => self.0.push((shadow.clone(), address, end)),
         }
@@ -952,7 +1179,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    crate::copystat::add(
+        crate::copystat::C::MoveUs,
+        moved.elapsed().as_micros() as u64,
+    );
     if whole {
         return;
     }
@@ -1134,9 +1364,8 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
+        let [cpu, gpu] =
+            [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -1430,7 +1659,11 @@ fn last_notes(runs: &[&HostList]) -> String {
         for (i, r) in runs.iter().enumerate() {
             let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
             for n in notes.iter().rev().take(6).rev() {
-                text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
+                text.push_str(&format!(
+                    "; list {i} of {}, of its {}: {n}",
+                    runs.len(),
+                    notes.len()
+                ));
             }
         }
         text
@@ -1447,9 +1680,16 @@ fn last_notes(runs: &[&HostList]) -> String {
 /// barriers overlaps on the GPU), by kind, and what the markers just
 /// before them say (`HostList::note_op`: diagnostics builds with
 /// device-removed data on).
-fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
+fn in_flight(
+    history: &[D3D12_AUTO_BREADCRUMB_OP],
+    markers: &[(u32, String)],
+    done: usize,
+) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
-    let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
+    let from = history[..done]
+        .iter()
+        .rposition(barrier)
+        .map_or(0, |b| b + 1);
     let to = history[done..]
         .iter()
         .position(barrier)
@@ -1568,5 +1808,93 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn warp_device() -> Option<ID3D12Device> {
+    // SAFETY: creates an isolated WARP software adapter device for deterministic tests.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+        device
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_caps(
+        sm: D3D_SHADER_MODEL,
+        wave_ops: bool,
+        wave_min: u32,
+        wave_max: u32,
+        mesh_tier: D3D12_MESH_SHADER_TIER,
+    ) -> HostCaps {
+        HostCaps {
+            adapter_name: "Synthetic Test GPU".to_owned(),
+            vendor_id: 0x10de,
+            device_id: 0x2484,
+            dedicated_vram: 8u64 << 30,
+            warp: false,
+            highest_shader_model: sm,
+            resource_binding_tier: D3D12_RESOURCE_BINDING_TIER_3,
+            resource_heap_tier: D3D12_RESOURCE_HEAP_TIER_2,
+            typed_uav_load_additional_formats: true,
+            wave_ops,
+            wave_lane_count_min: wave_min,
+            wave_lane_count_max: wave_max,
+            mesh_shader_tier: mesh_tier,
+            enhanced_barriers: true,
+            max_gpu_va_bits_per_resource: 40,
+            max_gpu_va_bits_per_process: 40,
+            uma: false,
+        }
+    }
+
+    #[test]
+    fn host_caps_wave_and_mesh_support_checks() {
+        // Wave32-only GPU (e.g. NVIDIA Ampere).
+        let wave32_only =
+            synthetic_caps(D3D_SHADER_MODEL_6_6, true, 32, 32, D3D12_MESH_SHADER_TIER_1);
+        assert!(wave32_only.supports_shader_model_6_6());
+        assert!(wave32_only.supports_mesh_shaders());
+        assert!(wave32_only.supports_wave_size(None));
+        assert!(wave32_only.supports_wave_size(Some(32)));
+        assert!(!wave32_only.supports_wave_size(Some(64)));
+        assert!(wave32_only.summary().contains("wave=32..32(ops=true)"));
+
+        // Wave32..64 GPU (e.g. AMD RDNA2).
+        let dual_wave =
+            synthetic_caps(D3D_SHADER_MODEL_6_7, true, 32, 64, D3D12_MESH_SHADER_TIER_1);
+        assert!(dual_wave.supports_wave_size(Some(32)));
+        assert!(dual_wave.supports_wave_size(Some(64)));
+
+        // GPU lacking SM 6.6 or mesh shaders or wave ops.
+        let legacy = synthetic_caps(
+            D3D_SHADER_MODEL_6_5,
+            false,
+            32,
+            32,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
+        );
+        assert!(!legacy.supports_shader_model_6_6());
+        assert!(!legacy.supports_mesh_shaders());
+        assert!(legacy.supports_wave_size(None));
+        assert!(!legacy.supports_wave_size(Some(32)));
+    }
+
+    #[test]
+    fn warp_caps_query_succeeds() {
+        let Some(device) = warp_device() else {
+            return;
+        };
+        let caps = HostCaps::query(&device, true);
+        assert!(caps.warp);
+        assert!(caps.supports_shader_model_6_6());
+        assert!(caps.summary().contains("warp=true"));
     }
 }

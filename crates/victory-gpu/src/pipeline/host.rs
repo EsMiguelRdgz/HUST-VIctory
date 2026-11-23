@@ -292,13 +292,33 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+        let host = host()?;
+        if !host.caps.supports_shader_model_6_6() {
+            return refuse("the host GPU lacks Shader Model 6.6", shaders);
+        }
+        if mesh.is_some() && !host.mesh_shaders() {
+            return refuse(
+                "the host GPU has no mesh shaders (or no shader model 6.6)",
+                shaders,
+            );
         }
         for (s, _) in &stages {
-            s.translated()?;
+            let t = s.translated()?;
+            if !host.caps.supports_wave_size(t.host.wave_size) {
+                tracing::warn!(
+                    ?shaders,
+                    required_wave = ?t.host.wave_size,
+                    wave_ops = host.caps.wave_ops,
+                    wave_min = host.caps.wave_lane_count_min,
+                    wave_max = host.caps.wave_lane_count_max,
+                    "host pipeline refused: required shader wave size unsupported by host GPU"
+                );
+                return refuse(
+                    "shader requires a wave size the host GPU does not support",
+                    shaders,
+                );
+            }
         }
-        let host = host()?;
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -527,15 +547,27 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
     }
     let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+        root: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            root.as_raw(),
+        ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+        mask: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+            g.sample_mask,
+        ),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+        targets: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            g.targets,
+        ),
+        dsv: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+            g.depth_format,
+        ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
