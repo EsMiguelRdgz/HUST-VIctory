@@ -588,7 +588,7 @@ pub(crate) fn start_monitor(
                             }
                         }
                     }
-                    if second.is_multiple_of(5) {
+                    if second == 2 || second.is_multiple_of(5) {
                         let line = summary(video());
                         tracing::info!("{line}");
                         report(&line);

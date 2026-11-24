@@ -382,14 +382,40 @@ impl Staging {
             return (size, lent);
         }
         if !committed(self.memory, size) {
+            if !partially_committed_mapped(self.memory, size) {
+                #[cfg(feature = "diagnostics")]
+                tracing::debug!(
+                    memory = ?self.memory,
+                    size,
+                    desc = ?self.layout.desc,
+                    "a sampled texture's memory is not committed"
+                );
+                return (0, None);
+            }
+            // Demand-committed physical-page texture with some committed pages
+            // and untouched trailing zero pages: read committed pages and fill
+            // uncommitted pages with zeros without forcing commit on them.
+            let Some(mut read) = take_read(size) else {
+                once!(size, "no memory to read a texture into; not detiled");
+                memstat::count(memstat::Event::Failures, 1);
+                return (0, None);
+            };
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let hash = blake3::hash(&read[..size]);
             #[cfg(feature = "diagnostics")]
-            tracing::debug!(
-                memory = ?self.memory,
-                size,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
-            );
-            return (0, None);
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            if last.hash == Some(hash) {
+                give_read(read);
+                return (size, None);
+            }
+            let lent = self.detile_lent(&read[..size]);
+            give_read(read);
+            if lent.is_some() {
+                last.hash = Some(hash);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            return (size, lent);
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
@@ -488,6 +514,37 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         p = info.BaseAddress as usize + info.RegionSize;
     }
     true
+}
+
+/// Whether `[at, at + len)` is entirely `MEM_MAPPED` (mapped physical-page
+/// views) with at least one `MEM_COMMIT` page. Returns `false` if any page is
+/// unmapped (`MEM_FREE`) or a placeholder (`MEM_PRIVATE`), or if none of the
+/// pages have been written/committed yet.
+fn partially_committed_mapped(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let mut p = at as usize;
+    let end = p.saturating_add(len);
+    let mut any_committed = false;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 || info.Type != MEM_MAPPED {
+            return false;
+        }
+        if info.State == MEM_COMMIT {
+            any_committed = true;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            break;
+        }
+        p = next;
+    }
+    any_committed
 }
 
 /// The staging state of a title texture, made on first use.

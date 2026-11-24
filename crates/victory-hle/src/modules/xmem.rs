@@ -15,11 +15,12 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_MAPPED,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_RESERVE,
-    UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READWRITE,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
+    VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -174,6 +175,13 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
+        if info.host.State == MEM_RESERVE
+            && info.host.Type == MEM_MAPPED
+            && is_mapped_physical(address as usize)
+        {
+            info.host.State = MEM_COMMIT;
+            info.host.Protect = PAGE_READWRITE;
+        }
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS
         } else {
@@ -343,19 +351,46 @@ struct Section {
 }
 
 impl Section {
-    /// Notes pages `[first, first + n)` committed; counts those that were not.
-    fn committed(&self, first: usize, n: usize) {
+    /// Notes pages `[first, first + n)` committed; counts those that were not
+    /// and returns how many pages became newly committed.
+    fn committed(&self, first: usize, n: usize) -> usize {
         let mut committed = self.committed.lock().unwrap_or_else(|e| e.into_inner());
         let Some(pages) = committed.get_mut(first..first + n) else {
-            return;
+            return 0;
         };
         let new = pages.iter().filter(|&&c| !c).count();
-        pages.fill(true);
-        victory_gpu::memstat::adjust(
-            victory_gpu::memstat::Kind::GuestPhysical,
-            (new * PAGE) as u64,
-            0,
-        );
+        if new > 0 {
+            pages.fill(true);
+            victory_gpu::memstat::adjust(
+                victory_gpu::memstat::Kind::GuestPhysical,
+                (new * PAGE) as u64,
+                0,
+            );
+        }
+        new
+    }
+
+    /// Returns contiguous `(offset_in_range, count)` runs within `[first, first + n)`
+    /// that are already committed in this section.
+    fn committed_runs(&self, first: usize, n: usize) -> Vec<(usize, usize)> {
+        let committed = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pages) = committed.get(first..first + n) else {
+            return Vec::new();
+        };
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < pages.len() {
+            if !pages[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < pages.len() && pages[i] {
+                i += 1;
+            }
+            runs.push((start, i - start));
+        }
+        runs
     }
 }
 
@@ -529,7 +564,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
             unsafe { UnmapViewOfFile(view) };
             return false;
         }
-        slice.section.committed(slice.index, 1);
+        let newly_committed = slice.section.committed(slice.index, 1) > 0;
         let n = (PAGE - within).min(data.len() - done);
         // SAFETY: the view holds `PAGE` bytes; `within + n <= PAGE`.
         unsafe {
@@ -538,6 +573,26 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
                 .add(within)
                 .copy_from_nonoverlapping(data[done..].as_ptr(), n);
             UnmapViewOfFile(view);
+        }
+        if newly_committed {
+            let mut remapped = Vec::new();
+            {
+                let physical = physical();
+                for (&view_base, &(view_len, ref vslice)) in &physical.views {
+                    if Arc::ptr_eq(&vslice.section, &slice.section) {
+                        let pages_in_view = view_len / PAGE;
+                        if slice.index >= vslice.index && slice.index < vslice.index + pages_in_view
+                        {
+                            let addr = view_base + (slice.index - vslice.index) * PAGE;
+                            let _ = commit(addr, PAGE);
+                            remapped.push(addr);
+                        }
+                    }
+                }
+            }
+            for addr in remapped {
+                victory_gpu::title_memory_remapped(addr, PAGE);
+            }
         }
         done += n;
     }
@@ -645,9 +700,180 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// Opt-out diagnostic toggle (`VICTORY_EAGER_PHYSICAL_COMMIT=1`) to commit all
+/// physical pages eagerly on `XMemMapPhysicalPages` instead of demand-committing
+/// each 64 KiB page on first CPU/kernel/GPU access.
+fn eager_physical_commit() -> bool {
+    static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EAGER
+        .get_or_init(|| std::env::var_os("VICTORY_EAGER_PHYSICAL_COMMIT").is_some_and(|v| v == "1"))
+}
+
+/// Whether `address` currently lies inside a mapped physical-page view.
+fn is_mapped_physical(address: usize) -> bool {
+    let physical = physical();
+    physical
+        .views
+        .range(..=address)
+        .next_back()
+        .is_some_and(|(&base, &(len, _))| address < base.saturating_add(len))
+}
+
+/// Ensures every demand-mapped physical page overlapping `[at, at + len)` is
+/// committed in its view before a host kernel write (`ReadFile`, `fread`,
+/// DirectStorage memory read) or GPU copy-back writes into it.
+pub fn ensure_committed(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut remapped = Vec::new();
+    {
+        let physical = physical();
+        let first = physical
+            .views
+            .range(..=at)
+            .next_back()
+            .filter(|&(&base, &(size, _))| base.saturating_add(size) > at)
+            .map(|(&base, _)| base);
+        let view_bases: Vec<usize> = first
+            .into_iter()
+            .chain(
+                physical
+                    .views
+                    .range(at.saturating_add(1)..end)
+                    .map(|(&b, _)| b),
+            )
+            .collect();
+        for view_base in view_bases {
+            let Some(&(view_len, ref slice)) = physical.views.get(&view_base) else {
+                continue;
+            };
+            let lo = at.max(view_base) & !(PAGE - 1);
+            let hi = end
+                .min(view_base.saturating_add(view_len))
+                .next_multiple_of(PAGE);
+            let hi = hi.min(view_base.saturating_add(view_len));
+            if hi <= lo {
+                continue;
+            }
+            let first_page = slice.index + (lo - view_base) / PAGE;
+            let page_count = (hi - lo) / PAGE;
+            // Only call `VirtualAlloc(MEM_COMMIT)` if any sub-range is still
+            // uncommitted (`MEM_RESERVE`), avoiding redundant syscalls on
+            // already-committed hot ranges.
+            let mut cur = lo;
+            let mut needs_commit = false;
+            while cur < hi {
+                // SAFETY: plain `VirtualQuery` on a mapped view.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: valid output pointer of the right size.
+                let n = unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) };
+                if n == 0 || info.RegionSize == 0 {
+                    needs_commit = true;
+                    break;
+                }
+                if info.State != MEM_COMMIT {
+                    needs_commit = true;
+                    break;
+                }
+                let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+                if next <= cur {
+                    break;
+                }
+                cur = next;
+            }
+            if needs_commit && commit(lo, hi - lo) {
+                slice.section.committed(first_page, page_count);
+                remapped.push((lo, hi - lo));
+            }
+        }
+    }
+    for (base, size) in remapped {
+        victory_gpu::title_memory_remapped(base, size);
+    }
+}
+
+/// Registers the vectored exception handler that demand-commits `SEC_RESERVE`
+/// physical-page views on first CPU read/write (64 KiB granularity) and wires
+/// `victory_gpu::use_commit_range(ensure_committed)`.
+fn install_demand_commit() {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS,
+    };
+
+    unsafe extern "system" fn on_physical_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the OS passes a valid `EXCEPTION_POINTERS` record.
+        let r = unsafe { &*(*info).ExceptionRecord };
+        const READ: usize = 0;
+        const WRITE: usize = 1;
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            || r.NumberParameters < 2
+            || (r.ExceptionInformation[0] != READ && r.ExceptionInformation[0] != WRITE)
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let at = r.ExceptionInformation[1];
+        let committed_page = {
+            let physical = physical();
+            let Some((&view_base, &(_view_len, ref slice))) = physical
+                .views
+                .range(..=at)
+                .next_back()
+                .filter(|&(&base, &(size, _))| at < base.saturating_add(size))
+            else {
+                return EXCEPTION_CONTINUE_SEARCH;
+            };
+            let page_base = at & !(PAGE - 1);
+            let page_idx = slice.index + (page_base - view_base) / PAGE;
+            // SAFETY: plain `VirtualQuery` on our mapped view.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out pointer.
+            let queried =
+                unsafe { VirtualQuery(page_base as *const _, &mut mbi, size_of_val(&mbi)) };
+            if queried == 0 {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            if mbi.State == MEM_COMMIT {
+                // If another thread just demand-committed this page to RW while
+                // we waited for `PHYSICAL`, retry the faulting instruction.
+                // If it is `PAGE_READONLY`, let `victory_gpu::watch`'s VEH
+                // handle the write-watch guard fault.
+                if (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0 {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            if mbi.State != MEM_RESERVE {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            if !commit(page_base, PAGE) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            slice.section.committed(page_idx, 1);
+            Some(page_base)
+        };
+        if let Some(page_base) = committed_page {
+            victory_gpu::title_memory_remapped(page_base, PAGE);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        victory_gpu::use_commit_range(ensure_committed);
+        // SAFETY: handler only commits pages in our own `PHYSICAL.views`.
+        unsafe { AddVectoredExceptionHandler(1, Some(on_physical_fault)) };
+    });
+}
+
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    install_demand_commit();
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -678,12 +904,27 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    if eager_physical_commit() {
+        if !commit(base, len) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            return false;
+        }
+        slice.section.committed(slice.index, len / PAGE);
+    } else {
+        // Demand-commit mode: untouched pages remain `MEM_RESERVE` (0 bytes of
+        // system commit) until first CPU, kernel, or GPU write access. Any
+        // pages already committed in this section (e.g. written via
+        // `write_physical` or aliased via `map_alias` / `unmap` split) are
+        // made `MEM_COMMIT` in this view at 0 additional system commit cost.
+        for (off_pages, count_pages) in slice.section.committed_runs(slice.index, len / PAGE) {
+            if !commit(base + off_pages * PAGE, count_pages * PAGE) {
+                // SAFETY: the view just mapped, back to a placeholder.
+                unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+                return false;
+            }
+        }
     }
-    slice.section.committed(slice.index, len / PAGE);
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     physical.views.insert(base, (len, slice));
@@ -1030,13 +1271,21 @@ mod tests {
 
     /// Freeing most of a pool gives its commit back (it used to stay charged
     /// until the last page was freed), and freeing all of it gives back the
-    /// rest. The system commit moves with other processes too: margins.
+    /// rest. Under demand-commit, mapping alone charges ~0 MiB until pages
+    /// are actually touched. The system commit moves with other processes too:
+    /// margins.
     #[test]
     fn partly_freed_physical_pages_return_their_commit() {
         let steps = physical_page_commit_steps(256 * MIB);
         let step = |name| steps.iter().find(|s| s.0 == name).expect("step").1 / MIB as i128;
         assert!(step("allocated") < 64, "{steps:?}");
-        assert!(step("mapped") > 192, "{steps:?}");
+        if !eager_physical_commit() {
+            assert!(
+                step("mapped") < 64,
+                "untouched mapped physical pool must not charge system commit: {steps:?}"
+            );
+        }
+        assert!(step("touched") > 192, "{steps:?}");
         assert!(
             step("unmapped") > 192,
             "allocated pages keep their data: {steps:?}"
@@ -1063,7 +1312,19 @@ mod tests {
         assert!(!at.is_null());
         let before = live(Kind::GuestPhysical).0;
         assert_eq!(XMemMapPhysicalPages(at, n, pages.as_ptr()), at);
-        // Mapped twice (a second view of the first chunk): still once.
+        if !eager_physical_commit() {
+            // Untouched mapped pages consume 0 GuestPhysical commit.
+            assert!(
+                live(Kind::GuestPhysical).0 < before + (n * PAGE) as u64,
+                "demand-mapped pages should not be eagerly committed"
+            );
+        }
+        // Touch every page via CPU write so all `n` pages are committed.
+        for i in 0..n {
+            // SAFETY: inside our mapped view; VEH demand-commits each page.
+            unsafe { at.cast::<u8>().add(i * PAGE).write(1) };
+        }
+        // Mapped twice (a second view of the first chunk): still counted once.
         assert!(write_physical(&pages[..1], 0, &[1]));
         let mapped = live(Kind::GuestPhysical).0;
         assert!(mapped >= before + (n * PAGE) as u64, "{before} {mapped}");
@@ -1075,9 +1336,91 @@ mod tests {
         unsafe { VirtualFree(at, 0, MEM_RELEASE) };
     }
 
-    /// Allocates `size` bytes of physical pages, maps them, unmaps them, frees
-    /// the first 7/8, then the rest; the system commit after each step
-    /// relative to before the allocation.
+    #[test]
+    fn demand_committed_physical_pages_commit_on_read_write_and_kernel_io() {
+        use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+        let mut pages = [0usize; 6];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        assert_eq!(XMemMapPhysicalPages(base, n, pages.as_ptr()), base);
+
+        // XMemVirtualQuery reports mapped physical views as committed graphics memory.
+        let qi = query(base);
+        assert_eq!(qi.host.State, MEM_COMMIT);
+        assert_eq!(qi.flags, GRAPHICS);
+
+        // Page 0: first CPU read demand-commits zeroed page.
+        // SAFETY: mapped physical view.
+        assert_eq!(unsafe { base.cast::<u8>().read() }, 0);
+
+        // Page 1: first CPU write demand-commits and persists.
+        // SAFETY: mapped physical view.
+        unsafe { base.cast::<u8>().add(PAGE).write(0x5A) };
+        // SAFETY: mapped physical view.
+        assert_eq!(unsafe { base.cast::<u8>().add(PAGE).read() }, 0x5A);
+
+        // Page 2: untouched page becomes kernel-writable via `ensure_committed`.
+        let p2 = base.wrapping_byte_add(2 * PAGE);
+        ensure_committed(p2 as usize, PAGE);
+        let payload = [0xA5u8; 16];
+        let mut written = 0usize;
+        // SAFETY: `p2` was committed by `ensure_committed`.
+        let ok = unsafe {
+            WriteProcessMemory(
+                GetCurrentProcess(),
+                p2,
+                payload.as_ptr().cast(),
+                payload.len(),
+                &mut written,
+            )
+        };
+        assert_ne!(ok, 0);
+        assert_eq!(written, payload.len());
+        // SAFETY: `p2` is committed and contains `payload`.
+        assert_eq!(unsafe { p2.cast::<u8>().read() }, 0xA5);
+
+        // Page 3: `write_physical` into an untouched already-mapped view commits
+        // the view so reads see the written byte immediately.
+        assert!(write_physical(&pages[3..4], 4, &[0x77]));
+        // SAFETY: mapped physical view.
+        assert_eq!(unsafe { base.cast::<u8>().add(3 * PAGE + 4).read() }, 0x77);
+
+        // Pages 4..6: concurrent multi-threaded reads and writes on untouched pages.
+        let p4 = base.wrapping_byte_add(4 * PAGE) as usize;
+        let p5 = base.wrapping_byte_add(5 * PAGE) as usize;
+        std::thread::scope(|s| {
+            for t in 0..8usize {
+                s.spawn(move || {
+                    // SAFETY: mapped physical views; VEH serializes concurrent faults.
+                    unsafe {
+                        let _ = (p4 as *const u8).add(t).read();
+                        (p5 as *mut u8).add(t).write((t + 1) as u8);
+                    }
+                });
+            }
+        });
+        for t in 0..8usize {
+            // SAFETY: written above.
+            assert_eq!(unsafe { (p5 as *const u8).add(t).read() }, (t + 1) as u8);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(base, n, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+        // SAFETY: our own placeholder reservation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    /// Allocates `size` bytes of physical pages, maps them, touches them,
+    /// unmaps them, frees the first 7/8, then the rest; the system commit after
+    /// each step relative to before the allocation.
     fn physical_page_commit_steps(size: usize) -> Vec<(&'static str, i128)> {
         let commit = || victory_gpu::memstat::system_commit().expect("commit").0 as i128;
         let n = size / PAGE;
@@ -1100,6 +1443,11 @@ mod tests {
         assert!(!at.is_null());
         assert_eq!(XMemMapPhysicalPages(at, n, pages.as_ptr()), at);
         steps.push(("mapped", commit() - base));
+        for i in 0..n {
+            // SAFETY: inside our mapped view; demand-commits every 64 KiB page.
+            unsafe { at.cast::<u8>().add(i * PAGE).write(1) };
+        }
+        steps.push(("touched", commit() - base));
         assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
         steps.push(("unmapped", commit() - base));
         let freed = n / 8 * 7;

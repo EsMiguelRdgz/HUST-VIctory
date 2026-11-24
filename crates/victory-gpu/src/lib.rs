@@ -54,8 +54,36 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
 #[cfg(windows)]
-pub use watch::writing as kernel_will_write;
+static COMMIT_RANGE: std::sync::OnceLock<fn(usize, usize)> = std::sync::OnceLock::new();
+
+/// Registers the runtime's callback (`xmem::ensure_committed`) that commits
+/// any demand-mapped guest physical pages intersecting `[at, at + len)`.
+#[cfg(windows)]
+pub fn use_commit_range(commit: fn(usize, usize)) {
+    let _ = COMMIT_RANGE.set(commit);
+}
+
+/// Ensures any demand-mapped guest physical pages in `[at, at + len)` are
+/// committed before a kernel or GPU-writeback operation writes into them.
+#[cfg(windows)]
+pub(crate) fn ensure_title_committed(at: usize, len: usize) {
+    if len > 0
+        && let Some(commit) = COMMIT_RANGE.get()
+    {
+        commit(at, len);
+    }
+}
+
+/// Called before the host kernel writes into `[at, at + len)` (`ReadFile`,
+/// `fread`, DirectStorage memory reads): ensures demand-mapped physical pages
+/// are committed and removes write-watch read-only guards.
+#[cfg(windows)]
+pub fn kernel_will_write(at: usize, len: usize) {
+    ensure_title_committed(at, len);
+    watch::writing(at, len);
+}
 
 /// Called by the runtime (`xmem`) when title physical/virtual mappings in
 /// `[at, at + len)` change: updates write-watch guard protections and evicts

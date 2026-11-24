@@ -1669,10 +1669,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 {
         return;
     }
     if title_dst {
+        crate::ensure_title_committed(dst as usize, len);
+        if !crate::texture::committed(dst, len) {
+            return;
+        }
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
@@ -1730,7 +1734,11 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 {
+        return;
+    }
+    crate::ensure_title_committed(dst as usize, len);
+    if write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
