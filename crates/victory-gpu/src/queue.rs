@@ -123,7 +123,15 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&host_lists);
+        let completed = host.execute(&host_lists);
+        if completed {
+            for &l in lists {
+                crate::list::on_executed(l);
+            }
+            if crate::memstat::under_pressure(0) {
+                crate::shadow::relieve_pressure(1);
+            }
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);

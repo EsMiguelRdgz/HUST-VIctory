@@ -85,9 +85,20 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        self.release_dynamic();
+    }
+}
+
+impl State {
+    /// Returns all dynamic descriptor slots held by this command list to their
+    /// `HostHeap`s, immediately dropping `HostHeap.owners` (`Arc<Shadow>`) and
+    /// `HostHeap.tex_owners` (`ID3D12Resource`) once the GPU finishes executing
+    /// the list rather than waiting 1-2 frames for `Reset()`.
+    pub(crate) fn release_dynamic(&mut self) {
+        for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
         }
+        self.fresh_tables.clear();
     }
 }
 
@@ -1360,7 +1371,10 @@ mod tests {
             "exhausted dynamic pool must refuse draw instead of colliding"
         );
 
-        // 6. Resetting draw state releases and re-nulls only the 4 slots it owned.
+        // 6. Releasing post-execution dynamic slots immediately frees the 4 slots
+        //    owned by this list (and `reset()` afterwards is idempotent).
+        state.release_dynamic();
+        assert_eq!(host_heap.dynamic_in_use(), 12);
         state.reset(std::ptr::null_mut());
         assert_eq!(host_heap.dynamic_in_use(), 12);
         host_heap.release(held, 12);

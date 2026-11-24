@@ -133,6 +133,15 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// Releases post-execution dynamic descriptor slots (`HostHeap.owners` and
+/// `HostHeap.tex_owners`) once the host GPU finishes running `this`.
+#[cfg(windows)]
+pub(crate) fn on_executed(this: This) {
+    if !this.is_null() {
+        with_state(this, |_, state| state.release_dynamic());
+    }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {

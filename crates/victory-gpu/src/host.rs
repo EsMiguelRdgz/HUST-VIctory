@@ -789,8 +789,9 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
-    pub(crate) fn execute(&self, runs: &[&HostList]) {
+    /// Runs closed lists and waits for them. Returns `true` if the GPU fence
+    /// confirmed completion.
+    pub(crate) fn execute(&self, runs: &[&HostList]) -> bool {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -965,9 +966,7 @@ impl Host {
         }
         self.log_messages();
         drop(submitted);
-        if completed && crate::memstat::under_pressure(0) {
-            crate::shadow::relieve_pressure(1);
-        }
+        completed
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1172,17 +1171,16 @@ impl HostList {
         }
     }
 
-    /// Releases post-execution eviction pins (`list_guard`, `bindless_guard`)
-    /// and downgrades strong `Arc<Shadow>` refs in `Step::Refresh` /
-    /// `Step::GpuWrite` to `Weak<Shadow>` as soon as the host GPU finishes
-    /// running this list, so idle textures and buffer/loose shadows can be
-    /// reclaimed before the title calls `Reset()` frames later while keeping
-    /// recorded `kept` COM refs, `uploads`, `writes`, and `scratch` intact in
-    /// case the title re-executes a closed list without calling `Reset()`.
+    /// Releases post-execution eviction pins (`list_guard`, `bindless_guard`),
+    /// kept COM refs, upload buffers, and downgrades strong `Arc<Shadow>` refs
+    /// in `Step::Refresh` / `Step::GpuWrite` to `Weak<Shadow>` as soon as the
+    /// host GPU finishes running this list, so evicted `ID3D12Resource`s and
+    /// idle buffer/loose shadows free their VRAM/commit immediately rather than
+    /// waiting 1-2 frames for `Reset()`.
     fn on_executed(&self) {
         self.executed.store(true, Ordering::Release);
         let mut dropped_shadows: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
-        let mut guards = {
+        let (mut guards, kept, uploads) = {
             let mut deferred = self.deferred();
             let mut out = std::mem::take(&mut deferred.guards);
             for step in &mut deferred.copies {
@@ -1211,15 +1209,28 @@ impl HostList {
                     _ => {}
                 }
             }
-            out
+            deferred.kept_ptrs.clear();
+            let kept = std::mem::take(&mut deferred.kept);
+            let uploads = std::mem::take(&mut deferred.uploads);
+            (out, kept, uploads)
         };
         guards.clear();
         drop(dropped_shadows);
+        drop(kept);
+        drop(uploads);
         let state_guards: Vec<Option<std::sync::Arc<()>>> = {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
             states.values_mut().map(|entry| entry.2.take()).collect()
         };
         drop(state_guards);
+        if crate::memstat::under_pressure(0) {
+            let dropped_chunks = {
+                let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+                (scratch.current, scratch.used) = (0, 0);
+                std::mem::take(&mut scratch.chunks)
+            };
+            drop(dropped_chunks);
+        }
     }
 
     /// Only after the list's last submission finished (every one is waited
