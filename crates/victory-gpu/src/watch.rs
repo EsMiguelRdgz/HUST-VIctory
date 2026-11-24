@@ -392,24 +392,60 @@ mod tests {
 
     #[test]
     fn unmapped_holes_in_guarded_views_are_cached_until_remapped() {
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFileEx,
+            UnmapViewOfFile,
         };
-        // SAFETY: map a 1-block pagefile view and query across 2 blocks so
-        // the second block is an unmapped hole past the view end.
-        let view = unsafe {
-            let section = CreateFileMappingW(
+        // Map a 1-block pagefile view and query across 2 blocks so the second
+        // block is a hole past the view end. The hole is claimed with a
+        // reservation (no commit, so `VirtualProtect` fails there): otherwise
+        // a concurrent allocation could land in it and be made read-only.
+        // SAFETY: a fresh pagefile section, closed once its view is gone.
+        let section = unsafe {
+            CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
                 PAGE_READWRITE,
                 0,
                 BLOCK as u32,
                 std::ptr::null(),
-            );
-            assert!(!section.is_null());
-            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize
+            )
         };
-        assert_ne!(view, 0);
+        assert!(!section.is_null());
+        let (view, hole) = (0..64)
+            .find_map(|_| {
+                // SAFETY: a free 2-block range is found by reserving and
+                // releasing it, then the view and a reservation fill it; any
+                // allocation racing in makes a step fail and is left alone.
+                unsafe {
+                    let base =
+                        VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE, PAGE_READWRITE)
+                            as usize;
+                    assert_ne!(base, 0);
+                    VirtualFree(base as *mut _, 0, MEM_RELEASE);
+                    let view =
+                        MapViewOfFileEx(section, FILE_MAP_WRITE, 0, 0, BLOCK, base as *const _)
+                            .Value as usize;
+                    if view != base {
+                        return None;
+                    }
+                    let hole = VirtualAlloc(
+                        (base + BLOCK) as *const _,
+                        BLOCK,
+                        MEM_RESERVE,
+                        PAGE_READWRITE,
+                    );
+                    if hole as usize == base + BLOCK {
+                        return Some((view, hole));
+                    }
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: view as *mut _,
+                    });
+                    None
+                }
+            })
+            .expect("a view with free address space after it");
         let mapped_block = view / BLOCK;
         let hole_block = mapped_block + 1;
 
@@ -426,13 +462,13 @@ mod tests {
         title_memory_remapped(view, 2 * BLOCK);
         assert!(!guards().unmapped.contains(&hole_block));
 
-        // SAFETY: our mapped view.
+        // SAFETY: our mapped view and reservation.
         unsafe {
-            UnmapViewOfFile(
-                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: view as *mut _,
-                },
-            );
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            VirtualFree(hole, 0, MEM_RELEASE);
+            CloseHandle(section);
         }
     }
 }
