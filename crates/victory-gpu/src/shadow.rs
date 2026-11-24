@@ -556,7 +556,10 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let bytes = len.next_multiple_of(1 << 16);
-        let (buffer, data) = host()?.shared_buffer(bytes)?;
+        if memstat::under_pressure(bytes) {
+            relieve_pressure(bytes);
+        }
+        let (buffer, data) = host_buffer(Kind::Buffer, bytes)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -629,13 +632,76 @@ fn reclaim(
             break;
         }
         map.remove(&key);
+        memstat::count(memstat::Event::Reclaimed, 1);
         freed += bytes;
         over = over.saturating_sub(bytes);
     }
     if freed > 0 {
         tracing::debug!(freed, "unused host copies of title memory freed");
+        memstat::count(memstat::Event::ReclaimedBytes, freed);
     }
     freed
+}
+
+/// Memory pressure (commit headroom low before an allocation of
+/// `incoming` bytes): frees every idle loose and aligned copy whatever the
+/// budgets, and the snapshot and texture pools; at most once a second, so
+/// a title that keeps allocating near the limit does not thrash. Returns
+/// the bytes freed. Nothing in use is freed: copies a list, a descriptor or
+/// a pending shader write holds stay, as do allocations the title owns.
+pub(crate) fn relieve_pressure(incoming: u64) -> u64 {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+            return 0;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    memstat::count(memstat::Event::PressureReclaims, 1);
+    let mut freed = 0;
+    for map in [&LOOSE, &ALIGNED] {
+        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+        freed += reclaim(&mut map, u64::MAX / 2, 0, 0);
+    }
+    freed += drain_snapshot_pool();
+    freed += crate::texture::drain_pools();
+    let headroom = memstat::system_commit().map(|(total, limit)| limit.saturating_sub(total));
+    tracing::warn!(
+        incoming,
+        freed,
+        headroom,
+        "memory pressure: idle host copies and pools freed"
+    );
+    freed
+}
+
+/// Frees every pooled snapshot buffer; returns their bytes.
+fn drain_snapshot_pool() -> u64 {
+    let pool = std::mem::take(&mut *SNAPSHOT_POOL.lock().unwrap_or_else(|e| e.into_inner()));
+    // One free per buffer, as each was counted.
+    for v in &pool {
+        memstat::free(Kind::SnapshotPool, v.capacity() as u64);
+    }
+    pool.iter().map(|v| v.capacity() as u64).sum()
+}
+
+/// A host buffer of `bytes` for a copy of `kind`: relieves memory pressure
+/// first if allocating it would leave little commit headroom, and reports
+/// a failure with its category and size.
+fn host_buffer(kind: Kind, bytes: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let made = host()?.shared_buffer(bytes);
+    if made.is_none() {
+        memstat::count(memstat::Event::Failures, 1);
+        let commit = memstat::system_commit();
+        tracing::error!(
+            ?kind,
+            bytes,
+            ?commit,
+            "no host memory for a copy of title memory; the draws that need it are skipped"
+        );
+    }
+    made
 }
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -656,28 +722,38 @@ pub(crate) fn find_aligned(address: u64, len: u64, align: u64) -> Option<Arc<Sha
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
-    let mut map = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = map
-        .range(..=(address, u64::MAX))
-        .rev()
-        .take(32)
-        .find(|&(&(start, slen), _)| {
-            start <= address
-                && start.saturating_add(slen) >= end
-                && (address - start).is_multiple_of(align)
-        })
-        .map(|(_, s)| s.touch())
-    {
-        return Some(existing);
-    }
     let bytes = len.max(align).next_multiple_of(1 << 16);
+    let mut relieved = false;
+    let mut map = loop {
+        let map = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map
+            .range(..=(address, u64::MAX))
+            .rev()
+            .take(32)
+            .find(|&(&(start, slen), _)| {
+                start <= address
+                    && start.saturating_add(slen) >= end
+                    && (address - start).is_multiple_of(align)
+            })
+            .map(|(_, s)| s.touch())
+        {
+            return Some(existing);
+        }
+        if relieved || !memstat::under_pressure(bytes) {
+            break map;
+        }
+        // Relief takes this map's lock; look again after it.
+        drop(map);
+        relieve_pressure(bytes);
+        relieved = true;
+    };
     reclaim(
         &mut map,
         memstat::live(Kind::Aligned).0,
         ALIGNED_BUDGET,
         bytes,
     );
-    let (buffer, data) = host()?.shared_buffer(bytes)?;
+    let (buffer, data) = host_buffer(Kind::Aligned, bytes)?;
     crate::host::name(&buffer, || {
         format!("aligned buffer {address:#x}+{bytes:#x} (align {align})")
     });
@@ -702,19 +778,28 @@ pub(crate) fn find_aligned(address: u64, len: u64, align: u64) -> Option<Arc<Sha
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    // Windows start on window boundaries, so one holding the range starts at
-    // or before `start`; there are few, so look at all that do.
-    if let Some(shadow) = map
-        .range(..=(start, u64::MAX))
-        .rev()
-        .find(|&(&(s, l), _)| s.saturating_add(l) >= end)
-        .map(|(_, s)| s.touch())
-    {
-        return Some(shadow);
-    }
+    let mut relieved = false;
+    let mut map = loop {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // Windows start on window boundaries, so one holding the range
+        // starts at or before `start`; there are few, so look at all that do.
+        if let Some(shadow) = map
+            .range(..=(start, u64::MAX))
+            .rev()
+            .find(|&(&(s, l), _)| s.saturating_add(l) >= end)
+            .map(|(_, s)| s.touch())
+        {
+            return Some(shadow);
+        }
+        if relieved || !memstat::under_pressure(len) {
+            break map;
+        }
+        drop(map);
+        relieve_pressure(len);
+        relieved = true;
+    };
     reclaim(&mut map, memstat::live(Kind::Loose).0, LOOSE_BUDGET, len);
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data) = host_buffer(Kind::Loose, len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1135,6 +1220,38 @@ mod tests {
         assert_eq!(&title_mem[200..204], &[0x99u8; 4], "title write preserved");
         assert!(snapshot.get(0, 385).is_none(), "past a segment");
         unregister(fake_id, base as u64);
+        let _ = host_gpu;
+    }
+
+    /// Under memory pressure every idle copy and pooled buffer is freed,
+    /// copies in use stay, and relief runs at most once a second.
+    #[test]
+    fn pressure_relief_frees_idle_copies_and_pools() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        // Loose copies read nothing at creation: an address range of this
+        // test's own, which no other test's windows can cover.
+        let at = 0x5a5a_0000_0000u64;
+        let idle = Arc::downgrade(&loose(at, at + 64).expect("copy"));
+        let held = loose(at + WINDOW, at + WINDOW + 64).expect("copy");
+        return_snapshot_buf(Vec::with_capacity(1 << 20));
+        assert!(idle.upgrade().is_some(), "kept by the map");
+        // Wait out another test's relief, if any ran this second.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let freed = relieve_pressure(0);
+        assert!(freed >= WINDOW, "the idle window at least: {freed}");
+        assert!(idle.upgrade().is_none(), "idle copy freed");
+        assert!(
+            LOOSE
+                .lock()
+                .unwrap()
+                .values()
+                .any(|s| Arc::ptr_eq(s, &held))
+        );
+        assert!(SNAPSHOT_POOL.lock().unwrap().is_empty());
+        assert_eq!(relieve_pressure(0), 0, "not again within a second");
+        drop(held);
         let _ = host_gpu;
     }
 }

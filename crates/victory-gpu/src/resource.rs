@@ -782,6 +782,13 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
 /// Sets the state the host texture is in after a submission; returns the
 /// one it was in.
 #[cfg(windows)]
+/// The host state a title resource's host copy is in now.
+pub(crate) fn host_state(this: This) -> u32 {
+    resource(this)
+        .host_state
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn swap_host_state(this: This, state: u32) -> u32 {
     resource(this)
         .host_state
@@ -1644,6 +1651,167 @@ mod tests {
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]
+    /// Reads a 2D `width` x `height` RGBA8 host texture's mip 0 back.
+    fn read_rgba8(image: This, width: u32, height: u32) -> Vec<u8> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let host = crate::host::host().expect("host");
+        let pitch = (width * 4).next_multiple_of(256);
+        let len = u64::from(pitch * height);
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let host_image = host_resource(image).unwrap();
+        let back = host.new_list().unwrap();
+        let (_, before) = host_transition(image, 0x800).unwrap();
+        #[repr(C)]
+        struct Location {
+            resource: *const c_void,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width,
+            height,
+            depth: 1,
+            row_pitch: pitch,
+        };
+        let out_to = Location {
+            resource: readback.as_raw().cast_const(),
+            kind: 1,
+            footprint: rows,
+        };
+        let out_from = Location {
+            resource: host_image.as_raw().cast_const(),
+            kind: 0,
+            footprint: rows,
+        };
+        // SAFETY: an open list, live resources, locations in the host layout.
+        unsafe {
+            back.list.ResourceBarrier(&[crate::host::transition(
+                host_image,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            back.list.CopyTextureRegion(
+                (&raw const out_to).cast(),
+                0,
+                0,
+                0,
+                (&raw const out_from).cast(),
+                None,
+            );
+        }
+        back.close();
+        host.execute(&[&back]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy finished (execute waits); the buffer is `len` bytes.
+        let read = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), len as usize)
+        };
+        (0..height as usize)
+            .flat_map(|y| read[y * pitch as usize..][..width as usize * 4].to_vec())
+            .collect()
+    }
+
+    /// A title texture's memory reaches its host copy at the submission that
+    /// samples it, again only when the memory changed, through an upload
+    /// buffer lent for that submission (none is kept per texture).
+    #[test]
+    fn title_texture_contents_are_uploaded_when_they_change() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let (width, height) = (64u32, 32u32);
+        let mut image = null;
+        let desc = texture(u64::from(width), height, 28, 1);
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, &mut image),
+            S_OK
+        );
+        let (memory, d) = texture_memory(image).unwrap();
+        let layout = texture_layout(&d).unwrap().planes[0].layout.clone();
+        let linear = |seed: u8| -> Vec<u8> {
+            (0..width * height * 4)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        };
+        let write = |seed: u8| {
+            // SAFETY: the texture's memory, its layout's size.
+            let tiled =
+                unsafe { std::slice::from_raw_parts_mut(memory.cast_mut(), layout.size as usize) };
+            let pitch = width as usize * 4;
+            layout
+                .tile(tiled, 0, 0, &linear(seed), pitch, pitch * height as usize)
+                .unwrap();
+        };
+        let submit = || {
+            let list = host.new_list().unwrap();
+            crate::texture::upload(&list, image, host_resource(image).unwrap());
+            crate::list::ensure_state(&list, image, 0x40 | 0x80);
+            list.close();
+            let before = crate::texture::RECORDED.load(Relaxed);
+            host.execute(&[&list]);
+            crate::texture::RECORDED.load(Relaxed) - before
+        };
+        write(1);
+        assert_eq!(submit(), 1, "first use uploads");
+        assert_eq!(read_rgba8(image, width, height), linear(1));
+        assert_eq!(submit(), 0, "unchanged memory uploads nothing");
+        assert_eq!(
+            read_rgba8(image, width, height),
+            linear(1),
+            "and keeps its contents"
+        );
+        write(2);
+        assert_eq!(submit(), 1, "changed memory uploads again");
+        assert_eq!(read_rgba8(image, width, height), linear(2));
+        // Many changing submissions reuse lent buffers instead of growing.
+        let made = crate::memstat::made(crate::memstat::Kind::TextureStaging);
+        for seed in 3..43 {
+            write(seed);
+            assert_eq!(submit(), 1);
+        }
+        assert_eq!(read_rgba8(image, width, height), linear(42));
+        let new = crate::memstat::made(crate::memstat::Kind::TextureStaging) - made;
+        assert!(new <= 2, "{new} upload buffers made for 40 uploads");
+        crate::host::assert_no_debug_errors(&host.device);
+    }
+
     #[test]
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;

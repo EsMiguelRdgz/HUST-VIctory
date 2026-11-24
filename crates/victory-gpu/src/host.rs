@@ -572,6 +572,13 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Brings a title texture's host copy (title resource, host texture) up
+    /// to date if its memory changed: in the submission's prelude.
+    Texture(
+        std::sync::Arc<crate::texture::Staging>,
+        usize,
+        ID3D12Resource,
+    ),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -684,11 +691,15 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         let mut batch = Batch::default();
+        // Texture contents uploaded by the preludes: their upload buffers go
+        // back to the pool once the submission has run.
+        let mut uploads: Vec<crate::texture::Upload> = Vec::new();
         for list in runs {
-            list.run_deferred(&mut batch);
-            if let Some(prelude) = list.prelude() {
+            let mine = list.run_deferred(&mut batch);
+            if let Some(prelude) = list.prelude(&mine) {
                 lists.push(Some(prelude));
             }
+            uploads.extend(mine);
             lists.push(list.list.cast().ok());
         }
         batch.flush();
@@ -805,6 +816,8 @@ impl Host {
             COPY_BACK[1].fetch_add(changed_bytes, Ordering::Relaxed);
             COPY_BACK[2].fetch_add(write_us, Ordering::Relaxed);
         }
+        // The preludes' upload buffers are free again.
+        drop(uploads);
         for list in runs {
             let deferred = list.deferred();
             // After GPU copy-backs, write bottom-of-pipe markers so the title
@@ -1081,35 +1094,64 @@ impl HostList {
     }
 
     /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// its real state to the one the list starts with, copying `uploads`
+    /// into their textures on the way (through the copy destination state);
+    /// the textures' real states become those the list ends with.
+    fn prelude(&self, uploads: &[crate::texture::Upload]) -> Option<ID3D12CommandList> {
+        const COPY_DEST: u32 = 0x400;
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .iter()
-            .filter_map(|(&resource, &(first, last))| {
-                let resource = resource as crate::object::This;
-                let texture = crate::resource::host_resource(resource)?;
-                let real = crate::resource::swap_host_state(resource, last);
-                (real != first).then(|| {
-                    transition(
-                        texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(first as i32),
-                    )
-                })
-            })
-            .collect();
-        if barriers.is_empty() {
+        let uploading = |resource: usize| uploads.iter().any(|u| u.resource == resource);
+        let barrier = |texture: &ID3D12Resource, from: u32, to: u32| {
+            transition(
+                texture,
+                D3D12_RESOURCE_STATES(from as i32),
+                D3D12_RESOURCE_STATES(to as i32),
+            )
+        };
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for (&resource, &(first, last)) in states.iter() {
+            let this = resource as crate::object::This;
+            let Some(texture) = crate::resource::host_resource(this) else {
+                continue;
+            };
+            let real = crate::resource::swap_host_state(this, last);
+            if uploading(resource) {
+                if real != COPY_DEST {
+                    before.push(barrier(texture, real, COPY_DEST));
+                }
+                if first != COPY_DEST {
+                    after.push(barrier(texture, COPY_DEST, first));
+                }
+            } else if real != first {
+                before.push(barrier(texture, real, first));
+            }
+        }
+        // Uploaded textures the list does not move: back where they were.
+        for upload in uploads.iter().filter(|u| !states.contains_key(&u.resource)) {
+            let real = crate::resource::host_state(upload.resource as crate::object::This);
+            if real != COPY_DEST {
+                before.push(barrier(upload.texture(), real, COPY_DEST));
+                after.push(barrier(upload.texture(), COPY_DEST, real));
+            }
+        }
+        if before.is_empty() && after.is_empty() && uploads.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures and upload buffers are live until it has run.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                if !before.is_empty() {
+                    list.ResourceBarrier(&before);
+                }
+                for upload in uploads {
+                    upload.record(list);
+                }
+                if !after.is_empty() {
+                    list.ResourceBarrier(&after);
+                }
                 list.Close()
             })
         };
@@ -1289,10 +1331,25 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// At submission, brings title texture `resource`'s host copy
+    /// (`texture`) up to date if its memory changed (`staging`).
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        resource: usize,
+        texture: ID3D12Resource,
+    ) {
+        self.deferred()
+            .copies
+            .push(Step::Texture(staging, resource, texture));
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    /// Returns the texture contents to upload in the list's prelude.
+    fn run_deferred(&self, batch: &mut Batch) -> Vec<crate::texture::Upload> {
+        let mut uploads = Vec::new();
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -1353,10 +1410,15 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
+                Step::Texture(staging, resource, texture) => {
+                    uploads.extend(staging.refresh(*resource, texture));
+                    continue;
+                }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        uploads
     }
 }
 
