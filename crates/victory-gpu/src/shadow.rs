@@ -550,22 +550,61 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     );
 }
 
+/// Registered buffers at least this large (`8 MiB`) use `1 MiB` windowed
+/// `LOOSE` shadows for sub-range accesses (`<= WINDOWED_MAX_REQ`), avoiding
+/// monolithic 20-174 MiB `CUSTOM L0` host copies when draws only touch a small
+/// slice of a giant arena/ring buffer. Full-buffer views (`> WINDOWED_MAX_REQ`)
+/// still materialize the enclosing monolithic buffer shadow cleanly.
+const WINDOWED_BUFFER_MIN: u64 = 8 << 20;
+const WINDOWED_MAX_REQ: u64 = 4 << 20;
+
 /// The title released it; lists that still hold its copy keep it alive.
-/// Also prunes any aligned sub-buffer shadows inside its address range so
-/// freed buffers do not leak VRAM.
+/// Also prunes any aligned or strictly-contained loose sub-buffer shadows
+/// inside its address range so freed buffers do not leak commit.
 pub(crate) fn unregister(resource: usize, start: u64) {
     let removed = buffers().remove(&(start, resource));
     if let Some(entry) = removed {
         let end = entry.end;
         let mut aligned = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
         aligned.retain(|&(a_start, a_len), _| a_start + a_len <= start || a_start >= end);
+        drop(aligned);
+        let mut loose_map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        loose_map.retain(|&(l_start, l_len), _| !(l_start >= start && l_start + l_len <= end));
     }
 }
 
+/// Like [`find`], but caps the requested span to the enclosing buffer's
+/// remaining bytes (up to `max_len`), used by root CBV/SRV bindings where the
+/// title passes a GPU virtual address without an explicit byte length.
+pub(crate) fn find_up_to(address: u64, max_len: u64) -> Option<Arc<Shadow>> {
+    let want = {
+        let map = buffers();
+        let entry = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end > address);
+        match entry {
+            Some((_, e)) => {
+                if let Some(shadow) = &e.shadow {
+                    return Some(shadow.touch());
+                }
+                max_len.min(e.end - address).max(1)
+            }
+            None => max_len.max(1),
+        }
+    };
+    find(address, want)
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
-/// len)`, made on first use.
+/// len)`, made on first use. For sub-range accesses (`len <= 4 MiB`) inside
+/// large registered arena buffers (`>= 8 MiB`) that have no monolithic shadow,
+/// delegates to `1 MiB` windowed `LOOSE` shadows to avoid multi-hundred-MB
+/// commit amplification.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let end = address.checked_add(len.max(1))?;
+    let req_len = len.max(1);
+    let end = address.checked_add(req_len)?;
     let mut relieved = false;
     let (mut map, key) = loop {
         let map = buffers();
@@ -583,7 +622,12 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         if entry.shadow.is_some() || relieved {
             break (map, key);
         }
-        let bytes = (entry.end - key.0).next_multiple_of(1 << 16);
+        let buf_len = entry.end - key.0;
+        if buf_len >= WINDOWED_BUFFER_MIN && req_len <= WINDOWED_MAX_REQ {
+            drop(map);
+            return loose(address, end);
+        }
+        let bytes = buf_len.next_multiple_of(1 << 16);
         if !memstat::under_pressure(bytes) {
             break (map, key);
         }
@@ -595,24 +639,27 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
-        let len = entry.end - key.0;
+        let buf_len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let bytes = len.next_multiple_of(1 << 16);
+        let bytes = buf_len.next_multiple_of(1 << 16);
         let (buffer, data) = host_buffer(Kind::Buffer, bytes)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        crate::host::name(&buffer, || {
+            format!("title buffer {:#x}+{buf_len:#x}", key.0)
+        });
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
+        if buf_len >= 16 << 20 {
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
-                len,
+                len = buf_len,
+                req_len,
                 "large buffer copied to the host"
             );
         } else {
             tracing::debug!(
                 start = format_args!("{:#x}", key.0),
-                len,
+                len = buf_len,
                 "buffer copied to the host"
             );
         }
@@ -620,7 +667,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             (buffer, data, gpu, bytes),
             Kind::Buffer,
             key.0,
-            len,
+            buf_len,
         )));
     }
     entry.shadow.as_ref().map(Shadow::touch)
@@ -1782,6 +1829,48 @@ mod tests {
         );
 
         list.reset();
+        unregister(id, addr);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Sub-range accesses (`<= 4 MiB`) inside large registered arena buffers
+    /// (`>= 8 MiB`) must allocate only a `1 MiB` windowed `LOOSE` shadow rather
+    /// than a monolithic copy of the whole arena; larger accesses (`> 4 MiB`)
+    /// still fall back to the full monolithic buffer shadow cleanly.
+    #[test]
+    fn large_buffer_subrange_uses_windowed_loose_shadow() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mut arena = vec![0x5Au8; 16 << 20];
+        let addr = arena.as_mut_ptr() as u64;
+        let id = (addr as usize) ^ 0xCAFE_BABE;
+        register(id, addr, arena.len() as u64);
+
+        let sub = find(addr + 0x2000, 4096).expect("windowed subrange shadow");
+        assert_eq!(
+            sub.kind,
+            Kind::Loose,
+            "sub-range inside 16 MiB arena must use a windowed LOOSE shadow"
+        );
+        assert!(
+            sub.bytes <= 2 * WINDOW,
+            "windowed shadow must stay bounded, got {}",
+            sub.bytes
+        );
+        assert!(sub.update((addr + 0x2000) as usize, 4096) >= 4096);
+        let off = sub.offset(addr + 0x2000) as usize;
+        // SAFETY: `[off, off + 8)` lies inside `sub`'s mapped host buffer.
+        let got = unsafe { std::slice::from_raw_parts(sub.data.add(off), 8) };
+        assert_eq!(got, &[0x5Au8; 8]);
+        drop(sub);
+
+        // Full-range access (> WINDOWED_MAX_REQ) falls back to monolithic Buffer shadow.
+        let full = find(addr, 6 << 20).expect("monolithic fallback shadow");
+        assert_eq!(full.kind, Kind::Buffer);
+        assert_eq!(full.bytes, 16 << 20);
+        drop(full);
+
         unregister(id, addr);
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
