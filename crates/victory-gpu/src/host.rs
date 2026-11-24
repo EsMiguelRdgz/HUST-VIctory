@@ -627,12 +627,26 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Active-list guards (e.g. dynamic-table textures and bindless descriptor
+    /// heaps) held until list reset so eviction never frees resources or
+    /// mutates slots while this list is open or executing.
+    guards: Vec<std::sync::Arc<()>>,
+    /// Deferred bindless textures already checked for populated data on this list.
+    bindless_checked: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
 
 impl Host {
+    /// Runs `f` while no host GPU submission is executing (`submitted` lock held),
+    /// ensuring shader-visible descriptor updates and evicted resource drops never
+    /// race with an in-flight `ExecuteCommandLists` submission.
+    pub(crate) fn with_gpu_idle<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _idle = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both).
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -1104,6 +1118,18 @@ impl HostList {
                 deferred.kept.push(unk);
             }
         }
+    }
+
+    /// Holds an active-list guard (`Resource::list_guard` or
+    /// `HostHeap::bindless_guard`) until this list resets or drops.
+    pub(crate) fn pin(&self, guard: std::sync::Arc<()>) {
+        self.deferred().guards.push(guard);
+    }
+
+    /// Records `resource` as checked for bindless deferred-SRV population on
+    /// this list; returns `true` the first time per list reset.
+    pub(crate) fn bindless_checked(&self, resource: usize) -> bool {
+        self.deferred().bindless_checked.insert(resource)
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this

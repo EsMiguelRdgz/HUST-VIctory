@@ -281,26 +281,98 @@ pub(crate) fn on_texture_materialized(resource: usize) {
     }
 }
 
-/// Materializes any deferred texture with an unordered-access view in
-/// shader-visible `heap_ptr`, called when a pipeline using direct
-/// `ResourceDescriptorHeap[]` indexing is bound so bindless UAV writes
-/// never land on a deferred NULL slot.
+/// Prepares a shader-visible view heap for a bindless
+/// (`ResourceDescriptorHeap[]`) draw/dispatch recorded onto `list`:
+/// 1. Pins `HostHeap::bindless_guard` onto `list` so eviction never mutates
+///    or drops a texture bound in this heap while `list` is open or executing.
+/// 2. Materializes every deferred UAV in this heap and transitions it to
+///    `UNORDERED_ACCESS`.
+/// 3. For deferred title-written SRVs in this heap (checked at most once per
+///    list reset), materializes, backfills, queues `texture::upload`, and
+///    transitions to `SHADER_RESOURCE` whenever guest memory holds populated
+///    (committed, non-zero) pixel data — keeping unpopulated/dormant textures
+///    at zero VRAM and zero commit.
 #[cfg(windows)]
-pub(crate) fn materialize_deferred_uavs(heap_ptr: usize) {
-    let resources: Vec<usize> = {
-        let map = DEFERRED_TEX_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
-        map.iter()
-            .filter_map(|(&res, slots)| {
-                slots
-                    .iter()
-                    .any(|s| s.heap == heap_ptr && s.unordered)
-                    .then_some(res)
-            })
-            .collect()
+pub(crate) fn prepare_bindless_heap(list: &crate::host::HostList, heap_ptr: usize) {
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    // Pin the heap's bindless guard on this list before checking deferred slots.
+    let guard = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        if heaps.iter().any(|&(_, _, h)| h == heap_ptr) {
+            // SAFETY: registered heaps are live while SHADER_HEAPS holds them.
+            unsafe { &*(heap_ptr as *const Heap) }
+                .host
+                .get()
+                .and_then(|h| h.as_ref())
+                .map(|h| h.bindless_guard())
+        } else {
+            None
+        }
     };
-    for res in resources {
-        let _ = crate::resource::host_resource(res as This);
+    if let Some(guard) = guard {
+        list.pin(guard);
     }
+
+    let (uavs, srvs): (Vec<usize>, Vec<usize>) = {
+        let map = DEFERRED_TEX_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut u = Vec::new();
+        let mut s = Vec::new();
+        for (&res, slots) in map.iter() {
+            let mut has_uav = false;
+            let mut has_srv = false;
+            for slot in slots {
+                if slot.heap == heap_ptr {
+                    if slot.unordered {
+                        has_uav = true;
+                    } else {
+                        has_srv = true;
+                    }
+                }
+            }
+            if has_uav {
+                u.push(res);
+            } else if has_srv {
+                s.push(res);
+            }
+        }
+        (u, s)
+    };
+
+    for res in uavs {
+        if crate::resource::host_resource(res as This).is_some() {
+            crate::list::ensure_state(list, res as This, UNORDERED_ACCESS);
+        }
+    }
+    for res in srvs {
+        if !list.bindless_checked(res) {
+            continue;
+        }
+        if !crate::resource::has_populated_title_data(res as This) {
+            continue;
+        }
+        if let Some(tex) = crate::resource::host_resource(res as This) {
+            if crate::texture::title_written(&tex) {
+                crate::texture::upload(list, res as This, &tex);
+            }
+            crate::list::ensure_state(list, res as This, SHADER_RESOURCE);
+        }
+    }
+}
+
+/// Returns `true` if `resource` is bound in any shader-visible `HostHeap` that
+/// currently has an open or executing bindless command list.
+#[cfg(windows)]
+pub(crate) fn is_texture_pinned_by_bindless(resource: usize) -> bool {
+    let list = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    list.iter().any(|&(_, _, at)| {
+        // SAFETY: registered heaps are live while SHADER_HEAPS holds them.
+        unsafe { &*(at as *const Heap) }
+            .host
+            .get()
+            .and_then(|h| h.as_ref())
+            .is_some_and(|h| h.pins_texture_for_bindless(resource))
+    })
 }
 
 #[cfg(windows)]
@@ -536,12 +608,15 @@ fn record(handle: u64, view: View) {
 }
 
 /// Evicts every shader-visible `HostHeap` descriptor slot pointing to
-/// `resource`: writes a NULL descriptor, clears its cached key, drops the
-/// heap's COM reference to the host texture, and (when `re_defer` is true)
-/// re-registers mirrored slots in `DEFERRED_TEX_SLOTS` so a later
-/// re-materialization backfills them automatically.
+/// `resource` (optionally matching only the exact evicted `ID3D12Resource`
+/// pointer `only_host_ptr` so concurrent re-materialization is never
+/// clobbered): writes a type-compatible NULL descriptor, clears its cached
+/// key, drops the heap's COM reference to the host texture, and (when
+/// `re_defer` is true and `resource` is still unmaterialized) re-registers
+/// mirrored slots in `DEFERRED_TEX_SLOTS` so a later re-materialization
+/// backfills them automatically.
 #[cfg(windows)]
-pub(crate) fn evict_texture_slots(resource: usize, re_defer: bool) {
+pub(crate) fn evict_texture_slots(resource: usize, only_host_ptr: Option<usize>, re_defer: bool) {
     let heaps: Vec<(usize, u64, u32)> = {
         let list = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         list.iter()
@@ -562,12 +637,15 @@ pub(crate) fn evict_texture_slots(resource: usize, re_defer: bool) {
                     .host
                     .get()
                     .and_then(|h| h.as_ref())
-                    .map(|h| h.evict_texture(resource))
+                    .map(|h| h.evict_texture(resource, only_host_ptr))
             } else {
                 None
             }
         };
-        if re_defer && let Some(slots) = evicted {
+        if re_defer
+            && !crate::resource::has_host_resource(resource as This)
+            && let Some(slots) = evicted
+        {
             for (slot, unordered) in slots {
                 let handle = start + u64::from(slot) * u64::from(step);
                 register_deferred_slot(resource, heap_ptr, slot, handle, unordered);
@@ -584,7 +662,7 @@ pub(crate) fn forget(resource: usize) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&resource);
-        evict_texture_slots(resource, false);
+        evict_texture_slots(resource, None, false);
     }
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {

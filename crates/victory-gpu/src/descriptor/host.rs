@@ -42,9 +42,15 @@ pub(crate) struct HostHeap {
     /// them, so reclaiming unused copies never frees one a slot reads.
     owners: Mutex<HashMap<u32, Arc<Shadow>>>,
     /// Host textures that slots' SRV/UAV descriptors point to: `(title_resource,
-    /// unordered, host_texture)`. Keeps textures alive while bound in a slot
-    /// and lets eviction/release re-null and release slots cleanly.
-    tex_owners: Mutex<HashMap<u32, (usize, bool, ID3D12Resource)>>,
+    /// unordered, host_texture, view)`. Keeps textures alive while bound in a
+    /// slot and lets eviction/release re-null with a typed NULL and release
+    /// slots cleanly.
+    tex_owners: Mutex<HashMap<u32, (usize, bool, ID3D12Resource, View)>>,
+    /// Active-list guard cloned into any open `HostList` that binds a bindless
+    /// (`ResourceDescriptorHeap[]`) pipeline against this heap. While
+    /// `Arc::strong_count > 1`, eviction never mutates or frees textures bound
+    /// in this heap.
+    bindless_guard: Arc<()>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -222,6 +228,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             owners: Mutex::default(),
             tex_owners: Mutex::default(),
+            bindless_guard: Arc::new(()),
             next: Mutex::new((0, vec![false; dynamic_count as usize])),
             capped_mirrors: AtomicU64::new(0),
             dynamic_exhausted: AtomicU64::new(0),
@@ -412,9 +419,27 @@ impl HostHeap {
         }
     }
 
+    /// Active-list guard cloned into any open command list using direct
+    /// `ResourceDescriptorHeap[]` indexing on this heap.
+    pub(crate) fn bindless_guard(&self) -> Arc<()> {
+        self.bindless_guard.clone()
+    }
+
+    /// Whether an open or executing bindless command list currently uses this
+    /// heap and this heap holds a live descriptor pointing to `resource`.
+    pub(crate) fn pins_texture_for_bindless(&self, resource: usize) -> bool {
+        if self.sampler || Arc::strong_count(&self.bindless_guard) == 1 {
+            return false;
+        }
+        let tex = self.tex_owners.lock().unwrap_or_else(|e| e.into_inner());
+        tex.values().any(|&(res, ..)| res == resource)
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a type-compatible null
-    /// view if the host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    /// view if the host cannot. Returns `(title_resource, host_texture)` if a
+    /// host texture was bound into the slot so the caller can pin it on the
+    /// open command list.
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> Option<(usize, ID3D12Resource)> {
         let mut owner = None;
         let mut tex_owner = None;
         if !make_owned(
@@ -427,7 +452,11 @@ impl HostHeap {
             self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
             null_for_on(&self.device, view, self.cpu(index));
         }
+        let bound = tex_owner
+            .as_ref()
+            .map(|(res, _, tex, _)| (*res, tex.clone()));
         self.own(index, owner, tex_owner);
+        bound
     }
 
     /// Slot `index` now shows `owner`'s buffer copy and/or `tex_owner`'s host
@@ -436,7 +465,7 @@ impl HostHeap {
         &self,
         index: u32,
         owner: Option<Arc<Shadow>>,
-        tex_owner: Option<(usize, bool, ID3D12Resource)>,
+        tex_owner: Option<(usize, bool, ID3D12Resource, View)>,
     ) {
         let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
         match owner {
@@ -451,11 +480,18 @@ impl HostHeap {
         };
     }
 
-    /// Re-nulls every slot pointing to `resource`, drops this heap's COM
-    /// reference to its host texture, resets mirrored `made` keys so future
-    /// draws rebuild the slot, and returns the mirrored `(slot, unordered)`
-    /// pairs that were evicted.
-    pub(crate) fn evict_texture(&self, resource: usize) -> Vec<(u32, bool)> {
+    /// Re-nulls every slot pointing to `resource` (optionally restricted to
+    /// slots holding the exact evicted host `ID3D12Resource` pointer
+    /// `only_host_ptr`), writing a type- and dimension-compatible NULL
+    /// descriptor, dropping this heap's COM reference, resetting mirrored
+    /// `made` keys so future draws rebuild the slot, and returning the
+    /// mirrored `(slot, unordered)` pairs that were evicted.
+    pub(crate) fn evict_texture(
+        &self,
+        resource: usize,
+        only_host_ptr: Option<usize>,
+    ) -> Vec<(u32, bool)> {
+        use windows::core::Interface;
         if self.sampler {
             return Vec::new();
         }
@@ -463,18 +499,29 @@ impl HostHeap {
         let mut tex = self.tex_owners.lock().unwrap_or_else(|e| e.into_inner());
         let slots: Vec<(u32, bool)> = tex
             .iter()
-            .filter_map(|(&slot, &(res, unordered, _))| {
-                (res == resource).then_some((slot, unordered))
+            .filter_map(|(&slot, (res, unordered, host_tex, _))| {
+                if *res != resource {
+                    return None;
+                }
+                if let Some(target_ptr) = only_host_ptr
+                    && host_tex.as_raw() as usize != target_ptr
+                {
+                    return None;
+                }
+                Some((slot, *unordered))
             })
             .collect();
         let mut mirrored = Vec::new();
         for (slot, unordered) in slots {
-            tex.remove(&slot);
+            let removed = tex.remove(&slot);
             if slot < self.count {
                 made[slot as usize] = 0;
                 mirrored.push((slot, unordered));
             }
-            null_view_on(&self.device, self.cpu(slot));
+            match removed {
+                Some((_, _, _, view)) => null_for_on(&self.device, &view, self.cpu(slot)),
+                None => null_view_on(&self.device, self.cpu(slot)),
+            }
         }
         mirrored
     }
@@ -547,10 +594,17 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-        if for_draw && let Some(ref v) = view {
-            // Materialize any deferred texture BEFORE taking `self.made` so
-            // `on_texture_materialized` backfill never re-enters `self.made`.
-            ensure_view_materialized(v);
+        if let Some(ref v) = view {
+            if for_draw {
+                // Materialize any deferred texture or placed texture BEFORE
+                // taking `self.made` so `on_texture_materialized` /
+                // `PLACED_TEXTURES` never re-enter or invert `self.made`.
+                ensure_view_materialized(v);
+            } else if matches!(v, View::Placed(false, r, _) if r[0] != 1) {
+                // Resolve placed textures before locking `self.made` to keep
+                // lock order strictly acyclic (`PLACED_TEXTURES` never under `made`).
+                let _ = placed_texture(v);
+            }
         }
         let deferred_to_register = {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -649,11 +703,13 @@ fn deferred_texture_of(view: &View) -> Option<(usize, bool)> {
     }
 }
 
-/// Ensures any deferred texture referenced by `view` is materialized before
-/// taking `HostHeap.made`.
+/// Ensures any deferred or placed texture referenced by `view` is materialized
+/// before taking `HostHeap.made`.
 fn ensure_view_materialized(view: &View) {
     if let Some((r, _)) = deferred_texture_of(view) {
         let _ = crate::resource::host_resource(r as crate::object::This);
+    } else if matches!(view, View::Placed(false, r, _) if r[0] != 1) {
+        let _ = placed_texture(view);
     }
 }
 
@@ -939,7 +995,7 @@ fn make_owned(
     view: &View,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     owner: &mut Option<Arc<Shadow>>,
-    tex_owner: &mut Option<(usize, bool, ID3D12Resource)>,
+    tex_owner: &mut Option<(usize, bool, ID3D12Resource, View)>,
 ) -> bool {
     match view {
         &View::Constant(address, size) => {
@@ -986,7 +1042,7 @@ fn make_owned(
                         at,
                     )
                 };
-                *tex_owner = Some((res_id, false, texture));
+                *tex_owner = Some((res_id, false, texture, view.clone()));
                 true
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -1035,7 +1091,7 @@ fn make_owned(
                     at,
                 )
             };
-            *tex_owner = Some((res_id, true, texture));
+            *tex_owner = Some((res_id, true, texture, view.clone()));
             true
         }
         View::Sampler(words) => {

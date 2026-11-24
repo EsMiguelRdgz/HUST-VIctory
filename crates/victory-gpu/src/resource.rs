@@ -915,6 +915,77 @@ pub(crate) fn existing_host_resource(
     None
 }
 
+/// Returns `true` if `this` is a title-written texture (`Flags & 0x7 == 0`)
+/// whose backing title memory has committed, readable pages containing at
+/// least one non-zero byte. Used by bindless (`ResourceDescriptorHeap[]`)
+/// draw/dispatch preparation so populated textures are materialized & uploaded
+/// while uncommitted or all-zero placeholders stay deferred at 0 VRAM/commit.
+#[cfg(windows)]
+pub(crate) fn has_populated_title_data(this: This) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || (r.desc.flags & 0x7) != 0 {
+        return false;
+    }
+    let ptr = r.data() as usize;
+    if ptr == 0 {
+        return false;
+    }
+    let span = footprint(&r.desc).map_or(0, |i| i.size) as usize;
+    if span == 0 {
+        return false;
+    }
+    let end = ptr.saturating_add(span);
+    let mut cur = ptr;
+    while cur < end {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: plain VirtualQuery on a title address.
+        let queried = unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) };
+        if queried == 0 || info.RegionSize == 0 {
+            break;
+        }
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        let chunk_end = region_end.min(end);
+        let readable = info.State == MEM_COMMIT
+            && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
+            && info.Protect != 0;
+        if readable && chunk_end > cur {
+            let len = chunk_end - cur;
+            // SAFETY: VirtualQuery confirmed `[cur, chunk_end)` is committed
+            // and readable (neither PAGE_NOACCESS nor PAGE_GUARD).
+            let bytes = unsafe { std::slice::from_raw_parts(cur as *const u8, len) };
+            // SAFETY: `align_to::<u64>` only reinterprets aligned interior bytes.
+            let (prefix, words, suffix) = unsafe { bytes.align_to::<u64>() };
+            if prefix.iter().any(|&b| b != 0)
+                || words.iter().any(|&w| w != 0)
+                || suffix.iter().any(|&b| b != 0)
+            {
+                return true;
+            }
+        }
+        if region_end <= cur {
+            break;
+        }
+        cur = region_end;
+    }
+    false
+}
+
+/// Runs `f` while no host GPU submission is executing (`Host::with_gpu_idle`),
+/// or directly if no host GPU device has been created.
+#[cfg(windows)]
+fn with_host_gpu_idle<R>(f: impl FnOnce() -> R) -> R {
+    match crate::host::host() {
+        Some(h) => h.with_gpu_idle(f),
+        None => f(),
+    }
+}
+
 /// The host GPU's copy of a title resource, materializing a deferred texture
 /// on first GPU use.
 #[cfg(windows)]
@@ -927,6 +998,14 @@ pub(crate) fn host_resource(
     let r = resource(this);
     if r.desc.dimension == BUFFER {
         return None;
+    }
+    if !r.host_live.load(std::sync::atomic::Ordering::Acquire) {
+        // Relieve commit pressure BEFORE acquiring `r.host` so eviction never
+        // nests under a `Resource::host` lock (prevents AB-BA lock inversion).
+        let est = r.deferred_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if est > 0 && crate::memstat::under_pressure(est) {
+            crate::shadow::relieve_pressure(est);
+        }
     }
     let (res, newly_materialized) = {
         let mut slot = r.host.lock().unwrap_or_else(|e| e.into_inner());
@@ -1102,9 +1181,6 @@ fn host_texture(
             .GetResourceAllocationInfo(0, &[*(&raw const d).cast::<D3D12_RESOURCE_DESC>()])
     }
     .SizeInBytes;
-    if crate::memstat::under_pressure(est_size) {
-        crate::shadow::relieve_pressure(est_size);
-    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1190,8 +1266,25 @@ fn hand_out_resource(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    hand_out_resource_inner(
+        desc, heap, heap_flags, backing, state, clear, iid, out, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hand_out_resource_inner(
+    desc: ResourceDesc,
+    heap: HeapProperties,
+    heap_flags: u32,
+    backing: Backing,
+    state: u32,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+    track_evictable: bool,
+) -> HRESULT {
     #[cfg(not(windows))]
-    let _ = (state, clear);
+    let _ = (state, clear, track_evictable);
     #[cfg(windows)]
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole 20-byte clear value.
@@ -1201,6 +1294,10 @@ fn hand_out_resource(
     let (slot, live, initial_host_state, deferred_est) = if desc.dimension == BUFFER {
         (HostTexSlot::default(), false, 0, 0)
     } else if !lazy_textures_enabled() {
+        let est = footprint(&desc).map_or(KIB_64, |i| i.size);
+        if crate::memstat::under_pressure(est) {
+            crate::shadow::relieve_pressure(est);
+        }
         match host_texture(&desc, state, clear_value.as_ref()) {
             Some((tex, bytes, host_state)) => (
                 HostTexSlot {
@@ -1258,7 +1355,7 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         if desc.dimension == BUFFER {
             crate::shadow::register(at, resource.data() as u64, desc.width);
-        } else if (desc.flags & 0x7) == 0 {
+        } else if track_evictable && (desc.flags & 0x7) == 0 {
             TITLE_WRITTEN_TEXTURES
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1480,56 +1577,66 @@ static PLACED_TEXTURES: std::sync::Mutex<
 #[cfg(windows)]
 static RETIRED_PLACED: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
 
-/// Releases a placed-texture `Resource` if no open command list holds it, else
-/// defers release into `RETIRED_PLACED`. Returns host bytes freed now.
+/// Releases a placed-texture `Resource` if no open command list or bindless
+/// heap holds it (and while the host GPU is idle), else defers release into
+/// `RETIRED_PLACED`. Returns host bytes freed now.
 #[cfg(windows)]
 fn release_placed_entry(res: usize, host_bytes: u64) -> u64 {
-    let r = resource(res as This);
-    if std::sync::Arc::strong_count(&r.list_guard) == 1 {
-        crate::descriptor::evict_texture_slots(res, false);
-        resource_release(res as This);
-        if host_bytes > 0 {
-            crate::memstat::count(crate::memstat::Event::TexturesEvicted, 1);
-            crate::memstat::count(crate::memstat::Event::TexturesEvictedBytes, host_bytes);
+    with_host_gpu_idle(|| {
+        let r = resource(res as This);
+        if std::sync::Arc::strong_count(&r.list_guard) == 1
+            && !crate::descriptor::is_texture_pinned_by_bindless(res)
+        {
+            crate::descriptor::evict_texture_slots(res, None, false);
+            resource_release(res as This);
+            if host_bytes > 0 {
+                crate::memstat::count(crate::memstat::Event::TexturesEvicted, 1);
+                crate::memstat::count(crate::memstat::Event::TexturesEvictedBytes, host_bytes);
+            }
+            host_bytes
+        } else {
+            RETIRED_PLACED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((res, host_bytes));
+            0
         }
-        host_bytes
-    } else {
-        RETIRED_PLACED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((res, host_bytes));
-        0
-    }
+    })
 }
 
-/// Drains any previously retired placed textures whose command lists have now
-/// reset. Returns host bytes freed.
+/// Drains any previously retired placed textures whose command lists and
+/// bindless heaps are now idle (while the host GPU is idle). Returns host
+/// bytes freed.
 #[cfg(windows)]
 fn drain_retired_placed() -> u64 {
-    let mut retired = RETIRED_PLACED.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ready = Vec::new();
-    let mut i = 0;
-    while i < retired.len() {
-        let (res, _bytes) = retired[i];
-        let r = resource(res as This);
-        if std::sync::Arc::strong_count(&r.list_guard) == 1 {
-            ready.push(retired.swap_remove(i));
-        } else {
-            i += 1;
+    with_host_gpu_idle(|| {
+        let mut retired = RETIRED_PLACED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < retired.len() {
+            let (res, _bytes) = retired[i];
+            let r = resource(res as This);
+            if std::sync::Arc::strong_count(&r.list_guard) == 1
+                && !crate::descriptor::is_texture_pinned_by_bindless(res)
+            {
+                ready.push(retired.swap_remove(i));
+            } else {
+                i += 1;
+            }
         }
-    }
-    drop(retired);
-    let mut freed = 0u64;
-    for (res, bytes) in ready {
-        crate::descriptor::evict_texture_slots(res, false);
-        resource_release(res as This);
-        if bytes > 0 {
-            crate::memstat::count(crate::memstat::Event::TexturesEvicted, 1);
-            crate::memstat::count(crate::memstat::Event::TexturesEvictedBytes, bytes);
-            freed += bytes;
+        drop(retired);
+        let mut freed = 0u64;
+        for (res, bytes) in ready {
+            crate::descriptor::evict_texture_slots(res, None, false);
+            resource_release(res as This);
+            if bytes > 0 {
+                crate::memstat::count(crate::memstat::Event::TexturesEvicted, 1);
+                crate::memstat::count(crate::memstat::Event::TexturesEvictedBytes, bytes);
+                freed += bytes;
+            }
         }
-    }
-    freed
+        freed
+    })
 }
 
 /// Evicts LRU idle entries from `PLACED_TEXTURES` until live bytes fit within
@@ -1547,6 +1654,7 @@ fn reclaim_placed_textures(budget: u64) -> u64 {
             .iter()
             .filter(|(_, e)| {
                 std::sync::Arc::strong_count(&resource(e.resource as This).list_guard) == 1
+                    && !crate::descriptor::is_texture_pinned_by_bindless(e.resource)
             })
             .map(|(k, e)| (e.last_used, *k, e.host_bytes))
             .collect();
@@ -1601,10 +1709,12 @@ pub(crate) fn on_title_memory_remapped(at: u64, len: u64) {
 /// Evicts idle placed textures and idle materialized title-written host
 /// textures (whose authoritative pixels still live in title memory) to
 /// relieve system-commit pressure. Never evicts GPU-written textures (RT,
-/// DSV, UAV, or copy/resolve targets) or any texture referenced by an open
-/// or in-flight command list. Returns host bytes freed.
+/// DSV, UAV, or copy/resolve targets), any texture referenced by an open or
+/// executing command list, or any texture bound in a shader-visible heap
+/// with an active bindless list. Returns host bytes freed.
 #[cfg(windows)]
 pub(crate) fn evict_idle_textures(incoming: u64) -> u64 {
+    use windows::core::Interface;
     let mut freed = reclaim_placed_textures(0);
     if incoming > 0 && freed >= incoming {
         return freed;
@@ -1627,6 +1737,9 @@ pub(crate) fn evict_idle_textures(incoming: u64) -> u64 {
                 if crate::texture::is_host_written(res as This) {
                     return None;
                 }
+                if crate::descriptor::is_texture_pinned_by_bindless(res) {
+                    return None;
+                }
                 Some((r.last_used.load(std::sync::atomic::Ordering::Relaxed), res))
             })
             .collect()
@@ -1636,47 +1749,58 @@ pub(crate) fn evict_idle_textures(incoming: u64) -> u64 {
         if incoming > 0 && freed >= incoming {
             break;
         }
-        // Hold `TITLE_WRITTEN_TEXTURES` across this single candidate's eviction
-        // so `Resource::drop` (which removes from this set first) cannot free
-        // `Box<Resource>` concurrently (no callee locks `TITLE_WRITTEN_TEXTURES`).
-        let dropped = {
+        // Hold GPU-idle + `TITLE_WRITTEN_TEXTURES` across this single
+        // candidate's eviction so:
+        // 1. No GPU submission executes while descriptors or textures change.
+        // 2. `Resource::drop` (which removes from `TITLE_WRITTEN_TEXTURES`
+        //    first) cannot free `Box<Resource>` concurrently.
+        // 3. `r.host` is taken FIRST via `try_lock()` (never deadlocks) and
+        //    dropped before `evict_texture_slots(res, Some(raw_ptr), true)`,
+        //    so concurrent re-materialization of a new host texture is never
+        //    clobbered.
+        let dropped = with_host_gpu_idle(|| {
             let set = TITLE_WRITTEN_TEXTURES
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if !set.contains(&res) {
-                continue;
+                return None;
             }
             let r = resource(res as This);
             if std::sync::Arc::strong_count(&r.list_guard) != 1
                 || crate::texture::is_host_written(res as This)
+                || crate::descriptor::is_texture_pinned_by_bindless(res)
             {
-                continue;
+                return None;
             }
-            // Re-null & re-defer any shader-visible descriptor slots first (drops
-            // HostHeap's COM ref to the ID3D12Resource), then clear last-uploaded
-            // state so the next GPU use re-uploads cleanly from title memory.
-            crate::descriptor::evict_texture_slots(res, true);
-            crate::texture::reset_uploaded(res);
-            let mut slot = r.host.lock().unwrap_or_else(|e| e.into_inner());
-            if std::sync::Arc::strong_count(&r.list_guard) != 1 {
-                None
-            } else if let Some(tex) = slot.resource.take() {
-                let bytes = slot.bytes;
-                slot.bytes = 0;
-                r.host_live
-                    .store(false, std::sync::atomic::Ordering::Release);
-                let est = footprint(&r.desc).map_or(KIB_64, |i| i.size);
-                let prev = r
-                    .deferred_bytes
-                    .swap(est, std::sync::atomic::Ordering::Relaxed);
-                if prev == 0 {
-                    crate::memstat::alloc(crate::memstat::Kind::DeferredTexture, est);
+            let taken = {
+                let Ok(mut slot) = r.host.try_lock() else {
+                    return None;
+                };
+                if std::sync::Arc::strong_count(&r.list_guard) != 1 {
+                    None
+                } else if let Some(tex) = slot.resource.take() {
+                    let bytes = slot.bytes;
+                    slot.bytes = 0;
+                    r.host_live
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    let est = footprint(&r.desc).map_or(KIB_64, |i| i.size);
+                    let prev = r
+                        .deferred_bytes
+                        .swap(est, std::sync::atomic::Ordering::Relaxed);
+                    if prev == 0 {
+                        crate::memstat::alloc(crate::memstat::Kind::DeferredTexture, est);
+                    }
+                    crate::texture::reset_uploaded(res);
+                    Some((tex, bytes))
+                } else {
+                    None
                 }
-                Some((tex, bytes))
-            } else {
-                None
+            };
+            if let Some((ref tex, _)) = taken {
+                crate::descriptor::evict_texture_slots(res, Some(tex.as_raw() as usize), true);
             }
-        };
+            taken
+        });
         if let Some((tex, bytes)) = dropped {
             drop(tex);
             freed += bytes;
@@ -1700,29 +1824,36 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
+    if d.dimension == BUFFER || address == 0 {
         return None;
     }
     let title_span = footprint(&d).map_or(KIB_64, |i| i.size);
+    const COMMON: u32 = 0;
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
     let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
+    // Placed cache entries are owned by `PLACED_TEXTURES` rather than
+    // `TITLE_WRITTEN_TEXTURES` (passing `track_evictable = false` avoids both
+    // double-eviction and locking `TITLE_WRITTEN_TEXTURES` inside `texture_at`).
+    let made = hand_out_resource_inner(
+        d,
+        DEFAULT,
         0,
+        Backing::Address(address as *mut u8),
+        COMMON,
         std::ptr::null(),
         &RESOURCE_IIDS[0],
         &mut out,
+        false,
     );
     if made != S_OK {
         return None;
     }
-    // Placed cache entries are managed by `PLACED_TEXTURES` rather than
-    // `TITLE_WRITTEN_TEXTURES` so they are never double-evicted.
-    TITLE_WRITTEN_TEXTURES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&(out as usize));
     if host_resource(out).is_none() {
         resource_release(out);
         return None;
@@ -3108,19 +3239,187 @@ pub(crate) mod tests {
         assert!(!has_host_resource(srv_tex));
         assert!(!has_host_resource(uav_tex));
 
-        crate::descriptor::materialize_deferred_uavs(sheap as usize);
+        let list = host_gpu.new_list().expect("host list");
+        crate::descriptor::prepare_bindless_heap(&list, sheap as usize);
         assert!(
             has_host_resource(uav_tex),
             "UAV texture materialized for bindless"
         );
         assert!(
             !has_host_resource(srv_tex),
-            "SRV-only texture remains deferred"
+            "all-zero SRV-only texture remains deferred"
         );
 
+        let _ = unsafe { list.list.Close() };
+        list.reset();
         assert_eq!(slot::<Release>(srv_tex, 0x10)(srv_tex), 0);
         assert_eq!(slot::<Release>(uav_tex, 0x10)(uav_tex), 0);
         assert_eq!(slot::<Release>(sheap, 0x10)(sheap), 0);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Bindless (`ResourceDescriptorHeap[]`) preparation materializes and queues
+    /// uploads for title-written SRVs whose backing memory is populated (non-zero),
+    /// keeps all-zero/dormant SRVs deferred, pins bound textures against eviction
+    /// while the bindless list is open, and allows clean eviction once the list
+    /// resets.
+    #[cfg(windows)]
+    #[test]
+    fn bindless_deferred_populated_srv_materializes_and_pins_against_eviction() {
+        let _guard = TEXTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        #[repr(C)]
+        struct HeapDescLocal {
+            kind: u32,
+            count: u32,
+            flags: u32,
+            node_mask: u32,
+        }
+        const HEAP_IID: Iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        let mut sheap = std::ptr::null();
+        let hdesc = HeapDescLocal {
+            kind: 0,
+            count: 32,
+            flags: 1,
+            node_mask: 0,
+        };
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                std::ptr::from_ref(&hdesc).cast(),
+                &HEAP_IID,
+                &mut sheap,
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(sheap);
+        let _ = title_heap.host();
+        let start = title_heap.start;
+
+        let zero_backing = vec![0u8; 64 << 10];
+        let mut populated_backing = vec![0u8; 64 << 10];
+        populated_backing[4096..4100].copy_from_slice(&[0xff, 0x80, 0x40, 0xff]);
+        let mut d = texture(64, 64, 28, 1);
+        d.layout = 1; // LINEAR
+
+        let (mut zero_tex, mut pop_tex) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(
+            create_at_address(
+                null,
+                zero_backing.as_ptr() as u64,
+                &d,
+                0,
+                null.cast(),
+                iid,
+                &mut zero_tex
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null,
+                populated_backing.as_ptr() as u64,
+                &d,
+                0,
+                null.cast(),
+                iid,
+                &mut pop_tex
+            ),
+            S_OK
+        );
+        crate::descriptor::create_srv(null, zero_tex, std::ptr::null(), start);
+        crate::descriptor::create_srv(null, pop_tex, std::ptr::null(), start + 32);
+        assert!(!has_host_resource(zero_tex));
+        assert!(!has_host_resource(pop_tex));
+
+        let list = host_gpu.new_list().expect("host list");
+        crate::descriptor::prepare_bindless_heap(&list, sheap as usize);
+        assert!(
+            !has_host_resource(zero_tex),
+            "unpopulated title-written texture stays deferred"
+        );
+        assert!(
+            has_host_resource(pop_tex),
+            "populated title-written texture materializes for bindless SRV"
+        );
+        assert!(
+            crate::descriptor::is_texture_pinned_by_bindless(pop_tex as usize),
+            "open bindless list pins shader-visible heap textures against eviction"
+        );
+
+        // Eviction must refuse to evict while the bindless list is still open.
+        let _ = evict_idle_textures(0);
+        assert!(
+            has_host_resource(pop_tex),
+            "eviction must not touch a texture pinned by an open bindless list"
+        );
+
+        // Execute and reset the list so both list_guard and bindless_guard release.
+        // SAFETY: open list.
+        unsafe { list.list.Close().unwrap() };
+        host_gpu.execute(&[&list]);
+        list.reset();
+        assert!(!crate::descriptor::is_texture_pinned_by_bindless(
+            pop_tex as usize
+        ));
+
+        let freed = evict_idle_textures(0);
+        assert!(freed > 0, "idle texture evicts once bindless list resets");
+        assert!(!has_host_resource(pop_tex));
+
+        assert_eq!(slot::<Release>(zero_tex, 0x10)(zero_tex), 0);
+        assert_eq!(slot::<Release>(pop_tex, 0x10)(pop_tex), 0);
+        assert_eq!(slot::<Release>(sheap, 0x10)(sheap), 0);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Concurrent `texture_at` / shader-visible `HostHeap::mirror` and
+    /// `evict_idle_textures` / `on_title_memory_remapped` must never deadlock
+    /// (verifies acyclic lock order between `TITLE_WRITTEN_TEXTURES`,
+    /// `PLACED_TEXTURES`, `SHADER_HEAPS`, `HostHeap.made`, and `Resource.host`).
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_placed_texture_mirror_and_eviction_never_deadlocks() {
+        let _guard = TEXTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let backing = vec![0x5Au8; 256 << 10];
+        let base_addr = backing.as_ptr() as u64;
+        let d = texture(64, 64, 28, 1);
+        // SAFETY: `ResourceDesc` is 56 bytes = 14 u32 words.
+        let words: [u32; 14] =
+            unsafe { std::ptr::from_ref(&d).cast::<[u32; 14]>().read_unaligned() };
+
+        let t1 = std::thread::spawn(move || {
+            for i in 0..40u64 {
+                let addr = base_addr + (i % 4) * 16384;
+                let _ = texture_at(addr, &words);
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..40u64 {
+                let _ = evict_idle_textures(0);
+                let addr = base_addr + (i % 4) * 16384;
+                on_title_memory_remapped(addr, 16384);
+            }
+        });
+        t1.join().expect("texture_at thread finished");
+        t2.join().expect("eviction thread finished");
+        on_title_memory_remapped(base_addr, backing.len() as u64);
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 

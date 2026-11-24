@@ -509,15 +509,18 @@ impl State {
             list.keep(&p.root);
             self.host_roots[usize::from(compute)] = root;
         }
-        if self.host_pipeline != self.pipeline {
+        // Compare by host PSO object pointer: a title pipeline released and
+        // recreated at the same address has a distinct host PSO.
+        let pso = p.pso.as_raw() as usize;
+        if self.host_pipeline != pso {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             list.keep(&p.pso);
-            self.host_pipeline = self.pipeline;
+            self.host_pipeline = pso;
             list.used_pipeline(&p.name);
         }
         if p.uses_resource_heap && self.heaps[0] != 0 {
-            crate::descriptor::materialize_deferred_uavs(self.heaps[0]);
+            crate::descriptor::prepare_bindless_heap(list, self.heaps[0]);
         }
         #[cfg(feature = "diagnostics")]
         self.last_tables.clear();
@@ -866,7 +869,12 @@ impl State {
                         host.constant_at(index, gpu, copy_len);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        if let Some((tex_res, host_tex)) = host.make_at(index, &view) {
+                            list.keep(&host_tex);
+                            if let Some(guard) = crate::resource::list_guard(tex_res as This) {
+                                list.pin(guard);
+                            }
+                        }
                         for u in &matching {
                             readable(list, u, &view);
                         }
