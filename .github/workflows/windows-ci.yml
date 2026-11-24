@@ -25,7 +25,7 @@ on:
         type: boolean
         default: false
       fmt_base:
-        description: "Base ref for the formatting gate (only .rs files changed since this ref must be rustfmt-clean)"
+        description: "Base branch for the formatting gate: .rs files changed since the merge-base must be rustfmt-clean (on that branch itself, HEAD's first parent is used)"
         type: string
         default: hust/phase12-memory
 
@@ -117,20 +117,62 @@ jobs:
           FMT_BASE: ${{ inputs.fmt_base }}
         run: |
           # The tree carries pre-existing rustfmt debt, so (per AGENTS.md) only
-          # files changed since FMT_BASE must be clean; the rest is reported.
+          # the .rs files this change touches must be clean; the rest is reported.
+          #
+          # Which base: on a feature branch, the merge-base with origin/FMT_BASE.
+          # When HEAD is already contained in origin/FMT_BASE (a run on the
+          # default branch itself, e.g. right after a merge), that diff is empty,
+          # so fall back to HEAD's first parent: for a merge commit that covers
+          # the whole merged PR, for a direct commit that commit.
+          $log = "$env:LOG_DIR\fmt.log"
           cargo fmt --all -- --check 2>&1 | Out-File -FilePath "$env:LOG_DIR\fmt-full.log" -Encoding utf8
-          $unformatted = @(Select-String -Path "$env:LOG_DIR\fmt-full.log" -Pattern '^Diff in (.+?):\d+:' |
-            ForEach-Object { (Resolve-Path -Relative $_.Matches[0].Groups[1].Value) -replace '\\','/' -replace '^\./','' } |
-            Sort-Object -Unique)
-          $changed = @()
-          if ($env:FMT_BASE -and (git rev-parse --verify --quiet "origin/$env:FMT_BASE")) {
-            $changed = @(git diff --name-only --diff-filter=ACMR "origin/$env:FMT_BASE...HEAD" -- '*.rs')
+          $ws = ([IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\') + '\')
+          $unformatted = @(Select-String -Path "$env:LOG_DIR\fmt-full.log" -Pattern '^Diff in (.+?\.rs):\d+:' |
+            ForEach-Object {
+              $p = $_.Matches[0].Groups[1].Value -replace '^\\\\\?\\', ''
+              if ($p.StartsWith($ws, [StringComparison]::OrdinalIgnoreCase)) { $p = $p.Substring($ws.Length) }
+              $p -replace '\\', '/'
+            } | Sort-Object -Unique)
+
+          $base = $null
+          $reason = ''
+          $baseRef = if ($env:FMT_BASE) { "origin/$env:FMT_BASE" } else { '' }
+          if ($baseRef -and (git rev-parse --verify --quiet "$baseRef^{commit}")) {
+            $mb = (git merge-base $baseRef HEAD).Trim()
+            $head = (git rev-parse HEAD).Trim()
+            if ($mb -and $mb -ne $head) {
+              $base = $mb
+              $reason = "merge-base with $baseRef"
+            } else {
+              $reason = "HEAD is already in $baseRef"
+            }
+          } elseif ($baseRef) {
+            $reason = "$baseRef not found"
+          } else {
+            $reason = 'fmt_base empty'
+          }
+          if (-not $base) {
+            $parent = git rev-parse --verify --quiet 'HEAD^1^{commit}'
+            if ($parent) {
+              $base = $parent.Trim()
+              $reason += "; using HEAD's first parent"
+            }
+          }
+          if ($base) {
+            $changed = @(git diff --name-only --diff-filter=ACMR "$base" HEAD -- '*.rs')
+            $scope = "files changed in $base..HEAD ($reason)"
+          } else {
+            # Root commit or no history: every file is new, gate them all.
+            $changed = @(git ls-files -- '*.rs')
+            $scope = "all tracked files ($reason; no parent commit)"
           }
           $blocking = @($unformatted | Where-Object { $changed -contains $_ })
-          "files with pre-existing rustfmt differences (advisory): $($unformatted.Count)" | Tee-Object -FilePath "$env:LOG_DIR\fmt.log"
-          "rust files changed since origin/$($env:FMT_BASE): $($changed.Count)" | Tee-Object -FilePath "$env:LOG_DIR\fmt.log" -Append
-          "changed files needing rustfmt (blocking): $($blocking.Count)" | Tee-Object -FilePath "$env:LOG_DIR\fmt.log" -Append
-          $blocking | Tee-Object -FilePath "$env:LOG_DIR\fmt.log" -Append
+          "formatting gate base: $scope" | Tee-Object -FilePath $log
+          "rust files in gate scope: $($changed.Count)" | Tee-Object -FilePath $log -Append
+          "files with rustfmt differences anywhere in the tree (advisory): $($unformatted.Count)" | Tee-Object -FilePath $log -Append
+          $unformatted | ForEach-Object { "  advisory: $_" } | Tee-Object -FilePath $log -Append
+          "changed files needing rustfmt (blocking): $($blocking.Count)" | Tee-Object -FilePath $log -Append
+          $blocking | ForEach-Object { "  blocking: $_" } | Tee-Object -FilePath $log -Append
           if ($blocking.Count -gt 0) { exit 1 }
           exit 0
 
