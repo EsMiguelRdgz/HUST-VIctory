@@ -241,6 +241,27 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 #[test]
+fn packed_add_selects_halves_of_inline_constants() {
+    // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
+    // The same GFX10 source field (248) has a different bit pattern for a
+    // packed floating-point and a packed integer instruction.
+    let cases = [
+        // v_pk_add_f16 v0, 0x3118, v1
+        ([0xcc0f4000, 0x1a0202f8], 0x0000_3118),
+        // v_pk_add_f16 v0, 0x3118, v1 op_sel_hi:[0,1] (use low twice)
+        ([0xcc0f4000, 0x120202f8], 0x3118_3118),
+        // v_pk_add_u16 v0, 0x3e22f983, v1
+        ([0xcc0a4000, 0x1a0202f8], 0x3e22_f983),
+    ];
+    for (words, expected) in cases {
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}: {words:08x?}");
+        });
+    }
+}
+
+#[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
     let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
@@ -527,6 +548,46 @@ fn v_sin_and_v_cos_f32_reduce_large_turns() {
             inp[0],
         );
     });
+}
+
+#[test]
+fn v_cvt_u16_and_i16_f16_saturate() {
+    // v_mov_b32 v0, 0; v_cvt_u16_f16 / v_cvt_i16_f16 v0, v1 (VOP1 0x052 / 0x053).
+    let cases: &[(u16, u16, u16)] = &[
+        // (f16 input, u16 result, i16 result)
+        (0x0000, 0, 0),          // 0
+        (0x8000, 0, 0),          // -0
+        (0x3E00, 1, 1),          // 1.5 -> 1 (toward zero)
+        (0xBE00, 0, 0xFFFF),     // -1.5 -> 0 / -1
+        (0x57D0, 125, 125),      // 125.0
+        (0x7800, 32768, 32767),  // 32768 saturates i16
+        (0x77FF, 32752, 32752),  // 32752, the largest f16 below 32768
+        (0xF800, 0, 0x8000),     // -32768 fits i16
+        (0xF801, 0, 0x8000),     // -32800 saturates i16
+        (0x7BFF, 65504, 32767),  // max finite f16
+        (0xFBFF, 0, 0x8000),     // -65504
+        (0x7C00, 0xFFFF, 32767), // +inf
+        (0xFC00, 0, 0x8000),     // -inf
+        (0x7E00, 0, 0),          // NaN
+        (0xFE00, 0, 0),          // -NaN
+        (0x0001, 0, 0),          // smallest subnormal
+    ];
+    for (op, what, pick) in [
+        (0x052u16, "v_cvt_u16_f16", 0usize),
+        (0x053, "v_cvt_i16_f16", 1),
+    ] {
+        let shader = build_valu_cs(&[vop1(0x001, 0, 128), vop1(op, 0, vgpr(1))]);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [u32::from(c.0), 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = if pick == 0 { cases[i].1 } else { cases[i].2 };
+            assert_eq!(
+                got,
+                u32::from(want),
+                "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#06x}",
+                cases[i].0,
+            );
+        });
+    }
 }
 
 #[test]
