@@ -1254,4 +1254,95 @@ mod tests {
         drop(held);
         let _ = host_gpu;
     }
+
+    /// Copies of title buffers made and released from several threads at
+    /// once (refreshes racing the title's releases) all go: the count of
+    /// live buffer copies returns to where it was.
+    #[test]
+    fn concurrent_buffer_copies_return_to_baseline() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        // Synthetic addresses of this test's own (copies read title memory
+        // only when refreshed, which this does not do).
+        const BASE: u64 = 0x5b5b_0000_0000;
+        std::thread::scope(|scope| {
+            for t in 0..4u64 {
+                scope.spawn(move || {
+                    for i in 0..25u64 {
+                        let start = BASE + (t * 100 + i) * (1 << 20);
+                        let id = (start as usize) ^ 0x7357;
+                        register(id, start, 1 << 16);
+                        let shadow = find(start, 64).expect("copy");
+                        assert_eq!(shadow.kind, Kind::Buffer);
+                        let weak = Arc::downgrade(&shadow);
+                        drop(shadow);
+                        unregister(id, start);
+                        assert!(weak.upgrade().is_none(), "released with its buffer");
+                    }
+                });
+            }
+        });
+        let _ = host_gpu;
+    }
+
+    /// Synthetic benchmark (`--ignored --test-threads=1 --nocapture`):
+    /// loose windows made and left idle well past their budget stay within
+    /// it; a large reservation costs address space, not commit.
+    #[test]
+    #[ignore]
+    fn bench_copy_reclamation_and_reservations() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mib = |b: i128| b as f64 / (1 << 20) as f64;
+        let commit = || memstat::system_commit().expect("commit").0 as i128;
+        let private = || memstat::process().expect("process").0 as i128;
+        let mut lines = Vec::new();
+
+        // 160 idle 4 MiB windows (640 MiB) against the 512 MiB budget.
+        let (c0, p0) = (commit(), private());
+        let mut peak = 0;
+        for i in 0..160u64 {
+            let at = 0x5c5c_0000_0000 + i * WINDOW * 2;
+            drop(loose(at, at + 64).expect("copy"));
+            peak = peak.max(memstat::live(Kind::Loose).0);
+        }
+        lines.push(format!(
+            "loose-windows made=160x4MiB peak-live={:.0}MiB budget={:.0}MiB commit-delta={:+.0}MiB private-delta={:+.0}MiB",
+            mib(peak as i128),
+            mib(LOOSE_BUDGET as i128),
+            mib(commit() - c0),
+            mib(private() - p0)
+        ));
+        assert!(peak <= LOOSE_BUDGET + WINDOW, "{peak}");
+
+        // A 64 GiB reservation, then 256 MiB committed in it, then released.
+        let (c0, s0) = (commit(), memstat::space());
+        // SAFETY: a fresh reservation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 64 << 30, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!p.is_null());
+        let (c1, s1) = (commit(), memstat::space());
+        // SAFETY: committing part of our reservation.
+        assert!(!unsafe { VirtualAlloc(p, 256 << 20, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let c2 = commit();
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        let c3 = commit();
+        lines.push(format!(
+            "reservation 64GiB: reserved-delta={:+.0}MiB commit-delta={:+.0}MiB; +256MiB committed: commit-delta={:+.0}MiB; released: commit-delta={:+.0}MiB",
+            mib(s1.reserved as i128 - s0.reserved as i128),
+            mib(c1 - c0),
+            mib(c2 - c0),
+            mib(c3 - c0)
+        ));
+        for line in &lines {
+            println!("{line}");
+            memstat::report(&format!("synthetic {line}"));
+        }
+        let _ = host_gpu;
+    }
 }

@@ -1019,9 +1019,13 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_physical_page_commit() {
-        for (phase, delta) in physical_page_commit_steps(512 * MIB) {
-            println!("physical-pages {phase} {:+.0}", delta as f64 / MIB as f64);
-        }
+        let steps: Vec<String> = physical_page_commit_steps(512 * MIB)
+            .into_iter()
+            .map(|(phase, delta)| format!("{phase}={:+.0}MiB", delta as f64 / MIB as f64))
+            .collect();
+        let line = format!("physical-pages 512MiB commit-delta {}", steps.join(" "));
+        println!("{line}");
+        victory_gpu::memstat::report(&format!("synthetic {line}"));
     }
 
     /// Freeing most of a pool gives its commit back (it used to stay charged

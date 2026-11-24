@@ -1812,6 +1812,165 @@ mod tests {
         crate::host::assert_no_debug_errors(&host.device);
     }
 
+    /// Synthetic benchmark (`--ignored --test-threads=1 --nocapture`): 48
+    /// title textures of 1 MiB each uploaded once. Before Phase 11 each kept
+    /// an upload buffer of its full footprint for good; now upload memory is
+    /// lent per submission from a bounded pool.
+    #[test]
+    #[ignore]
+    fn bench_texture_staging() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mib = |b: i128| b as f64 / (1 << 20) as f64;
+        let commit = || crate::memstat::system_commit().expect("commit").0 as i128;
+        let private = || crate::memstat::process().expect("process").0 as i128;
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let (c0, p0) = (commit(), private());
+        let mut old_retained = 0u64;
+        let mut images = Vec::new();
+        for n in 0..48u8 {
+            let mut image = null;
+            let desc = texture(512, 512, 28, 1);
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, &mut image),
+                S_OK
+            );
+            let (memory, d) = texture_memory(image).unwrap();
+            let layout = texture_layout(&d).unwrap().planes[0].layout.clone();
+            // SAFETY: the texture's memory, its layout's size.
+            unsafe { memory.cast_mut().write_bytes(n + 1, layout.size as usize) };
+            let host_texture = host_resource(image).unwrap();
+            // SAFETY: a live resource; outputs for one subresource.
+            let total = unsafe {
+                let d = host_texture.GetDesc();
+                let mut total = 0;
+                host.device
+                    .GetCopyableFootprints(&d, 0, 1, 0, None, None, None, Some(&mut total));
+                total
+            };
+            old_retained += total;
+            let list = host.new_list().unwrap();
+            crate::texture::upload(&list, image, host_texture);
+            crate::list::ensure_state(&list, image, 0x40 | 0x80);
+            list.close();
+            host.execute(&[&list]);
+            images.push(image);
+        }
+        let staging = crate::memstat::live(crate::memstat::Kind::TextureStaging);
+        let line = format!(
+            "texture-staging textures=48x1MiB old-permanent-staging={:.0}MiB now-staging-live={:.0}MiB in {} buffers (pool bound 256MiB); host-textures={:.0}MiB; commit-delta={:+.0}MiB private-delta={:+.0}MiB",
+            mib(old_retained as i128),
+            mib(staging.0 as i128),
+            staging.1,
+            mib(crate::memstat::live(crate::memstat::Kind::HostTexture).0 as i128),
+            mib(commit() - c0),
+            mib(private() - p0)
+        );
+        println!("{line}");
+        crate::memstat::report(&format!("synthetic {line}"));
+        assert!(staging.0 < old_retained);
+    }
+
+    /// Synthetic measurement (`--ignored --test-threads=1 --nocapture`):
+    /// what 256 MiB of default-heap (video memory) textures cost in process
+    /// private bytes, system commit and the GPU's local budget.
+    #[test]
+    #[ignore]
+    fn bench_default_heap_commit() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mib = |b: i128| b as f64 / (1 << 20) as f64;
+        let commit = || crate::memstat::system_commit().expect("commit").0 as i128;
+        let private = || crate::memstat::process().expect("process").0 as i128;
+        let local = || host.video_memory().map_or(0, |v| v[0].0 as i128);
+        let (c0, p0, l0) = (commit(), private(), local());
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4096,
+            Height: 4096,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let textures: Vec<ID3D12Resource> = (0..4)
+            .map(|_| {
+                let mut t: Option<ID3D12Resource> = None;
+                // SAFETY: plain creation of a texture.
+                unsafe {
+                    host.device
+                        .CreateCommittedResource(
+                            &heap,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            None,
+                            &mut t,
+                        )
+                        .unwrap();
+                }
+                t.unwrap()
+            })
+            .collect();
+        let (c1, p1, l1) = (commit(), private(), local());
+        drop(textures);
+        let (c2, p2) = (commit(), private());
+        // Repeated create/free cycles: bounded reuse or growth?
+        let mut cycles = Vec::new();
+        for _ in 0..10 {
+            let again: Vec<ID3D12Resource> = (0..4)
+                .map(|_| {
+                    let mut t: Option<ID3D12Resource> = None;
+                    // SAFETY: plain creation of a texture.
+                    unsafe {
+                        host.device
+                            .CreateCommittedResource(
+                                &heap,
+                                D3D12_HEAP_FLAG_NONE,
+                                &desc,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                None,
+                                &mut t,
+                            )
+                            .unwrap();
+                    }
+                    t.unwrap()
+                })
+                .collect();
+            drop(again);
+            cycles.push(format!("{:+.0}", mib(private() - p0)));
+        }
+        // An idle submission and a pause: deferred destruction completes.
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let p3 = private();
+        let line = format!(
+            "default-heap textures=4x64MiB: commit-delta={:+.0}MiB private-delta={:+.0}MiB gpu-local-delta={:+.0}MiB; released: commit-delta={:+.0}MiB private-delta={:+.0}MiB; private after each of 10 create/free cycles: {}; after an idle submission and 500 ms: {:+.0}MiB",
+            mib(c1 - c0),
+            mib(p1 - p0),
+            mib(l1 - l0),
+            mib(c2 - c0),
+            mib(p2 - p0),
+            cycles.join(" "),
+            mib(p3 - p0)
+        );
+        println!("{line}");
+        crate::memstat::report(&format!("synthetic {line}"));
+    }
+
     #[test]
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;
