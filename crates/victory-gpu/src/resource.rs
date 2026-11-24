@@ -278,13 +278,39 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
-/// the host copy is typed.
+/// the host copy is typed. Computed from the resource description without
+/// forcing lazy host-texture allocation.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
-    let host = host_resource(this)?;
-    // SAFETY: a live resource.
-    let format = unsafe { host.GetDesc() }.Format.0 as u32;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let own = pc_format(r.desc.format);
+    let host = crate::host::host()?;
+    let format = host_texture_desc(host, &r.desc).format;
     (format != own).then_some(own)
+}
+
+/// Whether `this` is a texture whose 16-bit packed color format was promoted
+/// to `DXGI_FORMAT_B8G8R8A8_UNORM (87)` on the host device. Computed without
+/// forcing lazy host-texture allocation.
+#[cfg(windows)]
+pub(crate) fn is_promoted_16bit(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return false;
+    }
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let d = host_texture_desc(host, &r.desc);
+    d.format == 87 && is_packed_16bit_color(pc_format(r.desc.format))
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -749,6 +775,25 @@ impl Drop for Backing {
     }
 }
 
+#[cfg(windows)]
+#[derive(Default)]
+struct HostTexSlot {
+    resource: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    failed: bool,
+    bytes: u64,
+}
+
+#[cfg(windows)]
+static TEXTURE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Whether host textures are created lazily on first GPU use (default: true).
+/// Set `VICTORY_LAZY_TEXTURES=0` to restore eager creation for A/B comparison.
+#[cfg(windows)]
+pub(crate) fn lazy_textures_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_TEXTURES").is_none_or(|v| v != "0"))
+}
+
 #[repr(C)]
 struct Resource {
     object: Object,
@@ -756,14 +801,29 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
-    /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// Textures also live on the host GPU (decision 0007); created lazily on
+    /// first GPU use so dormant/unrendered title textures hold 0 commit.
     #[cfg(windows)]
-    host: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    host: std::sync::Mutex<HostTexSlot>,
+    /// Fast atomic mirror of `host.resource.is_some()`.
+    #[cfg(windows)]
+    host_live: std::sync::atomic::AtomicBool,
+    /// Initial console resource state (used when lazily materializing `host`).
+    #[cfg(windows)]
+    initial_state: u32,
+    /// Clear value copied at creation time (title pointer lives only for create).
+    #[cfg(windows)]
+    clear_value: Option<[u32; 5]>,
+    /// Estimated footprint bytes currently counted under `Kind::DeferredTexture`.
+    #[cfg(windows)]
+    deferred_bytes: std::sync::atomic::AtomicU64,
     /// The state the host texture is in. The title's barriers name console
     /// states (looser than the host's), so we transition from this one.
     #[cfg(windows)]
     host_state: std::sync::atomic::AtomicU32,
+    /// Monotonic last-use tick for LRU eviction of idle title-written textures.
+    #[cfg(windows)]
+    last_used: std::sync::atomic::AtomicU64,
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -771,39 +831,138 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
+    let host = existing_host_resource(this)?;
     let r = resource(this);
-    let host = r.host.as_ref()?;
     let before = r
         .host_state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
     (before != wanted).then(|| (host.as_raw(), before))
 }
 
-/// Sets the state the host texture is in after a submission; returns the
-/// one it was in.
-#[cfg(windows)]
 /// The host state a title resource's host copy is in now.
+#[cfg(windows)]
 pub(crate) fn host_state(this: This) -> u32 {
     resource(this)
         .host_state
         .load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(windows)]
 pub(crate) fn swap_host_state(this: This, state: u32) -> u32 {
     resource(this)
         .host_state
         .swap(state, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The host GPU's copy of a title resource, if it has one.
+/// Whether `this` currently has a materialized host D3D12 texture (lock-free).
 #[cfg(windows)]
-pub(crate) fn host_resource<'a>(
+pub(crate) fn has_host_resource(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    resource(this)
+        .host_live
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether `this` is a title texture whose host D3D12 texture has not been
+/// materialized yet.
+#[cfg(windows)]
+pub(crate) fn is_deferred_texture(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    r.desc.dimension != BUFFER && !r.host_live.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Returns the host D3D12 texture for `this` ONLY if it is already
+/// materialized, without triggering lazy allocation (for barriers and
+/// diagnostics).
+#[cfg(windows)]
+pub(crate) fn existing_host_resource(
     this: This,
-) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_ref()
+    let r = resource(this);
+    if !r.host_live.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let slot = r.host.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(res) = &slot.resource {
+        r.last_used.store(
+            TEXTURE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return Some(res.clone());
+    }
+    None
+}
+
+/// The host GPU's copy of a title resource, materializing a deferred texture
+/// on first GPU use.
+#[cfg(windows)]
+pub(crate) fn host_resource(
+    this: This,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let (res, newly_materialized) = {
+        let mut slot = r.host.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(res) = &slot.resource {
+            r.last_used.store(
+                TEXTURE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            return Some(res.clone());
+        }
+        if slot.failed {
+            return None;
+        }
+        let Some((tex, host_bytes, initial_host_state)) =
+            host_texture(&r.desc, r.initial_state, r.clear_value.as_ref())
+        else {
+            slot.failed = true;
+            let prev = r
+                .deferred_bytes
+                .swap(0, std::sync::atomic::Ordering::Relaxed);
+            if prev > 0 {
+                crate::memstat::free(crate::memstat::Kind::DeferredTexture, prev);
+            }
+            return None;
+        };
+        let prev = r
+            .deferred_bytes
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if prev > 0 {
+            crate::memstat::free(crate::memstat::Kind::DeferredTexture, prev);
+        }
+        r.host_state
+            .store(initial_host_state, std::sync::atomic::Ordering::Relaxed);
+        r.last_used.store(
+            TEXTURE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        slot.bytes = host_bytes;
+        slot.resource = Some(tex.clone());
+        r.host_live
+            .store(true, std::sync::atomic::Ordering::Release);
+        crate::memstat::count(crate::memstat::Event::LazyMaterializations, 1);
+        (tex, true)
+    };
+    if newly_materialized {
+        // Backfill any shader-visible descriptor slots that deferred mirroring
+        // while this texture was unmaterialized (lock already released).
+        crate::descriptor::on_texture_materialized(this as usize);
+    }
+    Some(res)
 }
 
 /// Whether `format` is a 16-bit packed color format (`B5G6R5_UNORM`,
@@ -854,20 +1013,13 @@ pub(crate) fn host_rt_format(format: u32) -> u32 {
     }
 }
 
-/// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// Host-compatible texture description derived from a console `ResourceDesc`.
 #[cfg(windows)]
-fn host_texture(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    use windows::Win32::Graphics::Direct3D12::*;
+fn host_texture_desc(host: &crate::host::Host, desc: &ResourceDesc) -> ResourceDesc {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
-    if desc.dimension == BUFFER {
-        return None;
-    }
-    let host = crate::host::host()?;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    const DENY_SHADER_RESOURCE: u32 = 8;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -876,24 +1028,10 @@ fn host_texture(
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
     // copy if draws write it as a UAV.
-    const DEPTH: u32 = 2;
-    const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    let title_format = pc_format(d.format);
     d.format = host_format_for(host, d.format, d.flags);
-    if d.format != title_format {
-        tracing::debug!(
-            from = title_format,
-            to = d.format,
-            flags = d.flags,
-            width = d.width,
-            height = d.height,
-            "promoted unsupported 16-bit texture format on host"
-        );
-    }
-    const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
     {
@@ -904,14 +1042,55 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    d
+}
+
+/// A host texture like the title's: same description, in GPU memory,
+/// without the console's layout and flags. Returns `(resource, bytes, initial_host_state)`.
+#[cfg(windows)]
+fn host_texture(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: Option<&[u32; 5]>,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    u64,
+    u32,
+)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    if desc.dimension == BUFFER {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let title_format = pc_format(desc.format);
+    let d = host_texture_desc(host, desc);
+    if d.format != title_format && is_packed_16bit_color(title_format) {
+        tracing::debug!(
+            from = title_format,
+            to = d.format,
+            flags = d.flags,
+            width = d.width,
+            height = d.height,
+            "promoted unsupported 16-bit texture format on host"
+        );
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
-        // SAFETY: the title passes a whole clear value.
-        let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
+    let clear_value = clear.map(|v| {
+        let mut value = *v;
         value[0] = host_format_for(host, value[0], d.flags);
         value
     });
+    let initial_host_state = crate::host::legal_for(d.flags, crate::host::texture_state(state));
+    // SAFETY: a plain query with the description the texture will be made of.
+    let est_size = unsafe {
+        host.device
+            .GetResourceAllocationInfo(0, &[*(&raw const d).cast::<D3D12_RESOURCE_DESC>()])
+    }
+    .SizeInBytes;
+    if crate::memstat::under_pressure(est_size) {
+        crate::shadow::relieve_pressure(est_size);
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -924,9 +1103,7 @@ fn host_texture(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
+            D3D12_RESOURCE_STATES(initial_host_state as i32),
             // The same layout: format, then color or depth and stencil.
             clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
@@ -936,21 +1113,15 @@ fn host_texture(
         tracing::warn!(error = %e, desc = ?d, "no host texture");
         crate::memstat::count(crate::memstat::Event::Failures, 1);
     }
-    if let Some(t) = &texture {
-        // SAFETY: a plain query with the description the texture was made of.
-        let info = unsafe {
-            host.device
-                .GetResourceAllocationInfo(0, &[*(&raw const d).cast::<D3D12_RESOURCE_DESC>()])
-        };
-        crate::host::track(t, crate::memstat::Kind::HostTexture, info.SizeInBytes);
-        crate::host::name(t, || {
-            format!(
-                "texture {}x{} f{} flags {:#x}",
-                d.width, d.height, d.format, d.flags
-            )
-        });
-    }
-    texture
+    let t = texture?;
+    crate::host::track(&t, crate::memstat::Kind::HostTexture, est_size);
+    crate::host::name(&t, || {
+        format!(
+            "texture {}x{} f{} flags {:#x}",
+            d.width, d.height, d.format, d.flags
+        )
+    });
+    Some((t, est_size, initial_host_state))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1008,7 +1179,43 @@ fn hand_out_resource(
     #[cfg(not(windows))]
     let _ = (state, clear);
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    let clear_value = (!clear.is_null()).then(|| {
+        // SAFETY: the title passes a whole 20-byte clear value.
+        unsafe { clear.cast::<[u32; 5]>().read_unaligned() }
+    });
+    #[cfg(windows)]
+    let (slot, live, initial_host_state, deferred_est) = if desc.dimension == BUFFER {
+        (HostTexSlot::default(), false, 0, 0)
+    } else if !lazy_textures_enabled() {
+        match host_texture(&desc, state, clear_value.as_ref()) {
+            Some((tex, bytes, host_state)) => (
+                HostTexSlot {
+                    resource: Some(tex),
+                    failed: false,
+                    bytes,
+                },
+                true,
+                host_state,
+                0,
+            ),
+            None => (
+                HostTexSlot {
+                    resource: None,
+                    failed: true,
+                    bytes: 0,
+                },
+                false,
+                0,
+                0,
+            ),
+        }
+    } else {
+        let est = footprint(&desc).map_or(KIB_64, |i| i.size);
+        crate::memstat::alloc(crate::memstat::Kind::DeferredTexture, est);
+        let initial_host_state =
+            crate::host::legal_for(desc.flags & 0xf, crate::host::texture_state(state));
+        (HostTexSlot::default(), false, initial_host_state, est)
+    };
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1016,14 +1223,19 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host_state: host
-            .as_ref()
-            .map_or(0, |t| {
-                crate::host::legal_state(t, crate::host::texture_state(state))
-            })
-            .into(),
+        host: std::sync::Mutex::new(slot),
         #[cfg(windows)]
-        host,
+        host_live: std::sync::atomic::AtomicBool::new(live),
+        #[cfg(windows)]
+        initial_state: state,
+        #[cfg(windows)]
+        clear_value,
+        #[cfg(windows)]
+        deferred_bytes: std::sync::atomic::AtomicU64::new(deferred_est),
+        #[cfg(windows)]
+        host_state: initial_host_state.into(),
+        #[cfg(windows)]
+        last_used: std::sync::atomic::AtomicU64::new(0),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1036,6 +1248,12 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        let deferred = self
+            .deferred_bytes
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if deferred > 0 {
+            crate::memstat::free(crate::memstat::Kind::DeferredTexture, deferred);
+        }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
@@ -1237,7 +1455,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    host_resource(out).is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1720,7 +1938,7 @@ mod tests {
         // SAFETY: an open list, live resources, locations in the host layout.
         unsafe {
             back.list.ResourceBarrier(&[crate::host::transition(
-                host_image,
+                &host_image,
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
@@ -1781,7 +1999,7 @@ mod tests {
         };
         let submit = || {
             let list = host.new_list().unwrap();
-            crate::texture::upload(&list, image, host_resource(image).unwrap());
+            crate::texture::upload(&list, image, &host_resource(image).unwrap());
             crate::list::ensure_state(&list, image, 0x40 | 0x80);
             list.close();
             let before = crate::texture::RECORDED.load(Relaxed);
@@ -1851,7 +2069,7 @@ mod tests {
             };
             old_retained += total;
             let list = host.new_list().unwrap();
-            crate::texture::upload(&list, image, host_texture);
+            crate::texture::upload(&list, image, &host_texture);
             crate::list::ensure_state(&list, image, 0x40 | 0x80);
             list.close();
             host.execute(&[&list]);
@@ -2128,7 +2346,7 @@ mod tests {
         // SAFETY: an open list, live resources, locations in the host layout.
         unsafe {
             back.list.ResourceBarrier(&[crate::host::transition(
-                host_image,
+                &host_image,
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
@@ -2285,7 +2503,7 @@ mod tests {
                 rtv_slot.as_mut_ptr() as u64,
             );
             let record = crate::descriptor::rtv_record(rtv_slot.as_ptr() as u64).unwrap();
-            let _ = host_gpu.rtv(host_tex, record.desc().as_ref());
+            let _ = host_gpu.rtv(&host_tex, record.desc().as_ref());
 
             // Explicit SRV with title's original 16-bit format must succeed without null fallback.
             // Layout: [0]=Format, [1]=ViewDimension, [2]=Mapping, [3]=pad,
@@ -2321,5 +2539,278 @@ mod tests {
             crate::host::assert_no_debug_errors(&host_gpu.device);
             assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
         }
+    }
+
+    /// Creating textures and writing their SRVs into a shader-visible heap
+    /// does not allocate D3D12 host textures until actual GPU use; first GPU
+    /// use materializes only that texture and backfills its deferred slots.
+    #[cfg(windows)]
+    #[test]
+    fn lazy_textures_defer_allocation_until_first_gpu_use() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        #[repr(C)]
+        struct ExtendedHeap([u32; 4], [u64; 2]);
+        let hdesc = ExtendedHeap([0, 64, 1, 0], [0, 0]);
+        let mut sheap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                (&raw const hdesc.0).cast(),
+                &heap_iid,
+                &mut sheap
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(sheap);
+        let _host_heap = title_heap.host().expect("host view heap");
+        let start = title_heap.start;
+
+        let lazy_before = crate::memstat::events(crate::memstat::Event::LazyMaterializations);
+        let backing = vec![0u8; 64 << 10];
+        let mut textures = Vec::new();
+        for i in 0..16u64 {
+            let mut tex = null;
+            let desc = ResourceDesc {
+                flags: 1, // ALLOW_RENDER_TARGET
+                ..texture(256, 256, 28, 1)
+            };
+            assert_eq!(
+                create_at_address(
+                    null,
+                    backing.as_ptr() as u64,
+                    &desc,
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut tex
+                ),
+                S_OK
+            );
+            assert!(
+                !has_host_resource(tex),
+                "texture {i} must stay deferred at creation"
+            );
+            assert!(existing_host_resource(tex).is_none());
+            crate::descriptor::create_srv(null, tex, std::ptr::null(), start + i * 32);
+            assert!(
+                !has_host_resource(tex),
+                "SRV write for texture {i} must not force host allocation"
+            );
+            textures.push(tex);
+        }
+
+        // First GPU use on texture 3 materializes ONLY texture 3 and backfills its slot.
+        let mat = host_resource(textures[3]).expect("lazy materialization");
+        assert!(has_host_resource(textures[3]));
+        assert!(!has_host_resource(textures[0]));
+        assert!(crate::memstat::events(crate::memstat::Event::LazyMaterializations) > lazy_before);
+        drop(mat);
+
+        for tex in textures {
+            assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
+        }
+        assert_eq!(slot::<Release>(sheap, 0x10)(sheap), 0);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// A barrier on a deferred texture skips allocating a host texture, while
+    /// a later clear + readback materializes it cleanly with valid transitions.
+    #[cfg(windows)]
+    #[test]
+    fn barriers_on_deferred_textures_skip_allocation_until_real_gpu_use() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let mut tex = null;
+        let desc = ResourceDesc {
+            flags: 1, // ALLOW_RENDER_TARGET
+            ..texture(16, 16, 28, 1)
+        };
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, &mut tex),
+            S_OK
+        );
+        assert!(!has_host_resource(tex));
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut alloc, mut cmd) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut alloc),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut cmd),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct TransBarrier {
+            kind: u32,
+            flags: u32,
+            res: This,
+            sub_before: u64,
+            after: u64,
+        }
+        let b = TransBarrier {
+            kind: 0,
+            flags: 0,
+            res: tex,
+            sub_before: 0xffff_ffff,
+            after: 0x4, // RENDER_TARGET
+        };
+        slot::<extern "system" fn(This, u32, *const TransBarrier)>(cmd, 0xd0)(cmd, 1, &b);
+        assert!(
+            !has_host_resource(tex),
+            "bare barrier must not allocate a host texture"
+        );
+
+        let mut rtv_slot = [0u8; 128];
+        crate::descriptor::create_rtv(null, tex, std::ptr::null(), rtv_slot.as_mut_ptr() as u64);
+        let color = [1.0f32, 0.0, 0.5, 1.0];
+        slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const c_void)>(cmd, 0x1a0)(
+            cmd,
+            rtv_slot.as_ptr() as u64,
+            &color,
+            0,
+            std::ptr::null(),
+        );
+        assert!(
+            has_host_resource(tex),
+            "ClearRenderTargetView must materialize the host texture"
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(cmd, 0x48)(cmd),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &cmd);
+
+        let pixels = read_rgba8(tex, 16, 16);
+        assert_eq!(pixels[0], 255);
+        assert_eq!(pixels[1], 0);
+        assert!((127..=128).contains(&pixels[2]), "got {:?}", &pixels[0..4]);
+        assert_eq!(pixels[3], 255);
+
+        assert_eq!(slot::<Release>(cmd, 0x10)(cmd), 0);
+        assert_eq!(slot::<Release>(alloc, 0x10)(alloc), 0);
+        assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
+        assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Bindless UAV materialization materializes deferred UAV textures on a
+    /// shader-visible heap while leaving SRV-only textures deferred.
+    #[cfg(windows)]
+    #[test]
+    fn bindless_uav_flush_materializes_only_uav_textures() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        #[repr(C)]
+        struct ExtendedHeap([u32; 4], [u64; 2]);
+        let hdesc = ExtendedHeap([0, 16, 1, 0], [0, 0]);
+        let mut sheap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                (&raw const hdesc.0).cast(),
+                &heap_iid,
+                &mut sheap
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(sheap);
+        let _host_heap = title_heap.host().expect("host view heap");
+        let start = title_heap.start;
+
+        let backing = vec![0u8; 64 << 10];
+        let mut srv_tex = null;
+        let mut uav_tex = null;
+        let srv_desc = texture(64, 64, 28, 1);
+        let uav_desc = ResourceDesc {
+            flags: 4, // ALLOW_UNORDERED_ACCESS
+            ..texture(64, 64, 28, 1)
+        };
+        assert_eq!(
+            create_at_address(
+                null,
+                backing.as_ptr() as u64,
+                &srv_desc,
+                0,
+                null.cast(),
+                iid,
+                &mut srv_tex
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null,
+                backing.as_ptr() as u64,
+                &uav_desc,
+                0,
+                null.cast(),
+                iid,
+                &mut uav_tex
+            ),
+            S_OK
+        );
+        crate::descriptor::create_srv(null, srv_tex, std::ptr::null(), start);
+        crate::descriptor::create_uav(null, uav_tex, null, std::ptr::null(), start + 32);
+        assert!(!has_host_resource(srv_tex));
+        assert!(!has_host_resource(uav_tex));
+
+        crate::descriptor::materialize_deferred_uavs(sheap as usize);
+        assert!(
+            has_host_resource(uav_tex),
+            "UAV texture materialized for bindless"
+        );
+        assert!(
+            !has_host_resource(srv_tex),
+            "SRV-only texture remains deferred"
+        );
+
+        assert_eq!(slot::<Release>(srv_tex, 0x10)(srv_tex), 0);
+        assert_eq!(slot::<Release>(uav_tex, 0x10)(uav_tex), 0);
+        assert_eq!(slot::<Release>(sheap, 0x10)(sheap), 0);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 }

@@ -102,7 +102,13 @@ impl Heap {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let h = self
             .host
-            .get_or_init(|| host::HostHeap::new(self.samplers(), self.desc.count))
+            .get_or_init(|| {
+                host::HostHeap::new(
+                    self.samplers(),
+                    self.desc.count,
+                    std::ptr::from_ref(self) as usize,
+                )
+            })
             .as_ref()?;
         let step = u64::from(increment(self.desc.kind)?);
         for i in pending.drain(..) {
@@ -188,12 +194,127 @@ pub(crate) fn shader_heap_stats() -> String {
     parts.join("; ")
 }
 
+/// A shader-visible descriptor slot whose texture resource was not yet
+/// materialized when the title wrote it. Backfilled automatically if/when
+/// that texture materializes for GPU use.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DeferredSlot {
+    heap: usize,
+    index: u32,
+    handle: u64,
+    unordered: bool,
+}
+
+/// Deferred shader-visible slots by title resource address.
+#[cfg(windows)]
+static DEFERRED_TEX_SLOTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Vec<DeferredSlot>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Records that shader-visible slot `(heap, index)` at `handle` refers to a
+/// not-yet-materialized texture `resource`, so it is backfilled on first GPU use.
+#[cfg(windows)]
+pub(crate) fn register_deferred_slot(
+    resource: usize,
+    heap: usize,
+    index: u32,
+    handle: u64,
+    unordered: bool,
+) {
+    if resource == 0 || heap == 0 {
+        return;
+    }
+    let mut map = DEFERRED_TEX_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let slots = map.entry(resource).or_default();
+    let entry = DeferredSlot {
+        heap,
+        index,
+        handle,
+        unordered,
+    };
+    if let Some(existing) = slots
+        .iter_mut()
+        .find(|s| s.heap == heap && s.index == index)
+    {
+        *existing = entry;
+    } else {
+        slots.push(entry);
+    }
+}
+
+/// Backfills any shader-visible descriptor slots that deferred mirroring
+/// while `resource` had no host texture. Must be called with no `Resource`
+/// or `HostHeap` locks held.
+#[cfg(windows)]
+pub(crate) fn on_texture_materialized(resource: usize) {
+    let slots = {
+        let mut map = DEFERRED_TEX_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&resource)
+    };
+    let Some(slots) = slots else {
+        return;
+    };
+    for slot in slots {
+        // Verify the descriptor slot in title memory still points at `resource`
+        // (it may have been overwritten before materialization).
+        let still_same = view(slot.handle).is_some_and(|v| v.resources().contains(&resource));
+        if !still_same {
+            continue;
+        }
+        let host_heap = {
+            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            if heaps.iter().any(|&(_, _, h)| h == slot.heap) {
+                // SAFETY: registered heaps are live while SHADER_HEAPS holds them,
+                // and `Heap::drop` removes from SHADER_HEAPS before freeing.
+                unsafe { &*(slot.heap as *const Heap) }
+                    .host
+                    .get()
+                    .and_then(|h| h.as_ref())
+            } else {
+                None
+            }
+        };
+        if let Some(host_heap) = host_heap {
+            host_heap.mirror(slot.index, slot.handle, true);
+        }
+    }
+}
+
+/// Materializes any deferred texture with an unordered-access view in
+/// shader-visible `heap_ptr`, called when a pipeline using direct
+/// `ResourceDescriptorHeap[]` indexing is bound so bindless UAV writes
+/// never land on a deferred NULL slot.
+#[cfg(windows)]
+pub(crate) fn materialize_deferred_uavs(heap_ptr: usize) {
+    let resources: Vec<usize> = {
+        let map = DEFERRED_TEX_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter_map(|(&res, slots)| {
+                slots
+                    .iter()
+                    .any(|s| s.heap == heap_ptr && s.unordered)
+                    .then_some(res)
+            })
+            .collect()
+    };
+    for res in resources {
+        let _ = crate::resource::host_resource(res as This);
+    }
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        let mut deferred = DEFERRED_TEX_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        deferred.retain(|_, slots| {
+            slots.retain(|s| s.heap != at);
+            !slots.is_empty()
+        });
     }
 }
 
@@ -260,9 +381,7 @@ impl RtvRecord {
         };
         words[0] = crate::resource::pc_format(words[0]);
         if crate::resource::is_packed_16bit_color(words[0])
-            && let Some(tex) = crate::resource::host_resource(self.resource)
-            // SAFETY: a live host texture.
-            && unsafe { tex.GetDesc() }.Format.0 as u32 == 87
+            && crate::resource::is_promoted_16bit(self.resource)
         {
             words[0] = 87;
         }
@@ -418,6 +537,13 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
+    #[cfg(windows)]
+    {
+        DEFERRED_TEX_SLOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&resource);
+    }
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;

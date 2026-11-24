@@ -32,6 +32,8 @@ pub(crate) struct HostHeap {
     /// view heap.
     capped: bool,
     sampler: bool,
+    /// Owning title `Heap` pointer (for registering deferred texture slots).
+    title_heap: usize,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
     /// Host copies of title memory that slots' views are made on and that
@@ -68,9 +70,16 @@ macro_rules! once {
 }
 
 impl HostHeap {
-    pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+    pub(crate) fn new(sampler: bool, count: u32, title_heap: usize) -> Option<Self> {
         let host = host()?;
-        Self::new_on_device(host.device.clone(), sampler, count, PORTABLE_VIEWS, DYNAMIC)
+        Self::new_on_device(
+            host.device.clone(),
+            sampler,
+            count,
+            PORTABLE_VIEWS,
+            DYNAMIC,
+            title_heap,
+        )
     }
 
     /// Creates a shader-visible host heap on `device`, capping view heaps at
@@ -82,6 +91,7 @@ impl HostHeap {
         requested: u32,
         max_views: u32,
         dynamic_slots: u32,
+        title_heap: usize,
     ) -> Option<Self> {
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -120,7 +130,9 @@ impl HostHeap {
                 return None;
             }
         };
-        Self::finish_init(device, heap, kind, sampler, requested, count, extra, capped)
+        Self::finish_init(
+            device, heap, kind, sampler, requested, count, extra, capped, title_heap,
+        )
     }
 
     #[cfg(test)]
@@ -154,6 +166,7 @@ impl HostHeap {
             count,
             dynamic_slots,
             capped,
+            0,
         )
     }
 
@@ -167,6 +180,7 @@ impl HostHeap {
         count: u32,
         dynamic_count: u32,
         capped: bool,
+        title_heap: usize,
     ) -> Option<Self> {
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -200,6 +214,7 @@ impl HostHeap {
             dynamic_count,
             capped,
             sampler,
+            title_heap,
             made: Mutex::new(vec![0; count as usize]),
             owners: Mutex::default(),
             next: Mutex::new((0, vec![false; dynamic_count as usize])),
@@ -479,32 +494,46 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-        let Some(view) = view else {
-            // Not a view of ours (never written, or of a resource the
-            // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
-                self.make_null(index);
-            }
-            return None;
-        };
-        if made[index as usize] != key {
-            let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
-            let mut owner = None;
-            if (later || !make_owned(&self.device, &view, self.cpu(index), &mut owner))
-                && !self.sampler
-            {
-                if !later {
-                    self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
-                }
-                null_for_on(&self.device, &view, self.cpu(index));
-            }
-            self.own(index, owner);
+        if for_draw && let Some(ref v) = view {
+            // Materialize any deferred texture BEFORE taking `self.made` so
+            // `on_texture_materialized` backfill never re-enters `self.made`.
+            ensure_view_materialized(v);
         }
-        Some(view)
+        let deferred_to_register = {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(ref view) = view else {
+                // Not a view of ours (never written, or of a resource the
+                // title released): nothing to read.
+                if made[index as usize] != 0 {
+                    made[index as usize] = 0;
+                    self.make_null(index);
+                }
+                return None;
+            };
+            let mut register = None;
+            if made[index as usize] != key {
+                let deferred_tex = (!for_draw).then(|| deferred_texture_of(view)).flatten();
+                let later = (!for_draw && view.is_buffer()) || deferred_tex.is_some();
+                made[index as usize] = if later { 0 } else { key };
+                let mut owner = None;
+                if (later || !make_owned(&self.device, view, self.cpu(index), &mut owner))
+                    && !self.sampler
+                {
+                    if !later {
+                        self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    null_for_on(&self.device, view, self.cpu(index));
+                }
+                self.own(index, owner);
+                register = deferred_tex;
+            }
+            register
+        };
+        if let Some((res, unordered)) = deferred_to_register {
+            super::register_deferred_slot(res, self.title_heap, index, handle, unordered);
+        }
+        view
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -539,6 +568,32 @@ impl HostHeap {
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
+    }
+}
+
+/// Returns `(resource, is_uav)` if `view` names a title texture whose host
+/// D3D12 texture has not been materialized yet.
+fn deferred_texture_of(view: &View) -> Option<(usize, bool)> {
+    match *view {
+        View::Shader(r, _)
+            if r != 0 && crate::resource::is_deferred_texture(r as crate::object::This) =>
+        {
+            Some((r, false))
+        }
+        View::Unordered(r, _, _)
+            if r != 0 && crate::resource::is_deferred_texture(r as crate::object::This) =>
+        {
+            Some((r, true))
+        }
+        _ => None,
+    }
+}
+
+/// Ensures any deferred texture referenced by `view` is materialized before
+/// taking `HostHeap.made`.
+fn ensure_view_materialized(view: &View) {
+    if let Some((r, _)) = deferred_texture_of(view) {
+        let _ = crate::resource::host_resource(r as crate::object::This);
     }
 }
 
@@ -857,13 +912,13 @@ fn make_owned(
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                if !fits(&texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return false;
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
-                        texture,
+                        &texture,
                         desc.as_ref().map(std::ptr::from_ref),
                         at,
                     )
@@ -903,13 +958,13 @@ fn make_owned(
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(&texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return false;
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
-                    texture,
+                    &texture,
                     None::<&ID3D12Resource>,
                     desc.as_ref().map(std::ptr::from_ref),
                     at,
@@ -1394,7 +1449,7 @@ mod tests {
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
-        let Some(heap) = HostHeap::new(false, 4) else {
+        let Some(heap) = HostHeap::new(false, 4, 0) else {
             return; // no host GPU
         };
         let a = heap.dynamic(DYNAMIC - 100).unwrap();

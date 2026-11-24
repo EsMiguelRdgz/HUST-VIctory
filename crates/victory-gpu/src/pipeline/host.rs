@@ -247,6 +247,9 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// Whether any stage directly indexes `ResourceDescriptorHeap[]` outside a
+    /// descriptor table (`RootType::ResourceHeap`).
+    pub(crate) uses_resource_heap: bool,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -393,6 +396,12 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        let uses_resource_heap = bound.iter().any(|s| {
+            s.translated()
+                .used
+                .iter()
+                .any(|u| u.root == victory_shader::native::RootType::ResourceHeap)
+        });
         let root = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -435,6 +444,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                uses_resource_heap,
             });
         }
         let Some(g) = g else {
@@ -459,6 +469,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                uses_resource_heap,
             });
         }
 
@@ -516,6 +527,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            uses_resource_heap,
         })
     }
 }

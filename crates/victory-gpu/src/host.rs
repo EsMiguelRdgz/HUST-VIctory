@@ -1097,15 +1097,15 @@ impl HostList {
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
+    ) -> Option<(ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
-        let wanted = legal_state(texture, wanted);
+        let wanted = legal_state(&texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(resource as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted));
                 drop(states);
-                self.keep(texture);
+                self.keep(&texture);
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -1131,22 +1131,25 @@ impl HostList {
             )
         };
         let (mut before, mut after) = (Vec::new(), Vec::new());
+        // Keep owned COM handles alive until `list.ResourceBarrier` finishes.
+        let mut live_textures: Vec<ID3D12Resource> = Vec::with_capacity(states.len());
         for (&resource, &(first, last)) in states.iter() {
             let this = resource as crate::object::This;
-            let Some(texture) = crate::resource::host_resource(this) else {
+            let Some(texture) = crate::resource::existing_host_resource(this) else {
                 continue;
             };
             let real = crate::resource::swap_host_state(this, last);
             if uploading(resource) {
                 if real != COPY_DEST {
-                    before.push(barrier(texture, real, COPY_DEST));
+                    before.push(barrier(&texture, real, COPY_DEST));
                 }
                 if first != COPY_DEST {
-                    after.push(barrier(texture, COPY_DEST, first));
+                    after.push(barrier(&texture, COPY_DEST, first));
                 }
             } else if real != first {
-                before.push(barrier(texture, real, first));
+                before.push(barrier(&texture, real, first));
             }
+            live_textures.push(texture);
         }
         // Uploaded textures the list does not move: back where they were.
         for upload in uploads.iter().filter(|u| !states.contains_key(&u.resource)) {

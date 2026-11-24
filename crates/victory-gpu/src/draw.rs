@@ -327,18 +327,20 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            list.keep(&texture);
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
+            list.keep(&texture);
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some(host.dsv(&texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -514,6 +516,9 @@ impl State {
             self.host_pipeline = self.pipeline;
             list.used_pipeline(&p.name);
         }
+        if p.uses_resource_heap && self.heaps[0] != 0 {
+            crate::descriptor::materialize_deferred_uavs(self.heaps[0]);
+        }
         #[cfg(feature = "diagnostics")]
         self.last_tables.clear();
         for stage in &p.stages {
@@ -654,7 +659,7 @@ impl State {
             let rts: Vec<String> = self
                 .targets
                 .iter()
-                .filter_map(|&t| crate::resource::host_resource(t as This))
+                .filter_map(|&t| crate::resource::existing_host_resource(t as This))
                 .map(|t| {
                     // SAFETY: a live host resource.
                     let d = unsafe { t.GetDesc() };
@@ -662,7 +667,7 @@ impl State {
                 })
                 .collect();
             let dsv = (self.depth != 0)
-                .then(|| crate::resource::host_resource(self.depth as This))
+                .then(|| crate::resource::existing_host_resource(self.depth as This))
                 .flatten()
                 .map(|t| {
                     // SAFETY: a live host resource.
@@ -892,7 +897,7 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
+            .filter_map(|&t| crate::resource::existing_host_resource(t as This))
             .map(|t| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -1096,13 +1101,13 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             if let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && crate::texture::title_written(&t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload(list, *resource as This, &t);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            if let Some(t) = crate::resource::existing_host_resource(*resource as This) {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
@@ -1127,7 +1132,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
     let texture = |r: This| {
-        crate::resource::host_resource(r).map(|t| {
+        crate::resource::existing_host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
             format!(
