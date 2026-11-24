@@ -1,27 +1,27 @@
 # Current Project Status
 
 - Current milestone: Phase 10 — memory architecture, copy-back performance, bounded parallelism, GPU acceleration, resource budgeting, and robustness
-- Current subphase: Phase 10B/10A — snapshot isolation and fence-wait handling VERIFIED and committed; next: memory/lifetime accounting (Priority 3)
+- Current subphase: Phase 10 priorities 1-3 and 5 (reclamation) VERIFIED and committed; next: copy-back performance/timing split (priority 6), then bounded CPU parallelism (7) and GPU evaluation (8)
 - Current branch: `hust/nvidia-rtx3070`
-- Latest verified commit: `e24bc28` (fence waits). Phase 10 commits so far: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`
+- Latest verified commit: `ba4cb15` (descriptor ownership + reclamation). Phase 10 commits: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`, `13c97ad`, `ec38425`, `7036da9`, `ba4cb15`
 - Current working-tree status: clean except this progress.md checkpoint (committed with the next change)
 - Active agent: Claude Code
 - Model: Claude Opus 5.5
 - Last checkpoint timestamp: 2026-11-23 (Claude recovery checkpoint)
 - Current build status: PASS (`cargo test --workspace --no-run`)
-- Current test status: `cargo test -p victory-gpu` 55/55 after `e24bc28`; last full workspace run 239/0/3 at `bc9d31b` (rerun pending after the next change)
+- Current test status: `cargo test -p victory-gpu` 63/63, 40 parallel stress runs 0 failures at `ba4cb15`; workspace run in progress
 
 ## Active Task
 
-- Objective: Priority 3 — memory allocation and resource lifetime accounting for shadow copies, snapshot buffers and other host allocations, so excessive committed memory can be attributed on an authorized run.
+- Objective: Priority 6 — copy-back correctness/performance: separate timing of snapshot memcpy, diff scan, title writes (WriteProcessMemory), and reduce snapshot envelope amplification (snapshot covers min..max of all ranges incl. gaps).
 - Current implementation: NOT_STARTED.
-- Plan: (1) process-wide byte counters for live shadow host buffers by kind (buffer / loose window / aligned), snapshot-pool retained bytes and in-flight snapshot bytes; (2) report them with process private bytes / commit (`GetProcessMemoryInfo`, PROCESS_MEMORY_COUNTERS_EX.PrivateUsage) and DXGI local/non-local budget (`IDXGIAdapter3::QueryVideoMemoryInfo`) on the existing periodic stats line; (3) a byte budget for `SNAPSHOT_POOL` (currently 8 buffers by count, unbounded bytes).
+- Plan: (a) per-segment snapshots — `Snapshot` stores the merged ranges' bytes only (Vec of (offset,len) segments into one buffer) instead of the min..max envelope; (b) `COPY_BACK` split into snapshot/diff/write microseconds and snapshot bytes, reported on the frame-rate line; (c) only then consider parallel diff for large ranges (priority 7).
 - Known risks: none yet.
 
 ## Immediate Resume Instructions
 
-- First action: implement the accounting plan above in `crates/victory-gpu/src/shadow.rs` (counters next to `SNAPSHOT_POOL`, `Shadow::new`, `Drop`) and find the periodic frame-rate/stats log in `host.rs` (`SUBMISSION_US`, `COPY_BACK` are reported there).
-- Then: Priority 4/5 — bounded snapshot pool, reclamation of `LOOSE` windows and loose-derived `ALIGNED` shadows (currently never freed), Priority 6 copy-back timing split (snapshot memcpy vs diff vs WriteProcessMemory), Priority 7 bounded CPU parallelism, Priority 8 GPU-side evaluation.
+- First action: confirm the workspace test result for `ba4cb15` is recorded in Completed Tasks (rerun `cargo test --workspace` if not), then start the Priority 6 plan in Active Task (`shadow.rs` `snapshot_ranges`/`copy_back_ranges`, `host.rs` `COPY_BACK` and the `Meter::frame` log line).
+- Then: Priority 6 copy-back timing split (snapshot memcpy vs diff vs WriteProcessMemory), Priority 7 bounded CPU parallelism, Priority 8 GPU-side evaluation.
 - Pending tests: focused tests for each change, `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets`, `cargo build --profile diag -p victory --features diagnostics`.
 - Known blockers: none. Verified local commits are pre-authorized (AGENTS.md); pushes/destructive Git still need the user.
 - Remaining known risk: a thread's `run_deferred` refresh (before it takes the submission lock) can still write a shadow while another thread's submission GPU work reads/writes it; the snapshot fix does not cover this broader shared-shadow concurrency.
@@ -72,9 +72,11 @@
 
 - VERIFIED — Priority 3 memory accounting (`ec38425`): new `crates/victory-gpu/src/memstat.rs` counts live/peak bytes+counts per kind (buffers, loose, aligned, in-flight snapshots, snapshot pool); `Shadow` now carries `kind`/`bytes` and uncounts in `Drop`. Host `Meter` logs `host memory: private/working set; system commit/limit; GPU local/non-local usage/budget (IDXGIAdapter3::QueryVideoMemoryInfo); copies of title memory: ...` every 5 s in all builds. Snapshot pool now capped at 8 buffers AND 64 MiB (largest evicted first); new snapshot buffers use `try_reserve_exact`, falling back to whole-range copy-back on OOM. Tests: `counts_track_live_bytes_and_peaks_without_wrapping`, `process_and_system_memory_are_reported`, `snapshot_pool_keeps_within_its_byte_budget`, `aligned_shadows_are_counted_until_released`, `video_memory_reports_a_local_budget`. `cargo test -p victory-gpu` 60/60; 40 parallel stress runs 0 failures; clippy (both feature sets) only old warning. Incident: an over-broad `rustfmt crates/victory-gpu/src/lib.rs` reformatted untouched `capture.rs`/`queue.rs`; both were restored byte-for-byte from HEAD before committing (never pass lib.rs to rustfmt — it follows `mod` declarations).
 
+- VERIFIED — Priority 4/5 investigation + reclamation (`ba4cb15`). Findings: (1) descriptor slots (`descriptor/host.rs` `make_on`) were created on shadow host buffers without holding an `Arc`, which is why loose/aligned copies could never be freed safely; every other GPU-address use (root views, VB/IB, table refreshes) holds the `Arc` via the list. (2) `loose()` looked up windows by exact `(start,len)`, so a request spanning a window boundary created an overlapping duplicate copy of the same title memory (memory amplification + divergent copies). (3) Every title buffer object gets a full-size host copy in a CUSTOM write-back L0 heap (system-memory commit ≈ total size of title buffers used by draws) — architectural, unchanged, a prime suspect for high commit; measure with the new `host memory` line. Changes: `HostHeap.owners: HashMap<u32, Arc<Shadow>>` keeps loose/aligned copies a slot shows (`make_owned`, set in `mirror`/`make_at`, cleared in `make_null`/`make_null_for`/`release`); buffer-object copies keep free-at-unregister lifetime. `reclaim()` frees idle copies (strong_count==1, no pending writes) LRU-first past `LOOSE_BUDGET` 512 MiB / `ALIGNED_BUDGET` 256 MiB (unmeasured defaults); loose lookup now uses containment. Tests: `reclaim_frees_only_idle_copies_oldest_first`, `loose_requests_inside_a_window_share_it`, `slots_keep_the_copies_they_need_alive`. `cargo test -p victory-gpu` 63/63; 40 stress runs 0 failures; clippy both feature sets only the old warning.
+
 ## Incomplete Tasks
 
-- NOT_STARTED — Remaining Priority A: shadow/staging lifetime audit, snapshot-pool byte budgets/accounting, additional bounded allocation, and allocation-failure handling.
+- IN_PROGRESS — Remaining Priority A: shadow lifetime audit DONE (see Completed); snapshot pool bounded DONE; remaining: staging/scratch/upload allocations in `host.rs` (`list.scratch`, texture uploads) audit and allocation-failure handling.
 - NOT_STARTED — Priority B measurement: separate scanning, snapshot memcpy, comparison, title writes, page protection, fence API/event waits, synchronization, and temporary allocation costs.
 - NOT_STARTED — Priority C: evaluate justified bounded CPU parallelism with duplicate-job and memory-growth controls.
 - NOT_STARTED — Priority D: evaluate documented D3D12 compute/copy-queue acceleration and GPU-local intermediates where measurements justify them.
