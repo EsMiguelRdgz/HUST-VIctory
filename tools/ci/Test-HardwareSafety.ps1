@@ -189,6 +189,9 @@ if (Test-Path -LiteralPath $hwPath) {
     if ($hw -notmatch 'concurrency:\s*\n\s*group:\s*hust-rtx3070-hardware\s*\n\s*cancel-in-progress:\s*false') {
         Add-Failure "${hwRel}: must serialize hardware runs (concurrency group 'hust-rtx3070-hardware', cancel-in-progress: false)."
     }
+    if ($hw -notmatch 'vars\.HUST_RTX3070_HARDWARE_ENABLED' -or $hw -notmatch '\[\s*"\$ENABLED"\s*=\s*"true"\s*\]\s*\|\|\s*fail') {
+        Add-Failure "${hwRel}: must refuse unless the owner sets HUST_RTX3070_HARDWARE_ENABLED to 'true'."
+    }
     if ($hw -notmatch 'Run-VictoryDiagnostic\.ps1') {
         Add-Failure "${hwRel}: must launch through tools/diag/Run-VictoryDiagnostic.ps1."
     }

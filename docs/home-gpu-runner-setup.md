@@ -124,13 +124,20 @@ In **Settings → Secrets and variables → Actions**:
 1. On the **Variables** tab, add `HUST_RTX3070_RUNNER_REGISTERED` = `true`.
    Until it says `true`, the preflight refuses every hardware run. Set it to
    `false` to switch hardware runs off without touching the runner.
-2. Optional but recommended: a live online check. Create a fine-grained
+2. Do **not** create `HUST_RTX3070_HARDWARE_ENABLED` yet. It is the master
+   switch for physical tests and is separate from registration: until it
+   exists and says `true`, the preflight refuses every hardware run, even with
+   the runner registered and online. Set it to `true` only when you decide to
+   authorize physical testing, and set it back to `false` (or delete it)
+   afterwards. You can also keep the workflow switched off entirely with
+   **Actions → Home RTX 3070 diagnostic → ⋯ → Disable workflow**.
+3. Optional but recommended: a live online check. Create a fine-grained
    personal access token at <https://github.com/settings/personal-access-tokens/new>:
    - **Repository access**: only `EsMiguelRdgz/HUST-VIctory`.
    - **Repository permissions**: **Administration: Read-only**. This permission
      is needed to list runners. Nothing else.
    - Store it as a secret named `HUST_RUNNER_STATUS_TOKEN`, preferably on the
-     `home-rtx3070` environment from item 3. The workflow file holds only the
+     `home-rtx3070` environment from item 4. The workflow file holds only the
      secret's name, never its value.
 
    With the token set, the preflight refuses unless a runner labelled
@@ -138,12 +145,12 @@ In **Settings → Secrets and variables → Actions**:
    still refuses any job that waited longer than `max_queue_minutes` (default
    5) for the runner. A run dispatched while the PC was off therefore never
    starts by itself later.
-3. In **Settings → Environments**, create `home-rtx3070`:
+4. In **Settings → Environments**, create `home-rtx3070`:
    - **Required reviewers**: yourself. Every hardware run then waits for your
      click before it can start. The stale-queue timer starts only after you
      approve.
    - **Deployment branches**: selected branches, `hust/phase12-memory`.
-4. In **Settings → Actions → General → Workflow permissions**, choose **Read
+5. In **Settings → Actions → General → Workflow permissions**, choose **Read
    repository contents**.
 
 ## Step 5: Start the runner in your interactive session (each time you test)
@@ -169,7 +176,8 @@ Set-Location G:\actions-runner-hust
 The workflows appear in the **Actions** tab once they are on the default
 branch, `hust/phase12-memory`.
 
-1. Review the commit, push it to `hust/phase12-memory`, and copy its full
+1. Make sure `HUST_RTX3070_HARDWARE_ENABLED` is `true` (your explicit
+   authorization). Review the commit, push it to `hust/phase12-memory`, and copy its full
    40-character SHA.
 2. Open **Actions → Home RTX 3070 diagnostic → Run workflow**, with the branch
    set to `hust/phase12-memory`.
@@ -198,7 +206,7 @@ retention). The full run directory stays in `HUST_VICTORY_RESULTS_ROOT`.
 
 ## Removing the runner
 
-1. Set `HUST_RTX3070_RUNNER_REGISTERED` to `false`.
+1. Set `HUST_RTX3070_HARDWARE_ENABLED` and `HUST_RTX3070_RUNNER_REGISTERED` to `false`.
 2. Stop `run.cmd`.
 3. On **Settings → Actions → Runners → hust-rtx3070-home → Remove**, copy the
    removal command, then run it in the runner folder:
@@ -209,6 +217,7 @@ retention). The full run directory stays in `HUST_VICTORY_RESULTS_ROOT`.
 
 | Message | Meaning |
 |---|---|
+| `Hardware runs are disabled` | `HUST_RTX3070_HARDWARE_ENABLED` is not `true`: physical tests are not authorized. |
 | `HUST_RTX3070_RUNNER_REGISTERED is not 'true'` | Step 4.1 is not done, or hardware runs are switched off. |
 | `Commit ... is not on hust/phase12-memory` | Push or merge the reviewed commit first. |
 | `No online runner labelled hust-rtx3070` | Start `run.cmd` (Step 5). |
