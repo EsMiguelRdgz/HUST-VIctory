@@ -46,6 +46,9 @@ pub enum Kind {
     /// Host textures for title textures (video memory, or system memory
     /// when the GPU's budget is exceeded), sized by the host's layout.
     HostTexture,
+    /// Title textures whose host D3D12 texture is deferred until first GPU
+    /// use (estimated footprint; consumes 0 bytes of host VRAM/commit).
+    DeferredTexture,
     /// Upload memory lists hold until reset (scratch, uploads).
     ListUpload,
     /// Host descriptor heaps.
@@ -58,7 +61,7 @@ pub enum Kind {
     GuestPhysical,
 }
 
-const KINDS: usize = 12;
+const KINDS: usize = 13;
 const ALL: [(Kind, &str); KINDS] = [
     (Kind::Buffer, "buffer copies"),
     (Kind::Loose, "loose copies"),
@@ -68,10 +71,28 @@ const ALL: [(Kind, &str); KINDS] = [
     (Kind::TextureStaging, "texture staging"),
     (Kind::TextureRead, "texture reads"),
     (Kind::HostTexture, "host textures"),
+    (Kind::DeferredTexture, "deferred textures"),
     (Kind::ListUpload, "list uploads"),
     (Kind::DescriptorHeap, "descriptor heaps"),
     (Kind::TitleHeap, "title heaps"),
     (Kind::GuestPhysical, "guest physical"),
+];
+
+/// Categories whose committed bytes live inside the process's `PrivateUsage`
+/// (excluding `DeferredTexture`, which holds no host commit, and
+/// `GuestPhysical`, which is `MEM_MAPPED` pagefile-backed sections).
+const PRIVATE_KINDS: [Kind; 11] = [
+    Kind::Buffer,
+    Kind::Loose,
+    Kind::Aligned,
+    Kind::Snapshot,
+    Kind::SnapshotPool,
+    Kind::TextureStaging,
+    Kind::TextureRead,
+    Kind::HostTexture,
+    Kind::ListUpload,
+    Kind::DescriptorHeap,
+    Kind::TitleHeap,
 ];
 
 /// Live bytes, live allocations, peak live bytes, allocations ever made.
@@ -159,9 +180,15 @@ pub enum Event {
     PoolHits,
     /// Pool misses (a new buffer was allocated).
     PoolMisses,
+    /// Deferred host textures materialized on first GPU use.
+    LazyMaterializations,
+    /// Idle placed or title-written host textures evicted to reclaim commit.
+    TexturesEvicted,
+    /// Bytes reclaimed by host texture eviction.
+    TexturesEvictedBytes,
 }
 
-const EVENTS: usize = 6;
+const EVENTS: usize = 9;
 static EVENT: [AtomicU64; EVENTS] = [const { AtomicU64::new(0) }; EVENTS];
 
 /// Counts `n` of `event`.
@@ -279,6 +306,10 @@ pub struct Space {
     /// Of `private` and `mapped`, what lies in title memory's address range
     /// (`[2^32, 2^47)`, where xmem places it).
     pub title: u64,
+    /// Of `private`, what lies in title memory's address range.
+    pub title_private: u64,
+    /// Of `mapped`, what lies in title memory's address range (includes aliases).
+    pub title_mapped: u64,
     /// Regions walked.
     pub regions: u64,
 }
@@ -309,6 +340,11 @@ pub fn space() -> Space {
                 }
                 if info.Type != MEM_IMAGE && (1 << 32..1 << 47).contains(&base) {
                     space.title += size;
+                    if info.Type == MEM_MAPPED {
+                        space.title_mapped += size;
+                    } else {
+                        space.title_private += size;
+                    }
                 }
             }
             MEM_RESERVE => space.reserved += size,
@@ -340,22 +376,72 @@ pub fn under_pressure(incoming: u64) -> bool {
     })
 }
 
+/// Non-double-counted breakdown of VIctory's system-commit contribution.
+///
+/// `private` already includes all [`PRIVATE_KINDS`] (including WDDM-backed
+/// `HostTexture`s and GPU `Buffer` copies), while `GuestPhysical` lives in
+/// `MEM_MAPPED` pagefile-backed sections disjoint from `private`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitBreakdown {
+    /// Sum of [`PRIVATE_KINDS`] live bytes (subset of `process_private`).
+    pub tracked_private: u64,
+    /// `process_private.saturating_sub(tracked_private)`: title private commit
+    /// (`XMemVirtualAlloc`), heap/stacks, and driver overhead.
+    pub untracked_private: u64,
+    /// Committed guest physical section bytes (`Kind::GuestPhysical`).
+    pub guest_physical: u64,
+    /// Estimated VIctory total commit (`process_private + guest_physical`).
+    pub victory_commit: u64,
+    /// Estimated commit held by other processes (`system_commit - victory_commit`).
+    pub other_commit: u64,
+}
+
+/// Computes the non-double-counted commit breakdown from live counters and
+/// OS totals.
+pub fn commit_breakdown(process_private: u64, system_commit: u64) -> CommitBreakdown {
+    let tracked_private: u64 = PRIVATE_KINDS.iter().map(|&k| live(k).0).sum();
+    let untracked_private = process_private.saturating_sub(tracked_private);
+    let guest_physical = live(Kind::GuestPhysical).0;
+    let victory_commit = process_private.saturating_add(guest_physical);
+    let other_commit = system_commit.saturating_sub(victory_commit);
+    CommitBreakdown {
+        tracked_private,
+        untracked_private,
+        guest_physical,
+        victory_commit,
+        other_commit,
+    }
+}
+
 /// One line: process, system and GPU memory, then every category.
 pub(crate) fn summary(video: Option<Video>) -> String {
     let mb = |b: u64| b as f64 / (1 << 20) as f64;
     let mut text = String::from("host memory:");
-    if let Some((private, working)) = process() {
+    let proc_mem = process();
+    let sys_mem = system_commit();
+    if let Some((private, working)) = proc_mem {
         text.push_str(&format!(
             " private {:.0} MB, working set {:.0} MB;",
             mb(private),
             mb(working)
         ));
     }
-    if let Some((total, limit)) = system_commit() {
+    if let Some((total, limit)) = sys_mem {
         text.push_str(&format!(
             " system commit {:.0}/{:.0} MB;",
             mb(total),
             mb(limit)
+        ));
+    }
+    if let (Some((private, _)), Some((total, _))) = (proc_mem, sys_mem) {
+        let b = commit_breakdown(private, total);
+        text.push_str(&format!(
+            " victory est {:.0} MB (tracked private {:.0} + untracked private {:.0} + guest physical {:.0}), other {:.0} MB;",
+            mb(b.victory_commit),
+            mb(b.tracked_private),
+            mb(b.untracked_private),
+            mb(b.guest_physical),
+            mb(b.other_commit),
         ));
     }
     if let Some((available, installed)) = physical() {
@@ -385,13 +471,16 @@ pub(crate) fn summary(video: Option<Video>) -> String {
     }
     text.pop();
     text.push_str(&format!(
-        "; reclaimed {} ({:.1} MB), pressure reclaims {}, failures {}, pool hits/misses {}/{}",
+        "; reclaimed {} ({:.1} MB), pressure reclaims {}, failures {}, pool hits/misses {}/{}, lazy mat {}, tex evicted {} ({:.1} MB)",
         events(Event::Reclaimed),
         mb(events(Event::ReclaimedBytes)),
         events(Event::PressureReclaims),
         events(Event::Failures),
         events(Event::PoolHits),
         events(Event::PoolMisses),
+        events(Event::LazyMaterializations),
+        events(Event::TexturesEvicted),
+        mb(events(Event::TexturesEvictedBytes)),
     ));
     text
 }
@@ -400,14 +489,20 @@ pub(crate) fn summary(video: Option<Video>) -> String {
 pub fn space_summary() -> String {
     let mb = |b: u64| b as f64 / (1 << 20) as f64;
     let s = space();
+    let guest_phys = live(Kind::GuestPhysical).0;
+    let mapped_aliased = s.mapped.saturating_sub(guest_phys);
     format!(
-        "address space: committed private {:.0} MB, mapped {:.0} MB, image {:.0} MB; \
-         reserved {:.0} MB; in title range {:.0} MB; {} regions",
+        "address space: committed private {:.0} MB, mapped {:.0} MB (aliased ~{:.0} MB vs guest physical {:.0} MB), \
+         image {:.0} MB; reserved {:.0} MB; in title range {:.0} MB (private {:.0}, mapped {:.0}); {} regions",
         mb(s.private),
         mb(s.mapped),
+        mb(mapped_aliased),
+        mb(guest_phys),
         mb(s.image),
         mb(s.reserved),
         mb(s.title),
+        mb(s.title_private),
+        mb(s.title_mapped),
         s.regions
     )
 }
@@ -572,7 +667,44 @@ mod tests {
         let line = summary(Some([(1 << 20, 2 << 20), (0, 4 << 20)]));
         assert!(line.contains("private") && line.contains("GPU local 1/2 MB"));
         assert!(line.contains("snapshot pool") && line.contains("guest physical"));
-        assert!(line.contains("pressure reclaims"));
+        assert!(line.contains("deferred textures") && line.contains("victory est"));
+        assert!(line.contains("pressure reclaims") && line.contains("lazy mat"));
+    }
+
+    #[test]
+    fn commit_breakdown_avoids_double_counting_deferred_and_private_categories() {
+        // DeferredTexture holds no real commit; it must not inflate tracked_private
+        // or victory_commit.
+        let before = commit_breakdown(1000 << 20, 2000 << 20);
+        alloc(Kind::DeferredTexture, 64 << 20);
+        let with_deferred = commit_breakdown(1000 << 20, 2000 << 20);
+        free(Kind::DeferredTexture, 64 << 20);
+        assert_eq!(with_deferred.tracked_private, before.tracked_private);
+        assert_eq!(with_deferred.victory_commit, before.victory_commit);
+
+        // HostTexture lives inside process_private, so tracked_private increases
+        // while victory_commit (process_private + guest_physical) stays equal.
+        alloc(Kind::HostTexture, 32 << 20);
+        let with_host = commit_breakdown(1000 << 20, 2000 << 20);
+        free(Kind::HostTexture, 32 << 20);
+        assert_eq!(
+            with_host
+                .tracked_private
+                .saturating_sub(before.tracked_private),
+            32 << 20
+        );
+        assert_eq!(with_host.victory_commit, before.victory_commit);
+
+        // GuestPhysical is disjoint from process_private and adds to victory_commit.
+        alloc(Kind::GuestPhysical, 16 << 20);
+        let with_guest = commit_breakdown(1000 << 20, 2000 << 20);
+        free(Kind::GuestPhysical, 16 << 20);
+        assert_eq!(
+            with_guest
+                .victory_commit
+                .saturating_sub(before.victory_commit),
+            16 << 20
+        );
     }
 
     /// A reservation shows as reserved, not committed; committing it moves

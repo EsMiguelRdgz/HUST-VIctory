@@ -58,6 +58,7 @@ pub(crate) struct HostCaps {
     pub(crate) max_gpu_va_bits_per_resource: u32,
     pub(crate) max_gpu_va_bits_per_process: u32,
     pub(crate) uma: bool,
+    pub(crate) existing_heaps: bool,
 }
 
 impl HostCaps {
@@ -136,6 +137,16 @@ impl HostCaps {
                 size_of_val(&arch) as u32,
             );
 
+            let mut existing = D3D12_FEATURE_DATA_EXISTING_HEAPS::default();
+            let existing_heaps = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_EXISTING_HEAPS,
+                    (&raw mut existing).cast(),
+                    size_of_val(&existing) as u32,
+                )
+                .is_ok()
+                && existing.Supported.as_bool();
+
             HostCaps {
                 adapter_name,
                 vendor_id,
@@ -154,6 +165,7 @@ impl HostCaps {
                 max_gpu_va_bits_per_resource: va.MaxGPUVirtualAddressBitsPerResource,
                 max_gpu_va_bits_per_process: va.MaxGPUVirtualAddressBitsPerProcess,
                 uma: arch.UMA.as_bool(),
+                existing_heaps,
             }
         }
     }
@@ -180,7 +192,7 @@ impl HostCaps {
         let sm_major = (self.highest_shader_model.0 >> 4) & 0xf;
         let sm_minor = self.highest_shader_model.0 & 0xf;
         format!(
-            "adapter=\"{}\" ({:04x}:{:04x}, vram={}MiB, warp={}) sm={sm_major}.{sm_minor} bind_tier={} heap_tier={} wave={}..{}(ops={}) mesh_tier={} typed_uav={} enhanced_barriers={} va={}/{}b uma={}",
+            "adapter=\"{}\" ({:04x}:{:04x}, vram={}MiB, warp={}) sm={sm_major}.{sm_minor} bind_tier={} heap_tier={} wave={}..{}(ops={}) mesh_tier={} typed_uav={} enhanced_barriers={} va={}/{}b uma={} existing_heaps={}",
             self.adapter_name,
             self.vendor_id,
             self.device_id,
@@ -197,6 +209,7 @@ impl HostCaps {
             self.max_gpu_va_bits_per_resource,
             self.max_gpu_va_bits_per_process,
             self.uma,
+            self.existing_heaps,
         )
     }
 }
@@ -2392,6 +2405,7 @@ mod tests {
             max_gpu_va_bits_per_resource: 40,
             max_gpu_va_bits_per_process: 40,
             uma: false,
+            existing_heaps: false,
         }
     }
 
