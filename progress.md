@@ -1,14 +1,14 @@
 # Current Project Status
 
-- Current milestone: Phase 12 — NVIDIA RTX 3070 Memory Compatibility (lazy host textures, placed/idle texture eviction, buffer shadow reclamation, non-double-counted commit accounting)
-- Current subphase: Phase 12 offline engineering COMPLETE (A–H); READY for one controlled, instrumented hardware diagnostic run (NO-GO for gameplay/stress testing)
-- Current branch: `hust/phase12-memory` (branched from clean `5237d80` on `hust/nvidia-rtx3070`)
-- Latest verified commit: `c94fb30` (Phase 12 commits: `628059e`, `0ffbeb1`, `802a903`, `d6ba227`, `d08a472`, `c94fb30`, plus this progress checkpoint; preserves all Phase 1–11 commits through `5237d80`)
+- Current milestone: Phase 13 — Private GitHub (`EsMiguelRdgz/HUST-VIctory`), DPAPI Discord Notifications, Upstream Comparison & Selective Integration (`Marvisak/VIctory` @ `d2a4bae`), Phase 12 Correctness Audit, and Controlled PowerShell Diagnostic Harness
+- Current subphase: Phase 13 offline engineering COMPLETE; READY for optional local Discord webhook setup and ONE controlled, instrumented RTX 3070 diagnostic run (NO-GO for gameplay/stress testing)
+- Current branch: `hust/phase12-memory` (tracks private `origin/hust/phase12-memory` at `https://github.com/EsMiguelRdgz/HUST-VIctory.git`; `upstream` = `https://github.com/Marvisak/VIctory.git`)
+- Latest verified commit: `135fd56` (Phase 13 commits: `0227ffa`, `65d66d9`, `b0cc7ce`, `a6f5988`, `ed88284`, `484dfad`, `135fd56`, plus this progress checkpoint; preserves all Phase 1–12 commits)
 - Current working-tree status: clean except this checkpoint
 - Active agent: Antigravity
-- Last checkpoint timestamp: 2026-11-23 (Phase 12 complete offline)
+- Last checkpoint timestamp: 2026-11-24 (Phase 13 complete offline)
 - Current build status: diag build OK (`target/diag/victory.exe`, not launched)
-- Current test status: full matrix PASSED at `c94fb30` (workspace `278 passed / 0 failed / 8 ignored`: 3 external-data + 5 benchmarks; WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` `90 passed / 0 failed / 4 ignored`, 0 debug layer errors; `cargo xtask policy` 152 files ok; clippy both configs 0 new warnings, only pre-existing `list.rs:1441`; diag build OK)
+- Current test status: full matrix PASSED at `135fd56` (workspace `305 passed / 0 failed / 8 ignored`: 3 external-data + 5 benchmarks; WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` `99 passed / 0 failed / 4 ignored`, 0 debug layer errors; `cargo xtask policy` 160 files ok; clippy both configs 0 new warnings, only pre-existing `list.rs:1441`; PowerShell harness 6/6 synthetic self-tests passed; diag build OK)
 
 ## Phase 11 trigger (user report, RTX 3070 test 1)
 
@@ -50,18 +50,20 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 
 ## Active Task
 
-- Objective: none in progress; Phase 12 offline work complete (all commits verified at `c94fb30`, full report written to `G:\VIctory-Results\memory-investigation\phase12-progress.md`).
+- Objective: none in progress; Phase 13 offline work complete and pushed to private `origin` (`EsMiguelRdgz/HUST-VIctory`). Full checkpoints at `G:\VIctory-Results\phase13-progress.md` and `G:\VIctory-Results\upstream-comparison-phase13.md`.
 
 ## Immediate Resume Instructions
 
-- First action: wait for the user's controlled RTX 3070 hardware run (`target\diag\victory.exe` with `VICTORY_MEMORY_REPORT_DIR=G:\VIctory-Results\memory-investigation`, debug layer / DRED / capture OFF, commit guard ON, unnecessary background apps closed) and inspect the resulting `memory-<unix>.log` (`commit breakdown`, `host textures`, `deferred textures`, `lazy materializations`, `textures evicted`, `buffer copies`, `guest physical`, `GPU local/non-local`).
-- Next implementation step (evidence-dependent):
-  - If `host textures` drops substantially and GTA VI progresses further, verify rendering correctness and check whether `buffer copies` or `untracked private` becomes the next bottleneck.
-  - If visual artifacts appear with lazy textures, A/B test with `VICTORY_LAZY_TEXTURES=0` to isolate lazy deferral vs eviction.
-  - If `buffer copies` grows large in later gameplay, evaluate Phase 13 `ID3D12Device3::OpenExistingHeapFromAddress` (probe confirmed RTX 3070 support with `ALLOW_CROSS_ADAPTER`, pending safe `VirtualFree`/`MEM_DECOMMIT` and sparse-hole handling).
-- Pending tests: manual controlled hardware diagnostic run (not launched by agent). Synthetic benchmarks: `cargo test -p victory-gpu --lib bench_ -- --ignored --test-threads=1 --nocapture` and `cargo test -p victory-hle --lib bench_ -- --ignored --test-threads=1 --nocapture`.
-- Known blockers: none offline. Note: other host processes held ~27 GB of the 46.5 GB system commit limit in Phase 11 logs; close heavy non-essential apps before hardware validation.
-- Remaining risks: actual ratio of unused vs live textures during GTA VI boot/world load is unverified until measured on hardware; NVIDIA WDDM retains a bounded driver reuse pool after `DEFAULT` texture release; bindless `ResourceDescriptorHeap[]` SRV reads on never-written deferred textures see typed NULL descriptors until first materialization; `DXGI_ERROR_DEVICE_HUNG` post-memory changes remains unverified on hardware.
+- One-message session recovery (after any pause/quota reset): `"Resume HUST VIctory from the latest checkpoint."`
+- First action:
+  1. Optionally configure the local DPAPI Discord webhook (`powershell -ExecutionPolicy Bypass -File G:\VIctory\tools\discord\Setup-DiscordWebhook.ps1 -Test`).
+  2. When ready, run ONE controlled hardware diagnostic via `tools\diag\Run-VictoryDiagnostic.ps1 -TitleExe "<path-to-title-exe>" -AuthorizeGameLaunch -MaxDurationSeconds 600 -MinCommitHeadroomGB 5.0` (close heavy non-essential background apps first; commit guard stays ON; debug/DRED/capture OFF) and inspect the resulting `G:\VIctory-Results\diag-hw-<timestamp>\report.md` and `memory-*.log`.
+- Next implementation step (evidence-dependent after controlled hardware run):
+  - Evaluate real GTA VI `host textures` vs `deferred textures`, `lazy mat`, `tex evicted`, `commit breakdown`, pipeline compile/cache timings, and whether the run progresses past Phase 11 without hitting the commit guard or `DXGI_ERROR_DEVICE_HUNG`.
+  - If visual artifacts appear with lazy textures, A/B test with `-DisableLazyTextures` (`VICTORY_LAZY_TEXTURES=0`).
+  - Once Phase 12/13 memory stability is hardware-confirmed, evaluate Phase 14 selective integration of upstream `indirect.rs` (currently deferred because upstream reports ~55 s GPU page faults with indirect enabled) and `4e94c2b` DirectStorage single-view-per-run writes (adapted to our 16 MiB sections) or `OpenExistingHeapFromAddress` for buffer shadows if buffer copies become dominant.
+- Pending user authorizations: local Discord webhook setup (secret stays local in DPAPI), and explicit user execution/authorization for any real RTX 3070 game run.
+- Remaining risks: actual GTA VI used-vs-unused texture ratio and real commit reduction remain UNVERIFIED until measured on hardware; upstream GPU RAW/WAW command-ordering fixes are NOT yet published in `Marvisak/VIctory` (`d2a4bae`); NVIDIA WDDM retains a bounded driver reuse pool after `DEFAULT` texture release; `DXGI_ERROR_DEVICE_HUNG` post-Phase-12/13 changes remains unverified on hardware.
 - Commands required:
   - `cargo xtask policy`
   - `cargo test --workspace`
@@ -193,3 +195,19 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 - Synthetic measurements (RTX 3070): 256 × 4 MiB textures BEFORE (eager) `+1,017 MiB` commit / `+1,028 MiB` private / `+1,024 MiB` GPU local vs AFTER (lazy 0/256 used + 256 SRVs) `0 MiB` commit / `0 MiB` private / `0 MiB` GPU local, and 16/256 used `+66 MiB` commit (-93.5%); 64 × 4 MiB idle eviction freed `256 MiB -> 0 MiB` live `HostTexture`. `OpenExistingHeapFromAddress` probe confirmed `existing_heaps=true` with `ALLOW_CROSS_ADAPTER` required on RTX 3070 (buffers only; deferred to Phase 13 due to guest unmap/sparse-hole safety requirements).
 - Full Phase G verification at `c94fb30`: `cargo xtask policy` (`152 files ok`); `rustfmt --edition 2024 --check` + `git diff --check` clean; `cargo test --workspace` (`278 passed, 0 failed, 8 ignored`); WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` (`90 passed, 0 failed, 4 ignored`, 0 debug errors); `cargo clippy --workspace --all-targets` & `--features diagnostics` (0 new warnings; only pre-existing `list.rs:1441`); `cargo build --profile diag -p victory --features diagnostics` OK (`target/diag/victory.exe`, not launched).
 - Status: READY for one controlled hardware diagnostic run (see `G:\VIctory-Results\memory-investigation\phase12-progress.md`). Real GTA VI memory reduction remains UNVERIFIED until measured on hardware.
+
+### 2026-11-24 — Antigravity — Phase 13 private GitHub, DPAPI Discord tools, upstream selective integration, Phase 12 hardening, and diagnostic harness (complete offline)
+
+- Starting commit: `a29286dc44a319fdeabed577f8d02b8c6f4a66d0` (clean tree on `hust/phase12-memory`; all 7 Phase 12 commits verified intact).
+- Private GitHub repository created & verified: `https://github.com/EsMiguelRdgz/HUST-VIctory` (`isPrivate: true`, `visibility: PRIVATE`, `isFork: false`); `origin` -> `HUST-VIctory`, `upstream` -> `https://github.com/Marvisak/VIctory.git`. Pre-push secret/asset/history scan clean (`0` secrets, `0` banned extensions, GPL-3.0 preserved).
+- Phase 13 commits pushed to private `origin/hust/phase12-memory`:
+  - `0227ffa`: DPAPI-backed local Discord webhook setup & event-driven notification scripts (`tools/discord/`).
+  - `65d66d9`: Phase 12 correctness & lifetime hardening — `descriptor::prepare_bindless_heap()` (populates & uploads non-zero deferred title-written bindless SRVs while keeping all-zero/uncommitted deferred, pins `HostHeap::bindless_guard`), `Host::with_gpu_idle()`, dynamic-table texture `list_guard`/`list.keep` pinning, typed NULL preservation on eviction (`null_for_on`), atomic `try_lock` + exact host-ptr matching eviction, elimination of two AB-BA lock-order cycles, raw-PSO `host_pipeline` comparison, + 2 new regression tests.
+  - `b0cc7ce`: Selective upstream `victory-shader` integration (`36eb0b4`, `0b499d7`, `2e5001c` RDNA2 VALU + NVIDIA `FMNMX` `fract(NaN)` fix + `valu_tests.rs`; `a2f5f43` scalar carry; `c963b71` backward far jumps; `5fbea47` `find_input` underflow; `ea24ea1` cyclic wave64 lane-mask stack overflow; `0c56091` `v_swaprel_b32` delta).
+  - `a6f5988`: Selective upstream `victory-gpu`/`formats`/`pe` integration (`4c1766c` guard write-fault lock race; `73d776b` per-submission texture-check dedup adapted to `Step::Texture`; `0b607b1` WARP software check; `f3c7f0f` rect stride clamp; `e6a2c54`/`e158d95`/`005ad49`/`fc807b6`/`e98d3ca`/`9a5cbbe` bounds & overflow guards).
+  - `ed88284`: Selective upstream `35b054e` off-render-thread pipeline compilation (`pipeline/make.rs`) + persistent `ID3D12PipelineLibrary1` cache & pre-warm list (`pipeline/library.rs`) + `d3d12x.rs`/`lifecycle.rs` hooks, plus `Host::existing_host()` fix so HLE `title_memory_remapped()` never initializes D3D12 early.
+  - `484dfad`: Safety-guarded PowerShell diagnostic harness (`tools/diag/Run-VictoryDiagnostic.ps1` & `README.md`), verified with 6/6 offline synthetic self-tests.
+  - `135fd56`: Added missing `// SAFETY:` comments in `resource.rs` (0 new clippy warnings).
+- Upstream audit (`upstream/main` = `d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989`): detailed 74-commit triage written to `G:\VIctory-Results\upstream-comparison-phase13.md`. Confirmed async/cached pipelines published in `35b054e`; confirmed GPU command ordering / RAW & WAW barrier fixes are NOT yet published in upstream source; deferred `indirect.rs` until Phase 12/13 memory stability is hardware-verified.
+- Full verification at `135fd56`: `cargo xtask policy` (`160 files ok`); `cargo test --workspace` (`305 passed, 0 failed, 8 ignored`); WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` (`99 passed, 0 failed, 4 ignored`, 0 debug layer errors); `cargo clippy --workspace --all-targets` & `--features diagnostics` (0 new warnings; only pre-existing `list.rs:1441`); `cargo build --profile diag -p victory --features diagnostics` OK (`target/diag/victory.exe`, not launched); synthetic `bench_phase12_lazy_textures_and_eviction` re-verified (`+1030 MiB -> 0 MiB / +66 MiB`, `256 -> 0 MiB` eviction).
+- Status: GO for ONE controlled, instrumented RTX 3070 diagnostic run (manual execution via `tools/diag/Run-VictoryDiagnostic.ps1 -AuthorizeGameLaunch`); NO-GO for gameplay/stress testing. Real GTA VI memory reduction and world rendering remain UNVERIFIED until measured on hardware.
