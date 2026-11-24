@@ -436,6 +436,13 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Whether two host texture formats belong to the same DXGI copy-compatible
+/// format family (D3D12 `CopyResource` / `CopyTextureRegion` requirement).
+#[cfg(windows)]
+fn formats_copy_compatible(a: u32, b: u32) -> bool {
+    a == b || crate::resource::family(a) == crate::resource::family(b)
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -446,6 +453,20 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            // SAFETY: live host textures.
+            let (to_fmt, from_fmt) =
+                unsafe { (to.GetDesc().Format.0 as u32, from.GetDesc().Format.0 as u32) };
+            if !formats_copy_compatible(to_fmt, from_fmt) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        to_fmt,
+                        from_fmt,
+                        "skipping texture CopyResource between incompatible host formats"
+                    );
+                });
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -528,6 +549,24 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            // SAFETY: live host textures.
+            let (to_fmt, from_fmt) = unsafe {
+                (
+                    to.GetDesc().Format.0 as u32,
+                    texture.GetDesc().Format.0 as u32,
+                )
+            };
+            if !formats_copy_compatible(to_fmt, from_fmt) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        to_fmt,
+                        from_fmt,
+                        "skipping CopyTextureRegion between incompatible host formats"
+                    );
+                });
+                return;
+            }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -1364,5 +1403,15 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn texture_copy_format_compatibility_checks_families() {
+        assert!(formats_copy_compatible(28, 28)); // R8G8B8A8_UNORM
+        assert!(formats_copy_compatible(27, 29)); // R8G8B8A8_TYPELESS <-> SRGB
+        assert!(formats_copy_compatible(87, 91)); // B8G8R8A8_UNORM <-> SRGB
+        assert!(!formats_copy_compatible(87, 86)); // promoted 32-bit vs native 16-bit B5G5R5A1
+        assert!(!formats_copy_compatible(87, 115)); // promoted 32-bit vs native 16-bit B4G4R4A4
     }
 }

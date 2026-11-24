@@ -91,12 +91,59 @@ impl Drop for State {
     }
 }
 
-/// Draws recorded on the host GPU since the last frame line.
+/// Draws recorded on the host GPU since the start (caption & frame rate).
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
+}
+
+/// Per-interval command counters: requested vs executed draws, mesh dispatches,
+/// compute dispatches, and categorized drop counts (for the 5-second log).
+static DRAWS_REQ: AtomicU64 = AtomicU64::new(0);
+static DRAWS_OK: AtomicU64 = AtomicU64::new(0);
+static MESH_REQ: AtomicU64 = AtomicU64::new(0);
+static MESH_OK: AtomicU64 = AtomicU64::new(0);
+static DISP_REQ: AtomicU64 = AtomicU64::new(0);
+static DISP_OK: AtomicU64 = AtomicU64::new(0);
+static DROP_NO_PIPELINE: AtomicU64 = AtomicU64::new(0);
+static DROP_BIND: AtomicU64 = AtomicU64::new(0);
+static DROP_OTHER: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of requested vs executed command counts since the last call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FrameCounts {
+    pub(crate) draws_req: u64,
+    pub(crate) draws_ok: u64,
+    pub(crate) mesh_req: u64,
+    pub(crate) mesh_ok: u64,
+    pub(crate) disp_req: u64,
+    pub(crate) disp_ok: u64,
+    pub(crate) drop_no_pipeline: u64,
+    pub(crate) drop_bind: u64,
+    pub(crate) drop_other: u64,
+}
+
+impl FrameCounts {
+    pub(crate) fn total_dropped(&self) -> u64 {
+        self.drop_no_pipeline + self.drop_bind + self.drop_other
+    }
+}
+
+/// Swaps and returns the interval command counters since the last call.
+pub(crate) fn take_counts() -> FrameCounts {
+    FrameCounts {
+        draws_req: DRAWS_REQ.swap(0, Ordering::Relaxed),
+        draws_ok: DRAWS_OK.swap(0, Ordering::Relaxed),
+        mesh_req: MESH_REQ.swap(0, Ordering::Relaxed),
+        mesh_ok: MESH_OK.swap(0, Ordering::Relaxed),
+        disp_req: DISP_REQ.swap(0, Ordering::Relaxed),
+        disp_ok: DISP_OK.swap(0, Ordering::Relaxed),
+        drop_no_pipeline: DROP_NO_PIPELINE.swap(0, Ordering::Relaxed),
+        drop_bind: DROP_BIND.swap(0, Ordering::Relaxed),
+        drop_other: DROP_OTHER.swap(0, Ordering::Relaxed),
+    }
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -330,6 +377,7 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            DROP_NO_PIPELINE.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -337,9 +385,11 @@ impl State {
                 mesh,
                 "a draw or mesh dispatch with another kind of pipeline"
             );
+            DROP_OTHER.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         if !self.bind(list, p, false) {
+            DROP_BIND.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         let l = &list.list;
@@ -373,6 +423,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+                DROP_OTHER.fetch_add(1, Ordering::Relaxed);
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -499,18 +550,22 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        DISP_REQ.fetch_add(1, Ordering::Relaxed);
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            DROP_NO_PIPELINE.fetch_add(1, Ordering::Relaxed);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            DROP_OTHER.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if !self.bind(list, p, true) {
+            DROP_BIND.fetch_add(1, Ordering::Relaxed);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -518,6 +573,7 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        DISP_OK.fetch_add(1, Ordering::Relaxed);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -602,6 +658,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        MESH_REQ.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -612,9 +669,13 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    MESH_OK.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                Err(_) => false,
+                Err(_) => {
+                    DROP_OTHER.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
             };
         #[cfg(feature = "diagnostics")]
         if !ran {
@@ -872,10 +933,15 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        DRAWS_REQ.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        let prepared = self.prepare(list, false);
+        let ran = prepared && (!rects || self.rectangles(list, vertices, first));
+        if prepared && !ran {
+            DROP_OTHER.fetch_add(1, Ordering::Relaxed);
+        }
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -891,6 +957,7 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            DRAWS_OK.fetch_add(1, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
         if !ran {
@@ -962,10 +1029,12 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        DRAWS_REQ.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
+            DROP_OTHER.fetch_add(1, Ordering::Relaxed);
         }
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
         if ran {
@@ -977,6 +1046,7 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            DRAWS_OK.fetch_add(1, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
         if !ran {

@@ -1509,14 +1509,26 @@ impl Meter {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            #[cfg(feature = "diagnostics")]
             let log_frames = f64::from(self.logged_frames.max(1));
             self.logged_frames = 0;
             self.logged = std::time::Instant::now();
+            let c = crate::draw::take_counts();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; copy-back {cb_ms:.1} ms {cb_mb:.1} MB), {draws:.0} draws/frame"
+                 GPU; copy-back {cb_ms:.1} ms {cb_mb:.1} MB), {draws:.0} draws/frame \
+                 [exec/req per frame: draw {:.0}/{:.0}, mesh {:.0}/{:.0}, dispatch {:.0}/{:.0}, \
+                 dropped {:.0} (no_pipe={:.0}, bind={:.0}, other={:.0})]",
+                c.draws_ok as f64 / log_frames,
+                c.draws_req as f64 / log_frames,
+                c.mesh_ok as f64 / log_frames,
+                c.mesh_req as f64 / log_frames,
+                c.disp_ok as f64 / log_frames,
+                c.disp_req as f64 / log_frames,
+                c.total_dropped() as f64 / log_frames,
+                c.drop_no_pipeline as f64 / log_frames,
+                c.drop_bind as f64 / log_frames,
+                c.drop_other as f64 / log_frames,
             );
             #[cfg(feature = "diagnostics")]
             crate::copystat::log(log_frames);
