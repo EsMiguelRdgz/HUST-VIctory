@@ -1,15 +1,15 @@
 # Current Project Status
 
 - Current milestone: Phase 11 — P0 RAM / system-commit exhaustion investigation (supersedes Phase 10 performance tuning)
-- Current subphase: Phase 11 A-E implemented (audit, instrumentation, physical-page chunking, transient texture staging, pressure relief); F (synthetic benchmark report, full matrix) in progress
+- Current subphase: Phase 11 offline investigation COMPLETE (A-F); awaiting one controlled, instrumented hardware diagnostic run (see Phase 11 GO/NO-GO)
 - Current branch: `hust/nvidia-rtx3070`
-- Latest verified commit: `a773911` (Phase 11 commits: `c7564ce`, `5f2044c`, `83e9969`, `de0870e`, `a773911`)
+- Latest verified commit: `57676e4` (Phase 11 commits: `c7564ce`, `5f2044c`, `83e9969`, `de0870e`, `a773911`, `d197be5`, `df5ac87`, `57676e4`, plus this progress commit)
 - Current working-tree status: clean except this checkpoint
 - Active agent: Claude Code
 - Model: Claude Opus 5.5
 - Last checkpoint timestamp: 2026-11-23 (Phase 11 start)
-- Current build status: PASS at `dc93210`
-- Current test status: `cargo test -p victory-gpu` 76/76 (30 parallel stress runs 0 failures); `cargo test -p victory-hle` 83 passed / 1 ignored (benchmark)
+- Current build status: diag build OK (`target/diag/victory.exe`, not launched)
+- Current test status: full matrix PASSED at `57676e4` (workspace 267 passed / 0 failed / 7 ignored: 3 external-data + 4 Phase 11 benchmarks; policy 152 ok; clippy both configs only the pre-existing `list.rs:1430` warning; diag build OK)
 
 ## Phase 11 trigger (user report, RTX 3070 test 1)
 
@@ -33,34 +33,39 @@ Commit charge is what exhausted the system (49.5/50.5 GB). Reservations cost not
 
 Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host textures exceed VRAM and spill, and how much the debug layer added. The new telemetry answers all three.
 
+## Phase 11 measurements (synthetic, this machine, `G:\VIctory-Results\memory-investigation\memory-*.log`)
+
+- Reservation 64 GiB: commit +0 MiB; +256 MiB committed: +256 MiB; released: +0 MiB.
+- Physical pages 512 MiB (`bench_physical_page_commit`): allocated +0, mapped +514, unmapped +514, 7/8 freed BEFORE +515 / AFTER +65..68, all freed ~+1..3 MiB.
+- Default-heap textures 4x64 MiB (`bench_default_heap_commit`): private +256 MiB, system commit +256 MiB, GPU local +256 MiB -> video memory is commit-backed on this WDDM host; after release +192 MiB stays, flat over 10 create/free cycles (bounded driver reuse, not growth).
+- Loose copies 160x4 MiB idle (`bench_copy_reclamation_and_reservations`): peak live 512 MiB = budget; private +514 MiB.
+- Texture staging 48x1 MiB (`bench_texture_staging`): old permanent staging 48 MiB vs now 1 MiB lent (pool bound 256 MiB); title memory + host textures still cost ~2x (+102 MiB private).
+- Summary for humans: `G:\VIctory-Results\memory-investigation\phase11-summary.md` (not in Git).
+
+## Phase 11 GO/NO-GO
+
+- GO for ONE controlled, instrumented diagnostic run; NO-GO for gameplay testing.
+- Required settings: unset `VICTORY_D3D12_DEBUG`, `VICTORY_D3D12_DRED`, `VICTORY_CAPTURE`; `VICTORY_LOG=info`; `VICTORY_MEMORY_REPORT_DIR=G:\VIctory-Results\memory-investigation`; leave the commit guard on (do not set `VICTORY_MEMORY_GUARD=0`); Task Manager open; stop after the first world load or 10 minutes, or when the guard ends the run.
+- Collect: the `memory-<unix>.log` file, especially `host textures`, `buffer copies`, `title heaps`, `guest physical`, `address space` lines and GPU local/non-local vs budget.
+- Not claimed: that the GTA VI commit exhaustion is fixed. Two duplication/retention mechanisms are fixed and measured synthetically; the dominant expected consumers (title memory, host textures, buffer copies) remain by design until measured.
+
 ## Active Task
 
-- Objective: Phase 11F — synthetic memory benchmark report in `G:\VIctory-Results\memory-investigation\`, full verification matrix, final ranked report and GO/NO-GO.
-- Current implementation: IN_PROGRESS.
+- Objective: none in progress; Phase 11 offline work complete.
 
 ## Immediate Resume Instructions
 
-- First action: if `G:\\VIctory-Results\\memory-investigation\\` has no `synthetic-*.txt`, run the `bench_*` ignored tests (`cargo test -p victory-gpu --lib bench_ -- --ignored --test-threads=1 --nocapture`, `cargo test -p victory-hle --lib bench_ -- --ignored --test-threads=1 --nocapture`) and record their numbers; then run the full matrix.
-- Next implementation step (only after hardware numbers exist): decide on priority 8 GPU detiling (see evaluation in Completed Tasks); tune budgets/thresholds from `host memory` and frame-rate lines; consider removing the permanent per-texture upload staging copy if `texture staging` dominates.
-- Pending tests: authorized hardware run (manual, below). No automated test is pending.
-- Known blockers: hardware validation must be done by the user (agents must not launch the game or GPU workloads).
-- Remaining known risks: (1) ASSESSED, no fix needed: another thread's refresh can write a shared shadow while a submission runs on the GPU, but it skips that submission's pending (shader-written) ranges, so copy-back baselines are safe; on read-only ranges it only brings in bytes the title wrote concurrently, the same race the title has on the console where the GPU reads its memory directly. (2) Unconfirmed fence waits still write bottom-of-pipe markers (deliberate, avoids title deadlock). (3) Descriptor slots now keep loose/aligned copies alive; stale slots the title never rewrites retain those copies (bounded by what was previously never freed anyway). (4) Pre-existing clippy warning untouched (now reported at `list.rs:1430`).
-- Diagnostic executable: `cargo build --profile diag -p victory --features diagnostics` → `target/diag/victory.exe` (built by the matrix; not run).
+- First action: when the user provides the controlled-run memory report, record per-category numbers here and rank them.
+- Next implementation step (evidence-dependent): if `host textures` dominate, create host textures lazily on first GPU use (`resource.rs` texture creation; all `host_resource()` callers must tolerate creation on demand); if `buffer copies` dominate, evaluate `ID3D12Device3::OpenExistingHeapFromAddress` to let the GPU read title memory directly instead of full host copies (architectural; decision 0007 revision); if `title heaps` dominate, consider routing CreateHeap memory through the title allocator/xmem like committed resources.
+- Pending tests: hardware diagnostic run (manual). Benchmarks: `cargo test -p victory-gpu --lib bench_ -- --ignored --test-threads=1 --nocapture`, `cargo test -p victory-hle --lib bench_ -- --ignored --test-threads=1 --nocapture` (set `VICTORY_MEMORY_REPORT_DIR` to also write the report).
+- Known blockers: none offline.
+- Remaining risks: commit guard ends the run (by design) when the whole system is near its commit limit, including pressure caused by other processes; `XMemGetWorkingSetStatistics.title_used` reports process private bytes (includes host copies, excludes section pages) — may mislead the title's budgeting; host textures for every title texture are created eagerly.
 - Commands required:
   - `cargo xtask policy`
   - `cargo test --workspace`
   - `cargo clippy --workspace --all-targets`
   - `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets`
   - `cargo build --profile diag -p victory --features diagnostics`
-
-## Manual validation (authorized hardware run — to be performed by the user)
-
-1. Build: `cargo build --profile diag -p victory --features diagnostics` (or the normal release build used before).
-2. Run the authorized workload the usual way, once with defaults and once with `VICTORY_COPY_WORKERS=1` set in the environment (serial baseline). Play the same scene for at least 5 minutes each.
-3. From the log, collect every 5 s: the frame-rate line (`preparing: copies … textures …; copy-back X ms Y MB, of it writes Z ms; snapshots A ms B MB`) and the new `host memory:` line (private, working set, system commit, GPU local/non-local usage/budget, and per-kind host copies with peaks).
-4. Compare: (a) `private` and `system commit` growth over time vs the historical (unverified) measurements; (b) which `host copies` kind dominates and whether any grows without bound; (c) `copies`/`textures` ms with workers vs `VICTORY_COPY_WORKERS=1`; (d) copy-back split (writes vs compare vs snapshots).
-5. Watch for new log lines: `host submission completion not confirmed` (should never appear), `unused host copies of title memory freed` (debug level; reclamation activity), `no memory for a copy-back snapshot`, `no memory to read a texture into`.
-6. Record the numbers in this file before any further optimization; do not claim improvements without them.
 
 ## Completed Tasks
 
@@ -121,6 +126,9 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 - VERIFIED — Phase 11 physical-page chunking (`de0870e`): before/after numbers in Phase 11 findings #4; tests `partly_freed_physical_pages_return_their_commit` (mutation: CHUNK=1<<30 makes it FAIL) and `physical_page_commit_is_accounted`. victory-hle 83/0/1.
 - VERIFIED — Phase 11 transient texture staging + pressure relief (`a773911`): test `title_texture_contents_are_uploaded_when_they_change` on the host device (mutation dropping `upload.record` FAILS it), `pressure_relief_frees_idle_copies_and_pools`; 76/76; 30 stress runs 0 failures. A first version of the pressure test was flaky in parallel (heap address reuse let another test's never-freed loose window cover it); fixed by a synthetic address range.
 
+- VERIFIED — Phase 11 synthetic benchmarks + concurrent release test (`df5ac87`) and commit guard (`57676e4`, test `the_commit_guard_relieves_before_it_stops`).
+- VERIFIED — Phase 11 full matrix at `57676e4`: policy 152 ok; workspace 267/0/7; clippy workspace and diagnostics only the pre-existing `list.rs:1430` warning; diag build OK.
+
 ## Incomplete Tasks
 
 - IN_PROGRESS — Remaining Priority A: shadow lifetime audit DONE (see Completed); snapshot pool bounded DONE; remaining: staging/scratch/upload allocations in `host.rs` (`list.scratch`, texture uploads) audit and allocation-failure handling.
@@ -166,3 +174,4 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 
 - Starting commit: `05d6207`; tree clean; AGENTS.md/CLAUDE.md/progress.md present.
 - In progress: see Phase 11 sections above.
+- Phase 11 outcome: offline investigation complete; commits `c7564ce`..`57676e4`; GO for one controlled instrumented diagnostic run, NO-GO for gameplay testing; RAM problem NOT claimed fixed.
