@@ -1,0 +1,224 @@
+# Windows CI on a GitHub-hosted runner (windows-latest).
+#
+# Manual only. GitHub-hosted runners have NO hardware GPU: every D3D12 test
+# here runs on WARP (Microsoft's software rasterizer), so passing tests prove
+# translation/correctness on WARP, not behaviour or performance on the
+# RTX 3070. The D3D12 debug layer (Graphics Tools) is not installed on these
+# images, so VICTORY_D3D12_DEBUG validation is not performed. No title is
+# ever launched. Hardware runs go through home-rtx3070-diagnostic.yml.
+name: Windows CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_scope:
+        description: "Tests to run (shader-gpu = victory-shader + victory-gpu on WARP; workspace = all crates; none)"
+        type: choice
+        options: [shader-gpu, workspace, none]
+        default: shader-gpu
+      build_diag:
+        description: "Build target/diag/victory.exe (cargo build --profile diag -p victory --features diagnostics)"
+        type: boolean
+        default: true
+      upload_diag_exe:
+        description: "Also upload the built diagnostic executable (3-day retention; our code only)"
+        type: boolean
+        default: false
+      fmt_base:
+        description: "Base ref for the formatting gate (only .rs files changed since this ref must be rustfmt-clean)"
+        type: string
+        default: hust/phase12-memory
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Keep test parallelism modest on the 4-vCPU hosted image.
+  RUST_TEST_THREADS: "2"
+  LOG_DIR: ${{ github.workspace }}\ci-logs
+
+jobs:
+  windows:
+    name: Windows (windows-latest, WARP only)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          rustup --version
+          # Installs exactly the channel, components and target named in rust-toolchain.toml.
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc --version --verbose | Tee-Object -FilePath "$env:LOG_DIR\toolchain.txt"
+          cargo --version | Tee-Object -FilePath "$env:LOG_DIR\toolchain.txt" -Append
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: windows-ci
+          cache-on-failure: false
+
+      - name: Record the host environment (GPU limitations)
+        run: |
+          $gpus = @(Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) [status=$($_.Status)]" })
+          $debugLayer = Test-Path "$env:SystemRoot\System32\d3d12SDKLayers.dll"
+          $lines = @(
+            "runner image: $env:ImageOS $env:ImageVersion",
+            "display adapters: $($gpus -join '; ')",
+            "d3d12SDKLayers.dll (D3D12 debug layer) present: $debugLayer",
+            "hardware GPU available: no (GitHub-hosted runners have none; D3D12 tests use WARP)"
+          )
+          $lines | Tee-Object -FilePath "$env:LOG_DIR\environment.txt"
+          "DEBUG_LAYER=$debugLayer" >> $env:GITHUB_ENV
+
+      - name: Asset policy (cargo xtask policy)
+        run: |
+          cargo xtask policy 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\policy.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Hardware safety policy (harness guards, workflow triggers, secrets)
+        if: ${{ !cancelled() }}
+        run: |
+          ./tools/ci/Test-HardwareSafety.ps1 -RepoRoot $env:GITHUB_WORKSPACE 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\safety.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: PowerShell syntax check (tools/)
+        if: ${{ !cancelled() }}
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem tools -Recurse -Filter *.ps1) {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs) | Out-Null
+            foreach ($e in $errs) { "$($f.FullName):$($e.Extent.StartLineNumber): $($e.Message)"; $bad++ }
+          }
+          "PowerShell parse errors: $bad" | Tee-Object -FilePath "$env:LOG_DIR\ps-parse.log" -Append
+          if ($bad -gt 0) { exit 1 }
+
+      - name: Formatting (gate on changed files, report the rest)
+        if: ${{ !cancelled() }}
+        env:
+          FMT_BASE: ${{ inputs.fmt_base }}
+        run: |
+          # The tree carries pre-existing rustfmt debt, so (per AGENTS.md) only
+          # files changed since FMT_BASE must be clean; the rest is reported.
+          cargo fmt --all -- --check 2>&1 | Out-File -FilePath "$env:LOG_DIR\fmt-full.log" -Encoding utf8
+          $unformatted = @(Select-String -Path "$env:LOG_DIR\fmt-full.log" -Pattern '^Diff in (.+?):\d+:' |
+            ForEach-Object { (Resolve-Path -Relative $_.Matches[0].Groups[1].Value) -replace '\\','/' -replace '^\./','' } |
+            Sort-Object -Unique)
+          $changed = @()
+          if ($env:FMT_BASE -and (git rev-parse --verify --quiet "origin/$env:FMT_BASE")) {
+            $changed = @(git diff --name-only --diff-filter=ACMR "origin/$env:FMT_BASE...HEAD" -- '*.rs')
+          }
+          $blocking = @($unformatted | Where-Object { $changed -contains $_ })
+          "files with pre-existing rustfmt differences (advisory): $($unformatted.Count)" | Tee-Object -FilePath "$env:LOG_DIR\fmt.log"
+          "rust files changed since origin/$($env:FMT_BASE): $($changed.Count)" | Tee-Object -FilePath "$env:LOG_DIR\fmt.log" -Append
+          "changed files needing rustfmt (blocking): $($blocking.Count)" | Tee-Object -FilePath "$env:LOG_DIR\fmt.log" -Append
+          $blocking | Tee-Object -FilePath "$env:LOG_DIR\fmt.log" -Append
+          if ($blocking.Count -gt 0) { exit 1 }
+          exit 0
+
+      - name: Clippy (workspace, all targets)
+        if: ${{ !cancelled() }}
+        run: |
+          # Warnings are reported, not fatal: the tree has a known pre-existing warning.
+          cargo clippy --workspace --all-targets 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\clippy-workspace.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Clippy (victory-gpu + victory, diagnostics feature)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\clippy-diagnostics.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Tests - victory-shader (WARP)
+        if: ${{ !cancelled() && inputs.test_scope == 'shader-gpu' }}
+        timeout-minutes: 30
+        env:
+          VICTORY_WARP: "1"
+        run: |
+          cargo test -p victory-shader 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\test-victory-shader.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Tests - victory-gpu, diagnostics feature (WARP, one thread)
+        if: ${{ !cancelled() && inputs.test_scope == 'shader-gpu' }}
+        timeout-minutes: 30
+        env:
+          VICTORY_D3D12_WARP: "1"
+        run: |
+          cargo test -p victory-gpu --features diagnostics -- --test-threads=1 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\test-victory-gpu.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Tests - workspace (WARP)
+        if: ${{ !cancelled() && inputs.test_scope == 'workspace' }}
+        timeout-minutes: 45
+        env:
+          VICTORY_WARP: "1"
+          VICTORY_D3D12_WARP: "1"
+        run: |
+          cargo test --workspace 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\test-workspace.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build diagnostic executable
+        if: ${{ !cancelled() && inputs.build_diag }}
+        run: |
+          cargo build --profile diag -p victory --features diagnostics 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\build-diag.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-Item target\diag\victory.exe
+          "victory.exe: $($exe.Length) bytes, SHA256 $((Get-FileHash $exe.FullName -Algorithm SHA256).Hash)" | Tee-Object -FilePath "$env:LOG_DIR\build-diag.log" -Append
+
+      - name: Summarize
+        if: ${{ always() }}
+        run: |
+          $s = New-Object System.Collections.Generic.List[string]
+          $s.Add("## Windows CI - $env:GITHUB_SHA")
+          $s.Add("")
+          $s.Add("| Log | Result lines |")
+          $s.Add("|---|---|")
+          foreach ($f in Get-ChildItem $env:LOG_DIR -Filter *.log -ErrorAction SilentlyContinue | Sort-Object Name) {
+            $hits = @(Select-String -LiteralPath $f.FullName -Pattern '^test result:|asset policy:|hardware safety check:|PowerShell parse errors:|changed files needing rustfmt|^warning: .* generated \d+ warning|^error(\[|:)|victory\.exe:' |
+              ForEach-Object { $_.Line.Trim() } | Select-Object -First 12)
+            $s.Add("| ``$($f.Name)`` | $(($hits | ForEach-Object { $_ -replace '\|','/' }) -join '<br>') |")
+          }
+          $s.Add("")
+          $s.Add("### Limitations")
+          $s.Add("- GitHub-hosted ``windows-latest`` has **no hardware GPU**. D3D12 tests ran on **WARP** (software); results do not cover RTX 3070 driver behaviour, timing, VRAM or TDR.")
+          $s.Add("- D3D12 debug layer present on this image: **$env:DEBUG_LAYER**. When false, ``VICTORY_D3D12_DEBUG`` validation did not run.")
+          $s.Add("- Tests that need real title files or external reference data skip themselves (environment variables unset).")
+          $s.Add("- No title or game executable was launched or downloaded.")
+          $s -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          $s -join "`n" | Out-File -FilePath "$env:LOG_DIR\summary.md" -Encoding utf8
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-ci-logs-${{ github.run_id }}
+          path: ci-logs/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload diagnostic executable
+        if: ${{ success() && inputs.build_diag && inputs.upload_diag_exe }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: victory-diag-exe-${{ github.sha }}
+          path: target/diag/victory.exe
+          retention-days: 3
+          if-no-files-found: error

@@ -1,0 +1,325 @@
+# One controlled RTX 3070 diagnostic run on the owner's home PC.
+#
+# Manual only (workflow_dispatch). Never runs on push, pull request or a
+# schedule. The hardware job targets only the self-hosted runner labelled
+# `hust-rtx3070` and launches exclusively through
+# tools/diag/Run-VictoryDiagnostic.ps1, whose RAM/commit/GPU-health/timeout
+# guards stay in force. The title executable and its files never leave the
+# home machine: the job reads their location from the runner's local
+# environment, downloads nothing, and uploads only a sanitized summary bundle.
+#
+# Safety layers, in order:
+#   1. preflight (GitHub-hosted): dispatched from the default branch by the
+#      repository owner; typed authorization phrase; full commit SHA that is
+#      already on hust/phase12-memory (reviewed); runner declared registered;
+#      optional live "runner online" API check; optional environment approval.
+#   2. hardware (home runner): refuses if the job sat in the queue longer than
+#      max_queue_minutes (so a run queued while the PC was off never starts
+#      later on its own); verifies runner identity, interactive session, the
+#      RTX 3070, TDR still enabled, local paths; checks out exactly the SHA;
+#      runs the asset policy and the safety check from THIS workflow revision
+#      against that SHA; then one harness run.
+#   3. concurrency: one hardware run at a time, never cancelled mid-run.
+# Setup: docs/home-gpu-runner-setup.md
+name: Home RTX 3070 diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Full 40-character SHA of the reviewed commit to test (must already be on hust/phase12-memory)"
+        type: string
+        required: true
+      authorization:
+        description: "Type exactly: I AUTHORIZE ONE RTX 3070 RUN"
+        type: string
+        required: true
+      console:
+        description: "Console profile passed to victory run --console"
+        type: choice
+        options: [series-s, series-x]
+        default: series-s
+      max_duration_seconds:
+        description: "Harness max duration in seconds (30-600)"
+        type: number
+        default: 150
+      enable_dred:
+        description: "Set VICTORY_D3D12_DRED=1 (device-removal breadcrumbs)"
+        type: boolean
+        default: true
+      enable_capture:
+        description: "Capture frames (PNG files stay on the home PC; never uploaded)"
+        type: boolean
+        default: false
+      test_label:
+        description: "Optional label (letters, digits, space . _ # - ; max 60)"
+        type: string
+        default: ""
+      discord_notify:
+        description: "Let the harness send its local Discord notification"
+        type: boolean
+        default: false
+      max_queue_minutes:
+        description: "Refuse if the home runner picks the job up later than this (1-15 minutes)"
+        type: number
+        default: 5
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hust-rtx3070-hardware
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Preflight (GitHub-hosted)
+    runs-on: ubuntu-latest
+    # Optional human approval: add required reviewers to this environment.
+    environment: home-rtx3070
+    timeout-minutes: 5
+    outputs:
+      dispatched_epoch: ${{ steps.stamp.outputs.epoch }}
+    steps:
+      - name: Validate dispatch and inputs
+        env:
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.actor }}
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ inputs.commit_sha }}
+          AUTH: ${{ inputs.authorization }}
+          DURATION: ${{ inputs.max_duration_seconds }}
+          QUEUE: ${{ inputs.max_queue_minutes }}
+          LABEL: ${{ inputs.test_label }}
+          REGISTERED: ${{ vars.HUST_RTX3070_RUNNER_REGISTERED }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$REF" = "refs/heads/hust/phase12-memory" ] || fail "Dispatch from hust/phase12-memory only (got $REF)."
+          [ "$ACTOR" = "$OWNER" ] || fail "Only the repository owner may start a hardware run."
+          [ "$AUTH" = "I AUTHORIZE ONE RTX 3070 RUN" ] || fail "Authorization phrase does not match."
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail "commit_sha must be a full 40-character lowercase SHA."
+          [[ "$DURATION" =~ ^[0-9]+$ ]] && [ "$DURATION" -ge 30 ] && [ "$DURATION" -le 600 ] || fail "max_duration_seconds must be 30-600."
+          [[ "$QUEUE" =~ ^[0-9]+$ ]] && [ "$QUEUE" -ge 1 ] && [ "$QUEUE" -le 15 ] || fail "max_queue_minutes must be 1-15."
+          [[ "$LABEL" =~ ^[A-Za-z0-9\ ._#-]{0,60}$ ]] || fail "test_label has unsupported characters."
+          [ "$REGISTERED" = "true" ] || fail "Repository variable HUST_RTX3070_RUNNER_REGISTERED is not 'true'. Register the home runner first (docs/home-gpu-runner-setup.md)."
+
+      - name: Require the commit to be on the reviewed branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          status=$(gh api "repos/$REPO/compare/$SHA...hust/phase12-memory" --jq .status) || {
+            echo "::error::Commit $SHA not found in $REPO."; exit 1; }
+          case "$status" in
+            identical|ahead) echo "Commit $SHA is on hust/phase12-memory ($status).";;
+            *) echo "::error::Commit $SHA is not on hust/phase12-memory (compare status: $status). Push/merge the reviewed commit first."; exit 1;;
+          esac
+
+      - name: Check that the home runner is online (when a status token is configured)
+        env:
+          GH_TOKEN: ${{ secrets.HUST_RUNNER_STATUS_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::notice::HUST_RUNNER_STATUS_TOKEN not set: online status not queried. The hardware job's stale-queue guard still refuses late pickups."
+            exit 0
+          fi
+          online=$(gh api --paginate "repos/$REPO/actions/runners?per_page=100" \
+            --jq '[.runners[] | select(any(.labels[]; .name == "hust-rtx3070")) | select(.status == "online")] | length')
+          echo "online runners labelled hust-rtx3070: $online"
+          [ "$online" -ge 1 ] || { echo "::error::No online runner labelled hust-rtx3070. Start the runner on the home PC, then dispatch again."; exit 1; }
+
+      - name: Stamp dispatch time
+        id: stamp
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+  hardware:
+    name: RTX 3070 diagnostic (home runner)
+    needs: preflight
+    runs-on: [self-hosted, Windows, X64, hust-rtx3070]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: powershell
+    env:
+      DISPATCHED_EPOCH: ${{ needs.preflight.outputs.dispatched_epoch }}
+      MAX_QUEUE_MINUTES: ${{ inputs.max_queue_minutes }}
+      COMMIT_SHA: ${{ inputs.commit_sha }}
+      SRC_DIR: ${{ github.workspace }}\src
+      GUARD_DIR: ${{ github.workspace }}\guard
+    steps:
+      - name: Refuse a stale queued run
+        run: |
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $waited = $now - [long]$env:DISPATCHED_EPOCH
+          $limit = 60 * [int]$env:MAX_QUEUE_MINUTES
+          Write-Host "Picked up ${waited}s after preflight (limit ${limit}s)."
+          if ($waited -gt $limit) {
+            throw "Refusing: this run waited ${waited}s for the home runner (limit ${limit}s). It was probably queued while the runner was offline. Dispatch again when the runner is online."
+          }
+
+      - name: Verify runner, session, GPU and local paths
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows') { throw "Not a Windows runner." }
+          if ($env:HUST_VICTORY_RUNNER_ID -ne 'hust-rtx3070') {
+            throw "Runner identity missing: HUST_VICTORY_RUNNER_ID must be 'hust-rtx3070' in the runner's .env file."
+          }
+          $session = (Get-Process -Id $PID).SessionId
+          if ($session -eq 0 -or -not [Environment]::UserInteractive) {
+            throw "The runner is in session 0 / non-interactive (Windows service). GPU tests need run.cmd in the logged-in desktop session."
+          }
+          $rtx = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*RTX 3070*' })
+          if ($rtx.Count -eq 0) { throw "No NVIDIA RTX 3070 adapter found." }
+          if ($rtx[0].Status -ne 'OK') { throw "RTX 3070 adapter status is '$($rtx[0].Status)'." }
+          $gd = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -ErrorAction SilentlyContinue
+          if ($null -ne $gd -and $gd.PSObject.Properties['TdrLevel'] -and [int]$gd.TdrLevel -eq 0) {
+            throw "Windows TDR is disabled (TdrLevel=0). Re-enable it; this workflow never runs with TDR off."
+          }
+          $title = $env:HUST_VICTORY_TITLE_EXE
+          $results = $env:HUST_VICTORY_RESULTS_ROOT
+          if ([string]::IsNullOrWhiteSpace($title) -or -not (Test-Path -LiteralPath $title -PathType Leaf)) {
+            throw "HUST_VICTORY_TITLE_EXE is unset or does not point to a local file."
+          }
+          if ([string]::IsNullOrWhiteSpace($results) -or -not (Test-Path -LiteralPath $results -PathType Container)) {
+            throw "HUST_VICTORY_RESULTS_ROOT is unset or missing."
+          }
+          $ws = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\') + '\'
+          foreach ($p in @($title, $results)) {
+            if ([IO.Path]::GetFullPath($p).StartsWith($ws, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Local title/results paths must be outside the runner workspace: $p"
+            }
+          }
+          Write-Host "Runner $env:RUNNER_NAME ok: session $session, $($rtx[0].Name), driver $($rtx[0].DriverVersion)."
+
+      - name: Check out the safety tooling (this workflow revision)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: guard
+          sparse-checkout: tools/ci
+          persist-credentials: false
+
+      - name: Check out the selected commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit_sha }}
+          path: src
+          # Keep target/ between runs (incremental diag builds); the tree is
+          # verified clean below.
+          clean: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the project directory
+        run: |
+          $head = (& git -C $env:SRC_DIR rev-parse HEAD).Trim()
+          if ($head -ne $env:COMMIT_SHA) { throw "Checked-out HEAD $head does not match $env:COMMIT_SHA." }
+          $dirty = (& git -C $env:SRC_DIR status --porcelain) -join "`n"
+          if (-not [string]::IsNullOrWhiteSpace($dirty)) { throw "Project directory is not clean:`n$dirty" }
+          foreach ($f in @('Cargo.toml', 'rust-toolchain.toml', 'tools\diag\Run-VictoryDiagnostic.ps1', 'apps\victory\Cargo.toml')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $env:SRC_DIR $f))) { throw "Not a HUST-VIctory checkout: $f missing." }
+          }
+          Write-Host "Project directory $env:SRC_DIR is HUST-VIctory at $head (clean)."
+
+      - name: Asset policy and hardware safety check on the selected commit
+        run: |
+          Push-Location $env:SRC_DIR
+          try {
+            & cargo xtask policy
+            if ($LASTEXITCODE -ne 0) { throw "Asset policy failed on $env:COMMIT_SHA." }
+          } finally { Pop-Location }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $env:GUARD_DIR 'tools\ci\Test-HardwareSafety.ps1') -RepoRoot $env:SRC_DIR
+          if ($LASTEXITCODE -ne 0) { throw "Hardware safety check failed on $env:COMMIT_SHA; refusing to launch." }
+
+      - name: Run one diagnostic through Run-VictoryDiagnostic.ps1
+        id: diag
+        env:
+          IN_CONSOLE: ${{ inputs.console }}
+          IN_DURATION: ${{ inputs.max_duration_seconds }}
+          IN_DRED: ${{ inputs.enable_dred }}
+          IN_CAPTURE: ${{ inputs.enable_capture }}
+          IN_LABEL: ${{ inputs.test_label }}
+          IN_DISCORD: ${{ inputs.discord_notify }}
+        run: |
+          $started = Get-Date
+          $label = if ($env:IN_LABEL) { "gha-$env:GITHUB_RUN_ID $env:IN_LABEL" } else { "gha-$env:GITHUB_RUN_ID" }
+          $params = @{
+            TitleExe            = $env:HUST_VICTORY_TITLE_EXE
+            AuthorizeGameLaunch = $true
+            Console             = $env:IN_CONSOLE
+            RepoRoot            = $env:SRC_DIR
+            ResultsRoot         = $env:HUST_VICTORY_RESULTS_ROOT
+            MaxDurationSeconds  = [int]$env:IN_DURATION
+            TestLabel           = $label
+          }
+          if ($env:IN_DRED -eq 'true') { $params['EnableDred'] = $true }
+          if ($env:IN_CAPTURE -eq 'true') { $params['EnableCapture'] = $true }
+          if ($env:IN_DISCORD -ne 'true') { $params['NoDiscord'] = $true }
+          $harness = Join-Path $env:SRC_DIR 'tools\diag\Run-VictoryDiagnostic.ps1'
+          $runDir = ''
+          try {
+            $out = & $harness @params
+            $summary = @($out | Where-Object { $null -ne $_ -and $_.PSObject.Properties['RunDirectory'] }) | Select-Object -Last 1
+            if ($null -ne $summary) {
+              $runDir = $summary.RunDirectory
+              "classification=$($summary.Classification)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            }
+          } finally {
+            if (-not $runDir) {
+              $latest = Get-ChildItem -LiteralPath $env:HUST_VICTORY_RESULTS_ROOT -Directory -Filter 'diag-hw-*' -ErrorAction SilentlyContinue |
+                Where-Object { $_.CreationTime -ge $started.AddSeconds(-5) } | Sort-Object CreationTime | Select-Object -Last 1
+              if ($latest) { $runDir = $latest.FullName }
+            }
+            "RUN_DIR=$runDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Stop any process left by this run
+        if: ${{ always() }}
+        run: |
+          $prefix = (Join-Path $env:SRC_DIR 'target') + '\'
+          Get-Process -Name 'victory' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
+            ForEach-Object { Write-Warning "Stopping leftover victory.exe pid $($_.Id)"; Stop-Process -Id $_.Id -Force }
+
+      - name: Build the sanitized bundle
+        if: ${{ always() && env.RUN_DIR != '' }}
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'sanitized-diagnostic'
+          if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+          $titleDir = Split-Path -Parent $env:HUST_VICTORY_TITLE_EXE
+          & (Join-Path $env:GUARD_DIR 'tools\ci\Export-DiagnosticArtifacts.ps1') -RunDirectory $env:RUN_DIR -Destination $dest -Redact @(
+            "TITLE_DIR=$titleDir",
+            "RESULTS_ROOT=$env:HUST_VICTORY_RESULTS_ROOT",
+            "WORKSPACE=$env:GITHUB_WORKSPACE",
+            "RUNNER_ROOT=$(Split-Path -Parent $env:RUNNER_TEMP)"
+          )
+          $s = Join-Path $dest 'summary.json'
+          $md = New-Object System.Collections.Generic.List[string]
+          $md.Add("## RTX 3070 diagnostic - $env:COMMIT_SHA")
+          if (Test-Path -LiteralPath $s) {
+            $j = Get-Content -LiteralPath $s -Raw | ConvertFrom-Json
+            $md.Add("")
+            $md.Add("| Field | Value |")
+            $md.Add("|---|---|")
+            foreach ($k in 'Classification','HarnessStopReason','ExitCode','ElapsedSec','ProgressionStage','MaxFramePresented','UniquePipelinesBound','MaxDrawsPerFrame','PeakPrivateMB','MinObservedHeadroomMB','PeakGpuLocalMB','DredEnabled','CaptureEnabled') {
+              if ($j.PSObject.Properties[$k]) { $md.Add("| $k | $($j.$k) |") }
+            }
+          } else {
+            $md.Add("No summary.json: the harness stopped before writing it (see the job log).")
+          }
+          $md.Add("")
+          $md.Add("Full run directory, frames and unfiltered logs remain on the home PC.")
+          $md -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload the sanitized bundle
+        if: ${{ always() && env.RUN_DIR != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rtx3070-diagnostic-${{ github.run_id }}
+          path: ${{ runner.temp }}/sanitized-diagnostic
+          retention-days: 14
+          if-no-files-found: warn
