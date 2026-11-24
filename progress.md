@@ -1,14 +1,14 @@
 # Current Project Status
 
 - Current milestone: Phase 13.3 — Autonomous World Rendering Recovery & Selective Upstream Integration on NVIDIA GeForce RTX 3070 (8 GB VRAM, 32 GB DDR4 RAM)
-- Current subphase: Phase 13.3 Wave 1 **CONFIRMED ON RTX 3070** — Test #28 (`2327737`, `-Console series-s`, 153.33 s) completed full `MaxDurationReached` with **0 GPU hangs, 0 crashes, 7.86 GB min commit headroom, 1.38 GB VRAM, 1,810 unique pipelines, 979 draws/frame**, and captured textured 3D opening scene (`frame-1600.png`, 957 KB). Ready for Phase 13.3 Wave 2 (upstream PR #307 waterfall loops + PR #189 Wave64-on-Wave32 compute emulation + PR #469 depth/UAV twin textures) to recover the 2,226 dropped compute dispatches/frame (`no_pipe=2226`) for full lighting/sky/world rendering.
+- Current subphase: Phase 13.3 Waves 1–3 **CONFIRMED ON RTX 3070 (4 consecutive 150–184 s zero-hang, zero-crash runs!)** — Test #31 (`0abe8ec`, `-Console series-s`, `VICTORY_WAVE64_EMULATE=wave32`, 183.70 s) completed full `MaxDurationReached` with **0 GPU hangs, 0 crashes, 0 wave-size PSO refusals (down from 76), 0 depth/UAV view refusals, 7.28 GB min commit headroom, 1.50 GB VRAM, 1,858 unique pipelines, 1,122 draws/frame, 793 translated shaders**, and rendered the **4K letterboxed GTA VI opening cutscene with textured 3D alligator sculpture + glowing neon pink opening credits** (`frame-1605.png`, 683 KB).
 - Current branch: `hust/phase12-memory` (tracks private `origin/hust/phase12-memory` at `https://github.com/EsMiguelRdgz/HUST-VIctory.git`; `upstream` = `https://github.com/Marvisak/VIctory.git`)
-- Latest verified commit: `2327737` (Phase 13.3 Wave 1: `9cbb667` + `2327737`; preserves all Phase 1–13.2 work)
+- Latest verified commit: `0abe8ec` (Phase 13.3 Wave 1 `9cbb667`+`2327737` + Wave 2 `ab16884`+`2818d6e`+`c46ba3b` + Wave 3 `0abe8ec`; preserves all Phase 1–13.2 work)
 - Current working-tree status: clean except this checkpoint
 - Active agent: Antigravity
-- Last checkpoint timestamp: 2026-11-24T16:37Z (Phase 13.3 Wave 1 RTX 3070 hardware verified!)
-- Current build status: diag build OK (`target/diag/victory.exe` rebuilt with Phase 13.3 Wave 1)
-- Current test status: `cargo test -p victory-shader` (`71 passed / 0 failed`, including `a_heap_index_past_the_heap_reads_the_guard_slot` on WARP & RTX 3070); `VICTORY_D3D12_WARP=1 VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics` (`108 passed / 0 failed / 4 ignored`, 0 D3D12 Debug Layer errors); `cargo clippy -p victory-shader -p victory-gpu --features diagnostics --tests` (0 new warnings; only pre-existing `list.rs:1467`); `cargo build --profile diag --features diagnostics -p victory` OK; `cargo xtask policy` (`160 files ok`).
+- Last checkpoint timestamp: 2026-11-24T17:17Z (Phase 13.3 Waves 1–3 RTX 3070 hardware verified!)
+- Current build status: diag build OK (`target/diag/victory.exe` built at `0abe8ec`)
+- Current test status: `cargo test -p victory-shader` (`109 passed / 0 failed`, including all live RTX 3070 + WARP `emit::wave64_tests::gpu::*` and `valu_tests`); `VICTORY_D3D12_WARP=1 VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics -- --test-threads=1` (`109 passed / 0 failed / 4 ignored`, including `unordered_writes_reach_a_depth_target`, 0 D3D12 Debug Layer errors); `cargo clippy -p victory-shader -p victory-gpu --features diagnostics --tests` (0 new warnings; only pre-existing `list.rs:1474`); `cargo build --profile diag --features diagnostics -p victory` OK; `cargo xtask policy` (`161 files ok`).
 
 ## Phase 11 trigger (user report, RTX 3070 test 1)
 
@@ -54,14 +54,20 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 
 ## Immediate Resume Instructions
 
-- First action: Inspect RTX 3070 Hardware Test #26 (`-Console series-s`, 150 s, DRED + frame capture) results once completed:
-  1. Check whether `0x887A0006` (`d3e44e754b3eb6aa` / `0e45e59e93b736e4` OOB descriptor heap wrap hang) is eliminated by PR #483 (`heap_guard` + permanent null guard slot).
-  2. Visually inspect captured composited `frame-*.png` files (`PresentX` 2-plane MPO compositor `3840x2160` output) to confirm UI + 3D world rendering progression.
-  3. If world-stage GPU stability is confirmed, evaluate Phase 13.3 Wave 2 upstream shader/rendering fixes (PR #307 waterfall loops, PR #566 per-lane descriptors, PR #189 Wave64 compute emulation on Wave32, PR #469 depth/UAV twin textures) prioritized by actual Test #26 dropped-shader/visual evidence.
+- First action (Phase 13.3 Wave 4 — World Lighting, Remaining Dropped Shaders & Frame-Rate Optimization):
+  1. **Investigate top remaining dropped compute shaders** from Test #31 (`diag-hw-20261124-131300\stderr.log`):
+     - `34` shaders: `an address in an SGPR that is no root parameter is not supported`
+     - `30` shaders: `a cross-lane wave operation in divergent control flow is not supported`
+     - `18` shaders: `LDS accesses without a uniform LDS fence in split wave64 is not supported`
+     - `11` shaders: `a 64-bit image atomic is not supported`
+     - `10` shaders: `a scalar memory read as data is not supported`
+     Also consider adapting merged upstream **PR #612** (transitive phi liveness), **PR #376** (`v_cvt_norm_i16_f16`/`u16_f16`), and **PR #566** (per-lane control-flow descriptors), and evaluating whether `Wave64Mode::Wave32` should be the default on `wave=32..32(ops=true)` NVIDIA GPUs (confirmed 0 hangs + 60 more shaders than `Emulate` in Tests #30–#31).
+  2. **Investigate world-stage 0.4–1.5 FPS bottleneck** (`530–2,200 ms on the GPU` with `slow host submission ms=1655` on 2-list compute batches, plus `copies 250–400 ms` for `230–360 MB/frame` CPU->GPU buffer refreshes — check upstream PR #1277 view-memory cache & PR #1267 declared snapshots).
+  3. **Investigate alternating `level=44` / `level=1` frame brightness** during the opening cutscene (determine which dropped lighting/exposure/tonemapping compute shader causes dark frames between bright 3D cutscene frames).
 - Commands required:
   - `cargo xtask policy`
   - `cargo test -p victory-shader`
-  - `VICTORY_D3D12_WARP=1 VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics`
+  - `VICTORY_D3D12_WARP=1 VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics -- --test-threads=1`
   - `cargo clippy -p victory-shader -p victory-gpu --features diagnostics --tests`
   - `cargo build --profile diag -p victory --features diagnostics`
 
@@ -253,3 +259,15 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
   - **Commit `2327737`**: Lowered `Host::execute` `MAX_LISTS_PER_SUBMIT` from `8` to `2` and labeled `guard slot (null)` in `descriptor/host.rs::describe_slot` (`108/108` WARP+Debug, 0 new Clippy warnings).
   - **Test #28** (`2327737`, `G:\VIctory-Results\diag-hw-20261124-123325`, **153.33 s — `MaxDurationReached`!!**): **ZERO GPU hangs, ZERO crashes (`CrashLogs: {}`)**, `1,810` unique pipelines, **`979` draws/frame** (`177/194` vertex, `541/573` mesh, `1,578/3,755` compute), **`7,865.0 MB` min commit headroom**, **`1,382.8 MB` peak GPU local VRAM**, and **`frame-1600.png` (957 KB) rendered textured 3D Vice City opening scene (flamingo mural) cleanly via 2-plane MPO compositing!**
   - **Next engineering priority (Phase 13.3 Wave 2)**: Recover the `2,226` dropped compute dispatches/frame (`no_pipe=2226`) by adapting upstream **PR #307** (waterfall loops over per-lane descriptors), **PR #189** (Wave64 compute emulation on Wave32 NVIDIA), and **PR #469** (depth/UAV twin textures) for full lighting/sky/world rendering.
+
+### 2026-11-24 — Antigravity — Phase 13.3 Waves 2 & 3: Upstream PRs #307, #189 (Wave64-on-Wave32), #469 (Depth/UAV Twins), and 8 Merged Correctness PRs + Hardware Tests #29–#31
+
+- Commits pushed to private `origin/hust/phase12-memory` (`ab16884`..`0abe8ec`):
+  - `ab16884`: Adapted upstream **PR #307** (waterfall loops over per-lane descriptors) + guarded `Source::Fetched | Source::Lanes` non-uniform indices with PR #483 `heap_guard()`. Verified `80/80` `victory-shader`.
+  - `2818d6e`: Adapted upstream **PR #189** (Wave64 compute emulation on Wave32 NVIDIA GPUs via `Wave64Mode::Wave32` and `Wave64Mode::Emulate`, LDS half-wave staging, uniformity analysis, SGPR spill tracking, cache-keyed options; preserved HUST `<=32`-thread Wave32 fast path and `heap_guard`). Verified `104/104` `victory-shader` (including all live RTX 3070 + WARP `emit::wave64_tests::gpu::*`), `108/108` `victory-gpu` (WARP+Debug).
+  - `c46ba3b`: Adapted upstream **PR #469** (depth/UAV twin textures for shadow maps & Hi-Z depth, adapted cleanly to HUST lazy textures, `memstat::Kind::HostTexture` accounting, and eviction). Verified `109/109` `victory-gpu` (WARP+Debug, including `unordered_writes_reach_a_depth_target`).
+  - `0abe8ec`: Adapted 8 merged upstream correctness PRs (**#681** null VB unbind, **#637** packed inline constants, **#634** `image_sample_o` constant offsets, **#565** centroid position + conservative depth, **#432** uninitialized SGPRs read zero, **#384** `v_cvt_u16/i16_f16` 16-bit saturation, **#382** `SV_StencilRef` flag, **#381** PSV0 per-sample frequency). Verified `109/109` `victory-shader`, `109/109` `victory-gpu` (WARP+Debug), 0 new Clippy warnings, `diag` build OK, `xtask policy` (`161 files ok`).
+- Hardware validation results (RTX 3070, `-Console series-s`, 0 hangs, 0 crashes across all 3 runs):
+  - **Test #29** (`2818d6e`, `G:\VIctory-Results\diag-hw-20261124-125347`, `Wave64Mode::Emulate`, **153.97 s — `MaxDurationReached`**): **0 GPU hangs, 0 crashes**, **0 wave-size PSO refusals** (down from 76 in Test #28!), `7,871.1 MB` peak private, `7,697.7 MB` min commit headroom, `1,347.7 MB` peak VRAM, `1,807` pipelines, `1,038` draws/frame. Identified `1` `view the host does not allow unordered=true format=53 flags=2` (depth/UAV, fixed by PR #469) and `57` `v_readfirstlane in divergent control flow` rejections in `Emulate` mode (allowed by `Wave32` mode).
+  - **Test #30** (`c46ba3b`, `G:\VIctory-Results\diag-hw-20261124-130559`, `VICTORY_WAVE64_EMULATE=wave32`, **154.68 s — `MaxDurationReached`**): **0 GPU hangs, 0 crashes, 0 wave-size PSO refusals, 0 depth/UAV view refusals**, `translate_failed` dropped from `205` to **`145`** (+60 compute shaders recovered!), `dispatch 1,888/4,032`, `mesh 668/711` (94%), `7,636.6 MB` peak private, `7,793.8 MB` min commit headroom, `1,422.3 MB` VRAM, captured neon pink opening credits (`frame-1608.png`: `"Director of Art — aaron garbut"`).
+  - **Test #31** (`0abe8ec`, `G:\VIctory-Results\diag-hw-20261124-131300`, `VICTORY_WAVE64_EMULATE=wave32`, **183.70 s — `MaxDurationReached`**): **0 GPU hangs, 0 crashes, 0 wave-size PSO refusals**, **`793` translated shaders** (+72 vs Test #30), **`1,858` unique pipelines**, **`1,122` draws/frame** (`mesh 899/988`, `draw 285/309`, `dispatch 1,895/3,037`), `8,199.3 MB` peak private, `7,282.7 MB` min commit headroom, `1,498.1 MB` VRAM, and **`frame-1605.png` (683 KB) rendered textured 3D alligator sculpture with glowing neon pink GTA VI opening credits (`"Environment Art Direction — paul macpherson / adam cochrane / wayland standing"`) cleanly composited in 4K letterboxed cutscene!**
