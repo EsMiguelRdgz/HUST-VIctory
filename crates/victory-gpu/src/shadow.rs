@@ -208,7 +208,8 @@ fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
 const NOT_WATCHED: u8 = 2;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// written for a submission by its thread or, for big refresh batches, by one
+// of the workers it waits for (one per copy, see `crate::par`).
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
