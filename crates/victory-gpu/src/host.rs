@@ -461,8 +461,7 @@ fn create() -> windows::core::Result<Host> {
         let warp =
             cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some();
         if warp {
-            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
+            let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
@@ -1433,7 +1432,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.flush();
+                    batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1466,7 +1465,7 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
-                        batch.flush();
+                        batch.title_written();
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1488,7 +1487,9 @@ impl HostList {
                     texture,
                     ..
                 } => {
-                    uploads.extend(staging.refresh(*resource, texture));
+                    if batch.texture_due(staging) {
+                        uploads.extend(staging.refresh(*resource, texture));
+                    }
                     continue;
                 }
             };
@@ -1504,38 +1505,59 @@ impl HostList {
 const PARALLEL_REFRESH: usize = 8 << 20;
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// range that covers them, and the textures brought up to date in the
+/// submission so far: most lists of a world submission sample the same
+/// textures, and a texture in physical-page memory is hashed whole each time
+/// it is checked. Checked once, it is checked again only after a step that
+/// writes title memory.
 #[derive(Default)]
-struct Batch(Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>);
+struct Batch {
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Staging buffers (by address) refreshed since the last title write.
+    textures: std::collections::HashSet<usize>,
+}
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         match self
-            .0
+            .refreshes
             .iter_mut()
             .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
         {
             Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.0.push((shadow.clone(), address, end)),
+            None => self.refreshes.push((shadow.clone(), address, end)),
         }
+    }
+
+    /// Whether `staging` is still to be refreshed in this submission (and notes
+    /// it refreshed).
+    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
+        self.textures
+            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    }
+
+    /// Before a step that writes title memory: pending refreshes are done
+    /// first, and textures are checked again after it.
+    fn title_written(&mut self) {
+        self.flush();
+        self.textures.clear();
     }
 
     /// Brings the batched ranges up to date. Each entry is a distinct copy
     /// (its own host buffer), so big batches are shared among a few
     /// threads ([`crate::par`]); small ones run here, as before.
     fn flush(&mut self) {
-        if self.0.is_empty() {
+        if self.refreshes.is_empty() {
             return;
         }
         let started = std::time::Instant::now();
         // Biggest first, for an even share among threads.
-        self.0
+        self.refreshes
             .sort_unstable_by_key(|&(_, from, to)| std::cmp::Reverse(to - from));
         let copied = AtomicU64::new(0);
         crate::par::for_each(
-            &self.0,
+            &self.refreshes,
             crate::par::workers(),
             PARALLEL_REFRESH,
             |&(_, from, to)| to - from,
@@ -1553,9 +1575,31 @@ impl Batch {
                 );
             },
         );
-        self.0.clear();
+        self.refreshes.clear();
         PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied.into_inner(), Ordering::Relaxed);
+    }
+}
+
+/// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
+/// Reject it before creating a device in diagnostics' software-only mode.
+fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
+        let desc = adapter.cast::<IDXGIAdapter1>()?.GetDesc1()?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            tracing::warn!(
+                vendor = format_args!("{:#x}", desc.VendorId),
+                flags = format_args!("{:#x}", desc.Flags),
+                "DXGI did not identify the WARP adapter as software; refusing device"
+            );
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ));
+        }
+        Ok(adapter)
     }
 }
 
@@ -2572,5 +2616,51 @@ mod tests {
             "excess scratch chunks trimmed on reset"
         );
         assert!(list.deferred().kept.is_empty());
+    }
+
+    #[test]
+    fn a_texture_is_checked_once_per_submission() {
+        let mut batch = Batch::default();
+        let (a, b) = (
+            std::sync::Arc::new([0u8; 16]),
+            std::sync::Arc::new([0u8; 16]),
+        );
+        assert!(batch.texture_due(&a));
+        assert!(batch.texture_due(&b));
+        assert!(!batch.texture_due(&a));
+        assert!(!batch.texture_due(&a.clone()));
+        assert!(!batch.texture_due(&b));
+    }
+
+    #[test]
+    fn title_writes_make_textures_due_again() {
+        let mut batch = Batch::default();
+        let a = std::sync::Arc::new(1u32);
+        assert!(batch.texture_due(&a));
+        assert!(!batch.texture_due(&a));
+        batch.title_written();
+        assert!(batch.texture_due(&a));
+        assert!(!batch.texture_due(&a));
+        let mut next = Batch::default();
+        assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn warp_adapter_accepts_only_software() {
+        // SAFETY: plain DXGI adapter queries.
+        let raw = unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            factory.EnumWarpAdapter::<IDXGIAdapter>()
+        };
+        let Ok(raw) = raw else { return };
+        // SAFETY: valid adapter interface.
+        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
+        assert_eq!(
+            warp_adapter().is_ok(),
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        );
     }
 }

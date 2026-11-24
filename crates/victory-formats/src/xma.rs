@@ -53,7 +53,8 @@ pub struct Packet {
 }
 
 pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
-    let b = data.get(index * PACKET_BYTES..index * PACKET_BYTES + 4)?;
+    let start = index.checked_mul(PACKET_BYTES)?;
+    let b = data.get(start..)?.get(..4)?;
     let h = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     Some(Packet {
         frames: h >> 26,
@@ -136,14 +137,22 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     let mut number = 0;
     while at < start {
         let mut cursor = Cursor { data, pos: at };
-        at += cursor.bits(LENGTH_BITS)? as usize;
+        let bits = cursor.bits(LENGTH_BITS)? as usize;
+        // The same rule as `read_frame`: a length that does not cover its own
+        // field is not a frame. A zero length would never move `at`, so a
+        // damaged packet would loop here for good.
+        if bits <= LENGTH_BITS as usize {
+            return None;
+        }
+        at += bits;
         number += 1;
     }
     let last = number + 1 >= header.frames;
     let mut end = end;
     if end.is_multiple_of(PACKET_BITS) || (last && end / PACKET_BITS == index) {
         // The next frame begins in the next packet of this stream.
-        let next = (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
+        let next =
+            (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
         let header = packet(data, next)?;
         end = next * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
     }
@@ -240,10 +249,20 @@ fn codes() -> &'static Codes {
             scale: pairs(&SCALE, -60),
             scale_rl: pairs(&SCALE_RL, 0),
             coef: [
-                Vlc::new(COEF0_SYMS.iter().zip(COEF0_LENS).map(|(&s, l)| (s as i32, l))),
+                Vlc::new(
+                    COEF0_SYMS
+                        .iter()
+                        .zip(COEF0_LENS)
+                        .map(|(&s, l)| (s as i32, l)),
+                ),
                 pairs(&COEF1, 0),
             ],
-            vec4: Vlc::new(VEC4_SYMS.iter().zip(VEC4_LENS).map(|(&s, l)| (s as i32 - 1, l))),
+            vec4: Vlc::new(
+                VEC4_SYMS
+                    .iter()
+                    .zip(VEC4_LENS)
+                    .map(|(&s, l)| (s as i32 - 1, l)),
+            ),
             vec2: pairs(&VEC2, -1),
             vec1: pairs(&VEC1, 0),
         }
@@ -749,7 +768,11 @@ impl Decoder {
             ch.scale_factors = target;
             if ch.reuse_sf {
                 let from = ch.saved_scale_factors[ch.scale_factor_idx];
-                for (sf, &offset) in ch.saved_scale_factors[target].iter_mut().zip(&sf_offsets).take(self.num_bands) {
+                for (sf, &offset) in ch.saved_scale_factors[target]
+                    .iter_mut()
+                    .zip(&sf_offsets)
+                    .take(self.num_bands)
+                {
                     *sf = from[offset];
                 }
             }
@@ -882,7 +905,11 @@ impl Decoder {
                     }
                     quant += 31;
                 }
-                quant_step += if negative { -(quant + step) } else { quant + step };
+                quant_step += if negative {
+                    -(quant + step)
+                } else {
+                    quant + step
+                };
             }
             if self.channels_for_cur_subframe == 1 {
                 self.ch[self.channel_indexes[0]].quant_step = quant_step;
@@ -925,13 +952,21 @@ impl Decoder {
                 let sf = ch.saved_scale_factors[ch.scale_factors];
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
-                    let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
+                    let exp =
+                        ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
                     let quant = 10f32.powf(exp as f32 / 20.0);
-                    for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
+                    for (t, &c) in tmp[sfb[band]..end]
+                        .iter_mut()
+                        .zip(&ch.coeffs[sfb[band]..end])
+                    {
                         *t = c * quant;
                     }
                 }
-                imdct_half(&tmp[..subframe_len], &mut ch.out[at..at + subframe_len], scale);
+                imdct_half(
+                    &tmp[..subframe_len],
+                    &mut ch.out[at..at + subframe_len],
+                    scale,
+                );
             }
         } else {
             for i in 0..self.channels_for_cur_subframe {
@@ -948,7 +983,10 @@ impl Decoder {
                 start += (winlen - subframe_len) / 2;
                 winlen = subframe_len;
             }
-            window_overlap(&mut ch.out[start..start + winlen], &windows()[log2(winlen) as usize - 7]);
+            window_overlap(
+                &mut ch.out[start..start + winlen],
+                &windows()[log2(winlen) as usize - 7],
+            );
             ch.prev_block_len = subframe_len;
         }
 
@@ -1015,6 +1053,30 @@ fn to_i16(v: f32) -> i16 {
 mod tests {
     use super::*;
 
+    /// Writes `value` as `n` bits, MSB first, at bit `pos`.
+    fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
+        for i in 0..n as usize {
+            if value >> (n as usize - 1 - i) & 1 == 1 {
+                data[(pos + i) / 8] |= 1 << (7 - (pos + i) % 8);
+            }
+        }
+    }
+
+    /// A damaged packet whose first frame says it is 0 bits long: finding
+    /// the frame after a later one must give up, not walk in place forever
+    /// (found by random-input testing).
+    #[test]
+    fn a_zero_length_frame_before_the_start_ends_the_search() {
+        let mut data = vec![0u8; PACKET_BYTES];
+        // Two frames, the first at payload bit 0; its 15-bit length stays 0.
+        put_bits(&mut data, 0, 32, 2 << 26);
+        let start = HEADER_BITS + 100;
+        put_bits(&mut data, start, LENGTH_BITS, 200);
+        let frame = read_frame(&data, start).expect("the frame at `start` is well formed");
+        assert_eq!(frame.bits, 200);
+        assert_eq!(frame.next, None);
+    }
+
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
     /// the standard formula, negated).
     fn imdct_reference(input: &[f32]) -> Vec<f32> {
@@ -1025,7 +1087,9 @@ mod tests {
                 -(input
                     .iter()
                     .enumerate()
-                    .map(|(k, &x)| x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos())
+                    .map(|(k, &x)| {
+                        x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos()
+                    })
                     .sum::<f64>() as f32)
             })
             .collect()
@@ -1077,8 +1141,19 @@ mod tests {
             }
         }
         for i in n..5 * n {
-            assert!((out[i] - signal[i]).abs() < 1e-3, "{i}: {} vs {}", out[i], signal[i]);
+            assert!(
+                (out[i] - signal[i]).abs() < 1e-3,
+                "{i}: {} vs {}",
+                out[i],
+                signal[i]
+            );
         }
+    }
+
+    #[test]
+    fn packet_rejects_out_of_range_indices_and_partial_headers() {
+        assert!(packet(&[0; 4], usize::MAX / PACKET_BYTES + 1).is_none());
+        assert!(packet(&[0; 3], 0).is_none());
     }
 
     #[test]
