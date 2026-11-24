@@ -521,9 +521,35 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    if !read.is_null() {
+        super::xmem::ensure_committed(read as usize, size_of::<u32>());
+    }
+    if !overlapped.is_null() {
+        super::xmem::ensure_committed(overlapped as usize, 32);
+    }
+    let ok = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or(0);
+        // 997 = ERROR_IO_PENDING, 38 = ERROR_HANDLE_EOF.
+        if raw != 997 && raw != 38 {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+                tracing::warn!(
+                    raw,
+                    %err,
+                    buffer = format_args!("{buffer:p}"),
+                    len,
+                    read = format_args!("{read:p}"),
+                    overlapped = format_args!("{overlapped:p}"),
+                    "ReadFile failed"
+                );
+            }
+        }
+    }
+    ok
 }
 
 /// Kernel reads from title memory: commit any demand-committed pages first so
@@ -536,6 +562,12 @@ pub extern "system" fn WriteFile(
     overlapped: *mut c_void,
 ) -> i32 {
     super::xmem::ensure_committed(buffer as usize, len as usize);
+    if !written.is_null() {
+        super::xmem::ensure_committed(written as usize, size_of::<u32>());
+    }
+    if !overlapped.is_null() {
+        super::xmem::ensure_committed(overlapped as usize, 32);
+    }
     host!("kernel32.dll", "WriteFile": extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, written, overlapped,
     )

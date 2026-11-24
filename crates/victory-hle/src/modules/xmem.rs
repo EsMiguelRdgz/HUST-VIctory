@@ -400,6 +400,13 @@ pub extern "system" fn XMemVirtualAlloc(
         {
             install_demand_commit();
             demand_private().add(lo, hi);
+            tracing::debug!(
+                base = format_args!("{base:p}"),
+                size,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                "XMemVirtualAlloc sub-commit demand-private"
+            );
             return lo as *mut c_void;
         }
     }
@@ -452,12 +459,14 @@ pub extern "system" fn XMemVirtualAlloc(
             demand_private().remove(lo, hi);
         }
     }
-    if base.is_null() {
+    if base.is_null() || size >= DEMAND_PRIVATE_MIN_BYTES {
         tracing::debug!(
+            base = format_args!("{base:p}"),
             size,
             kind = format_args!("{kind:#x}"),
             alloc_kind = format_args!("{alloc_kind:#x}"),
             flags = format_args!("{flags:#x}"),
+            protect = format_args!("{protect:#x}"),
             at = format_args!("{at:p}"),
             demand_private = constrained && demand_commit_private,
             "XMemVirtualAlloc"
@@ -485,6 +494,9 @@ pub extern "system" fn XMemVirtualQuery(
     address: *const c_void,
     out: *mut BasicInformation,
 ) -> BOOL {
+    if !out.is_null() {
+        ensure_committed(out as usize, size_of::<BasicInformation>());
+    }
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
@@ -812,18 +824,26 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
+    let first = {
+        let mut physical = physical();
+        let first = physical.next_page;
+        physical.next_page += n * FRAMES;
+        for index in 0..n {
+            let slice = Slice {
+                section: sections[index / CHUNK].clone(),
+                index: index % CHUNK,
+            };
+            let number = first + index * FRAMES;
+            physical.pages.insert(number, slice);
+        }
+        first
+    };
+    // Write the title's output array AFTER releasing `PHYSICAL`: if `pages`
+    // lies in a demand-committed private pool, writing it may fault into
+    // `on_physical_fault`, which must never re-enter `PHYSICAL` on this thread.
     for index in 0..n {
-        let slice = Slice {
-            section: sections[index / CHUNK].clone(),
-            index: index % CHUNK,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
         // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+        unsafe { pages.add(index).write(first + index * FRAMES) };
     }
     1
 }
@@ -838,10 +858,13 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     if pages.is_null() {
         return 0;
     }
+    // Copy title memory BEFORE acquiring `PHYSICAL` so demand-commit faults
+    // cannot re-enter `PHYSICAL` on this thread.
+    // SAFETY: the title passes `n` page numbers.
+    let list: Vec<usize> = unsafe { std::slice::from_raw_parts(pages, n) }.to_vec();
     let mut physical = physical();
-    for i in 0..n {
-        // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+    for page in list {
+        physical.pages.remove(&page);
     }
     1
 }
@@ -854,10 +877,12 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let mut done = 0;
     while done < data.len() {
         let (page, within) = ((offset + done) / PAGE, (offset + done) % PAGE);
-        let Some(slice) = pages
-            .get(page)
-            .and_then(|p| physical().pages.get(p).cloned())
-        else {
+        // Read the title's page number BEFORE acquiring `PHYSICAL` so a
+        // demand-commit fault on `pages` cannot re-enter `PHYSICAL`.
+        let Some(&page_num) = pages.get(page) else {
+            return false;
+        };
+        let Some(slice) = physical().pages.get(&page_num).cloned() else {
             return false;
         };
         let at = (slice.index * PAGE) as u64;
@@ -923,13 +948,19 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    // Copy the title's page-number array BEFORE acquiring `PHYSICAL` so a
+    // demand-commit fault on `pages` cannot re-enter `PHYSICAL` on this thread.
+    let page_list = if pages.is_null() {
+        None
+    } else {
+        // SAFETY: the title passes `n` page numbers.
+        Some(unsafe { std::slice::from_raw_parts(pages, n) }.to_vec())
+    };
     let mut physical = physical();
     unmap(&mut physical, base, n * PAGE);
-    if pages.is_null() {
+    let Some(pages) = page_list else {
         return address;
-    }
-    // SAFETY: the title passes `n` page numbers.
-    let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    };
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -2113,5 +2144,45 @@ mod tests {
             }
         }
         assert_ne!(crate::modules::kernel::VirtualFree(p, 0, MEM_RELEASE), 0);
+    }
+
+    /// Regression test for the Test #8 boot deadlock: when the title places its
+    /// `pages` array inside an untouched demand-committed private pool and passes
+    /// it to `XMemAllocatePhysicalPages`, `XMemMapPhysicalPages`, `write_physical`,
+    /// or `XMemFreePhysicalPages`, faulting in `pages` must never re-enter `PHYSICAL`.
+    #[test]
+    fn allocate_free_and_map_physical_pages_using_untouched_demand_private_arrays() {
+        let pool = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            8 * MIB,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!pool.is_null());
+        // Place the page-number array on untouched pages well inside the pool.
+        let pages_ptr = pool.wrapping_byte_add(2 * MIB).cast::<usize>();
+        let mut n = 4096usize; // 32 KiB of page numbers spanning untouched pages
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages_ptr), 1);
+
+        let view = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!view.is_null());
+        assert_eq!(XMemMapPhysicalPages(view, 4, pages_ptr), view);
+        // SAFETY: `pages_ptr` holds `n >= 4` page numbers.
+        let slice = unsafe { std::slice::from_raw_parts(pages_ptr, 4) };
+        assert!(write_physical(slice, 0, &[0xAB; 64]));
+        // SAFETY: page 0 is mapped at `view`.
+        assert_eq!(unsafe { view.cast::<u8>().read() }, 0xAB);
+
+        assert_eq!(XMemMapPhysicalPages(view, 4, std::ptr::null()), view);
+        assert_eq!(XMemFreePhysicalPages(n, pages_ptr), 1);
+        assert_ne!(crate::modules::kernel::VirtualFree(view, 0, MEM_RELEASE), 0);
+        assert_ne!(crate::modules::kernel::VirtualFree(pool, 0, MEM_RELEASE), 0);
     }
 }

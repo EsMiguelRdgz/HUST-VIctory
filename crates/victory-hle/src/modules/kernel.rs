@@ -543,11 +543,17 @@ mod host {
         if !address.is_null() && size > 0 {
             super::super::xmem::ensure_private_committed(address as usize, size);
         }
+        if !old_protect.is_null() {
+            super::super::xmem::ensure_private_committed(old_protect as usize, size_of::<u32>());
+        }
         // SAFETY: forwarding the title's own arguments to host `VirtualProtect`.
         unsafe { VirtualProtect(address, size, new_protect, old_protect) }
     }
 
     pub(super) fn virtual_query(address: *const c_void, out: *mut c_void, len: usize) -> usize {
+        if !out.is_null() && len > 0 {
+            super::super::xmem::ensure_private_committed(out as usize, len);
+        }
         // SAFETY: forwarding the title's own arguments to host `VirtualQuery`.
         let n = unsafe { VirtualQuery(address, out.cast(), len) };
         if n >= size_of::<MEMORY_BASIC_INFORMATION>() && !out.is_null() {
@@ -563,6 +569,9 @@ mod host {
         out: *mut c_void,
         len: usize,
     ) -> usize {
+        if !out.is_null() && len > 0 {
+            super::super::xmem::ensure_private_committed(out as usize, len);
+        }
         // SAFETY: forwarding the title's own arguments to host `VirtualQueryEx`.
         let n = unsafe { VirtualQueryEx(process, address, out.cast(), len) };
         if n >= size_of::<MEMORY_BASIC_INFORMATION>() && !out.is_null() {
