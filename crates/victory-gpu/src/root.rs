@@ -343,6 +343,50 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }
 
+    /// What the old hand-packed test parameter amounted to on x64: the host
+    /// read register 0, space 1, no 32-bit values, and a shader visibility
+    /// from past the end of the struct. With an out-of-range visibility the
+    /// host refuses it and explains why in its error blob.
+    #[cfg(windows)]
+    #[test]
+    fn invalid_parameters_return_the_hosts_error() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY,
+        };
+        let parameter = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 1,
+                    Num32BitValues: 0,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY(0x7fff_ffff),
+        };
+        let desc = Desc {
+            parameter_count: 1,
+            parameters: (&raw const parameter).cast(),
+            sampler_count: 0,
+            samplers: std::ptr::null(),
+            flags: 1,
+        };
+        let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let hr = serialize(&desc, 1, &mut blob, &mut error);
+        let produced = !blob.is_null();
+        if produced {
+            let blob = blob.cast_const().cast::<Object>();
+            slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+        }
+        let text = error_text(error);
+        // TEMPORARY (one CI run): show the host's message in the log.
+        panic!(
+            "hr={:#010x} blob_produced={produced} host error blob: {text}",
+            hr as u32
+        );
+    }
+
     /// The host's deserializer reads our blobs back (the upscaler's call).
     #[cfg(windows)]
     #[test]
