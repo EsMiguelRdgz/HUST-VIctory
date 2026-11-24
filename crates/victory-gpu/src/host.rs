@@ -618,8 +618,8 @@ impl Host {
         // Deduplicate shader-written ranges per shadow across all lists in
         // this submission, and snapshot pre-GPU bytes before executing so
         // copy-back writes back only what the GPU actually changed.
-        let mut gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
-            Vec::new();
+        type ShadowRanges = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+        let mut gpu_writes: Vec<ShadowRanges> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step {
