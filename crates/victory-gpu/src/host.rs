@@ -1414,6 +1414,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    logged_frames: u32,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -1426,6 +1427,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            logged_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -1437,6 +1439,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        self.logged_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -1455,6 +1458,9 @@ impl Meter {
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+            #[cfg(feature = "diagnostics")]
+            let log_frames = f64::from(self.logged_frames.max(1));
+            self.logged_frames = 0;
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
@@ -1462,7 +1468,7 @@ impl Meter {
                  GPU), {draws:.0} draws/frame"
             );
             #[cfg(feature = "diagnostics")]
-            crate::copystat::log(frames);
+            crate::copystat::log(log_frames);
         }
         if self.caption.is_none() {
             // The window's own text, read without a message.

@@ -108,11 +108,15 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// Blocks in view memory where `VirtualProtect` failed (unmapped holes).
+    /// Cleared by [`title_memory_remapped`] when the title remaps that range.
+    unmapped: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    unmapped: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -137,10 +141,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     for block in first..=last {
-        let open = block < last && !g.clean.contains(&block);
+        let open = block < last && !g.clean.contains(&block) && !g.unmapped.contains(&block);
         if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
             } else {
@@ -149,15 +153,17 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+            protect(&mut g, from, block, &mut written);
         }
     }
     Some(written)
 }
 
-/// Makes blocks `[from, to)` read-only and notes them guarded and clean;
-/// block by block if they span views, leaving out any that fail (unmapped).
-fn protect(g: &mut Guards, from: usize, to: usize) {
+/// Makes blocks `[from, to)` read-only, notes them guarded and clean, and
+/// appends their pages to `written`; block by block if they span views,
+/// caching any block whose `VirtualProtect` fails in `g.unmapped` so sparse
+/// holes are not re-probed or reported as written on every watch call.
+fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -171,17 +177,20 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             ) != 0
         }
     };
-    let note = |g: &mut Guards, from: usize, to: usize| {
+    let note = |g: &mut Guards, written: &mut Vec<usize>, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        written.extend(from * BLOCK / PAGE..to * BLOCK / PAGE);
     };
     if set(from, to) {
-        note(g, from, to);
+        note(g, written, from, to);
         return;
     }
     for block in from..to {
         if set(block, block + 1) {
-            note(g, block, block + 1);
+            note(g, written, block, block + 1);
+        } else {
+            g.unmapped.insert(block);
         }
     }
 }
@@ -190,11 +199,12 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
+    let unmapped: Vec<usize> = g.unmapped.range(range).copied().collect();
+    for block in unmapped {
+        g.unmapped.remove(&block);
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -214,17 +224,19 @@ pub fn writing(at: usize, len: usize) {
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded.
+/// shows is new and read-write, so it is no longer guarded (and any cached
+/// unmapped holes in the range must be re-checked).
 pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..(at + len).div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let range = at / BLOCK..(at + len).div_ceil(BLOCK);
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    let unmapped: Vec<usize> = g.unmapped.range(range).copied().collect();
+    for block in unmapped {
+        g.unmapped.remove(&block);
     }
 }
 
@@ -354,14 +366,75 @@ mod tests {
             let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
             file.read(into).is_ok_and(|n| n == 13)
         };
-        assert!(!read(&mut file), "the kernel does not fault into our handler");
+        assert!(
+            !read(&mut file),
+            "the kernel does not fault into our handler"
+        );
         writing(view + 100, 13);
         assert!(read(&mut file));
         // SAFETY: the bytes just read.
-        assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
-        assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) },
+            b"from the disk"
+        );
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
         // SAFETY: our view.
-        unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn unmapped_holes_in_guarded_views_are_cached_until_remapped() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: map a 1-block pagefile view and query across 2 blocks so
+        // the second block is an unmapped hole past the view end.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let mapped_block = view / BLOCK;
+        let hole_block = mapped_block + 1;
+
+        // First call reports only the mapped block and caches the unmapped hole.
+        let first = guard(view, view + 2 * BLOCK).expect("MEM_MAPPED view");
+        assert_eq!(first, vec![mapped_block]);
+        assert!(guards().unmapped.contains(&hole_block));
+
+        // Second call reports zero written pages and does not re-probe the hole.
+        let second = guard(view, view + 2 * BLOCK).expect("MEM_MAPPED view");
+        assert!(second.is_empty());
+
+        // Remapping clears the cached unmapped state.
+        title_memory_remapped(view, 2 * BLOCK);
+        assert!(!guards().unmapped.contains(&hole_block));
+
+        // SAFETY: our mapped view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            );
+        }
     }
 }
