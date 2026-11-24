@@ -105,26 +105,27 @@ impl Heap {
             return None;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let h = self
-            .host
+        // A recorder can take the fast path as soon as the OnceLock is
+        // initialized. Publish only after replaying queued writes (PR #365).
+        self.host
             .get_or_init(|| {
-                host::HostHeap::new(
+                let step = u64::from(increment(self.desc.kind)?);
+                let h = host::HostHeap::new(
                     self.samplers(),
                     self.desc.count,
                     std::ptr::from_ref(self) as usize,
-                )
+                )?;
+                crate::host::check_removed("HostHeap::new/fill_null", self.desc.count);
+                for i in pending.drain(..) {
+                    let v = h.mirror(i, self.start + u64::from(i) * step, false);
+                    crate::host::check_removed(
+                        "Heap::host pending mirror",
+                        format_args!("slot={i} view={v:?}"),
+                    );
+                }
+                Some(h)
             })
-            .as_ref()?;
-        let step = u64::from(increment(self.desc.kind)?);
-        crate::host::check_removed("HostHeap::new/fill_null", self.desc.count);
-        for i in pending.drain(..) {
-            let v = h.mirror(i, self.start + u64::from(i) * step, false);
-            crate::host::check_removed(
-                "Heap::host pending mirror",
-                format_args!("slot={i} view={v:?}"),
-            );
-        }
-        Some(h)
+            .as_ref()
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.

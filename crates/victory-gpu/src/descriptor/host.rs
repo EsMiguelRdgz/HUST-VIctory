@@ -120,12 +120,17 @@ impl HostHeap {
                 })
             }
         };
+        // A view heap reserves `dynamic_slots` dynamic slots plus 1 permanent
+        // null guard slot at the end (`guard_slot = count + dynamic_count`)
+        // so shaders with OOB computed heap indices read null instead of
+        // wrapping onto an unrelated descriptor on NVIDIA GPUs (PR #483).
         let extra = if sampler { 0 } else { dynamic_slots };
-        let desired = requested.saturating_add(extra);
+        let total_extra = if sampler { 0 } else { dynamic_slots + 1 };
+        let desired = requested.saturating_add(total_extra);
         let (heap, count, capped) = match make(desired) {
             Ok(heap) => (heap, requested, false),
-            Err(e) if !sampler && desired > max_views && max_views > extra => {
-                let capped_count = max_views - extra;
+            Err(e) if !sampler && desired > max_views && max_views > total_extra => {
+                let capped_count = max_views - total_extra;
                 tracing::warn!(
                     error = %e,
                     requested,
@@ -155,12 +160,14 @@ impl HostHeap {
     ) -> Option<Self> {
         let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         assert!(host_limit > dynamic_slots);
+        // Allocate 1 extra slot past `host_limit` for the permanent null guard
+        // slot while keeping mirrored+dynamic counts identical to `host_limit`.
         // SAFETY: plain heap creation on the test device.
         let heap = unsafe {
             device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: host_limit,
+                    NumDescriptors: host_limit + 1,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
                 })
@@ -237,10 +244,10 @@ impl HostHeap {
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
-        // used-resource entry names) read a wild address. Every slot starts
-        // null instead.
+        // used-resource entry names) read a wild address. Every slot (including
+        // the trailing guard slot) starts null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + dynamic_count) {
+        if let Err(e) = h.fill_null(kind, slots) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(
@@ -254,6 +261,18 @@ impl HostHeap {
     /// must be remapped into dynamic slots (`count..count + dynamic_count`).
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The slot translated shaders read in place of a computed heap index at
+    /// or past it (an OOB index wraps on NVIDIA GPUs and can hang the device):
+    /// in a view heap its trailing slot after the dynamic range, null from the
+    /// start and never made; in a sampler heap its last slot.
+    pub(crate) fn guard_slot(&self) -> u32 {
+        if self.sampler {
+            self.count.saturating_sub(1)
+        } else {
+            self.count + self.dynamic_count
+        }
     }
 
     #[allow(dead_code)]

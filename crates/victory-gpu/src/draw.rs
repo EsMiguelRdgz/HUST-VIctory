@@ -363,6 +363,23 @@ impl State {
         };
     }
 
+    /// The value of user-data dword `u` of a translated shader: a root
+    /// argument, or a bound heap's guard slot (PR #483).
+    fn user_dword(&self, compute: bool, u: &victory_shader::emit::UserData) -> u32 {
+        let guard = |samplers: bool| {
+            let h = self.heaps[usize::from(samplers)];
+            (h != 0)
+                .then(|| crate::descriptor::heap(h as This).host())
+                .flatten()
+                .map_or(0, |h| h.guard_slot())
+        };
+        match u.root {
+            RootType::ResourceHeap => guard(false),
+            RootType::SamplerHeap => guard(true),
+            _ => self.user_value(compute, u.slot, u.root, u.dword),
+        }
+    }
+
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value.
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
@@ -547,7 +564,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => self.user_dword(compute, u),
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -637,7 +654,7 @@ impl State {
                 .unwrap_or(&[]);
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let title_v = self.user_value(compute, u.slot, u.root, u.dword);
+                let title_v = self.user_dword(compute, u);
                 let host_v = remapped
                     .iter()
                     .find(|m| m.0 == u.slot && u.root == RootType::Table)

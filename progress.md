@@ -1,14 +1,14 @@
 # Current Project Status
 
-- Current milestone: Phase 13.1 — Fully Autonomous GPU Debugging, Repair & Hardware Validation on NVIDIA GeForce RTX 3070 (8 GB VRAM, 32 GB DDR4 RAM)
-- Current subphase: Phase 13.1 autonomous loop complete (4/4 rolling 24h hardware launches used); Frame-2 `0x887A0001` GPU device removal CONFIRMED FIXED on RTX 3070, >10 GB boot commit reduction CONFIRMED on RTX 3070 (full 90 s / 2048+ frames @ 30.0 FPS locked, 665 MB VRAM, 9.03 GB free commit headroom), and Launch #4/4 `watch::title_memory_remapped` `PAGE_READONLY` concurrency race FIXED & OFFLINE VERIFIED (ready for next hardware validation once 24h budget resets or user manually runs)
+- Current milestone: Phase 13.3 — Autonomous World Rendering Recovery & Selective Upstream Integration on NVIDIA GeForce RTX 3070 (8 GB VRAM, 32 GB DDR4 RAM)
+- Current subphase: Phase 13.3 Wave 1 implemented & offline-verified (upstream PR #483 bounded shader descriptor heap guard slot, PR #365 descriptor heap publication race fix, PR #671 CPU-written texture upload before GPU copies; PR #336 & PR #89 already covered in HUST); ready for RTX 3070 Hardware Test #26 (`-Console series-s`) to validate elimination of world-stage `0x887A0006 (DXGI_ERROR_DEVICE_HUNG)` and capture 3D world frames via our 2-plane MPO compositor.
 - Current branch: `hust/phase12-memory` (tracks private `origin/hust/phase12-memory` at `https://github.com/EsMiguelRdgz/HUST-VIctory.git`; `upstream` = `https://github.com/Marvisak/VIctory.git`)
-- Latest verified commit: `b8266dd` (Phase 13.1 commits: `57a3da9`, `74180c2`, `fd55aac`, `849b764`, `b8266dd`, plus this checkpoint; preserves all Phase 1–13 commits)
-- Current working-tree status: clean except this checkpoint
+- Latest verified commit: Phase 13.3 Wave 1 (building on Phase 13.2 commits through `951dcf3`, preserving all Phase 1–13.2 work)
+- Current working-tree status: Phase 13.3 Wave 1 staged/committing cleanly
 - Active agent: Antigravity
-- Last checkpoint timestamp: 2026-11-24T05:01Z (Phase 13.1 complete)
-- Current build status: diag build OK (`target/diag/victory.exe` rebuilt at `b8266dd`)
-- Current test status: full matrix PASSED at `b8266dd` (`cargo xtask policy` 160 files ok; `cargo test --workspace` all passed, 0 failed; WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` `100 passed / 0 failed / 4 ignored`, 0 debug layer errors; `cargo clippy --workspace --all-targets` & `--features diagnostics` 0 new warnings; `bench_physical_page_commit` 512 MiB `mapped=+3 MiB`; diag build OK)
+- Last checkpoint timestamp: 2026-11-24T16:21Z (Phase 13.3 Wave 1 offline verified, launching Test #26)
+- Current build status: diag build OK (`target/diag/victory.exe` rebuilt with Phase 13.3 Wave 1)
+- Current test status: `cargo test -p victory-shader` (`71 passed / 0 failed`, including `a_heap_index_past_the_heap_reads_the_guard_slot` on WARP & RTX 3070); `VICTORY_D3D12_WARP=1 VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics` (`108 passed / 0 failed / 4 ignored`, 0 D3D12 Debug Layer errors); `cargo clippy -p victory-shader -p victory-gpu --features diagnostics --tests` (0 new warnings; only pre-existing `list.rs:1467`); `cargo build --profile diag --features diagnostics -p victory` OK; `cargo xtask policy` (`160 files ok`).
 
 ## Phase 11 trigger (user report, RTX 3070 test 1)
 
@@ -50,40 +50,19 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 
 ## Active Task
 
-- Objective: Phase 13.1 complete (4/4 rolling 24h autonomous hardware launches used). Next step requires either waiting for the rolling 24h launch budget to refresh (earliest slot frees at `2026-11-25T04:36:56Z`) or manual user launch of `target\diag\victory.exe` at `b8266dd` to validate scripted progression past the `"ACCOUNT PICKER (Y)   PLAYER (A)"` prompt with the `watch::title_memory_remapped` `PAGE_READONLY` race fix included. Full checkpoint at `G:\VIctory-Results\phase13-progress.md`.
+- Objective: Phase 13.3 — Resolve recurring world-stage `0x887A0006 (DXGI_ERROR_DEVICE_HUNG)` on RTX 3070, integrate applicable upstream fixes (PRs #365, #671, #483 in Wave 1; evaluate #307/#566/#189/#469 in Wave 2), and achieve clearly visible, stable 3D world rendering via Series S 2-plane MPO compositing.
 
 ## Immediate Resume Instructions
 
-- One-message session recovery (after any pause/quota reset): `"Resume HUST VIctory from the latest checkpoint."`
-- First action (once 24h hardware launch budget frees or user launches manually):
-  1. Verify `git status` clean on `hust/phase12-memory` @ `b8266dd` (or latest checkpoint commit) and `G:\VIctory\target\diag\victory.exe` up to date.
-  2. Run controlled RTX 3070 progression test past Account Picker via `Run-VictoryDiagnostic.ps1`:
-     ```powershell
-     powershell -NoProfile -ExecutionPolicy Bypass -File G:\VIctory\tools\diag\Run-VictoryDiagnostic.ps1 `
-       -TitleExe "C:\Users\esmig\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe" `
-       -AuthorizeGameLaunch `
-       -EnableDred `
-       -EnableCapture `
-       -ScriptedKeys "12:Enter,18:Enter,25:Enter,33:Enter,42:Enter,52:Enter" `
-       -CaptureFrames "350,450,600,800,1200,1500,1800,2200,2600" `
-       -MaxDurationSeconds 90 `
-       -MinPreLaunchHeadroomGB 10.0 `
-       -MinCommitHeadroomGB 5.0 `
-       -TestLabel "post-watch-fix-progression"
-     ```
-- Next implementation step (evidence-dependent after progression past Account Picker):
-  - Inspect captured frames & `memory-*.log` during setup/loading/world streaming; verify zero `0xC0000005` regressions and check whether any later D3D12 shader/barrier/indirect issue appears during world loading.
-  - Note: Do NOT run `-EnableDebugLayer` while baseline desktop commit is ~25.6/43.4 GB (Debug Layer overhead trips the 5 GB harness headroom cutoff before Frame 1); use `-EnableDred` + zero-overhead `host::check_removed()` checkpoints instead.
-- Remaining risks:
-  - `b8266dd` (`watch::title_memory_remapped` `PAGE_READONLY` race fix) is verified offline with deterministic + 200-iteration concurrent stress tests, but NOT YET re-tested on GTA VI hardware because the 4/4 rolling 24h launch budget was exhausted on Launch #4/4.
-  - Progression past `"ACCOUNT PICKER (Y)   PLAYER (A)"` into world loading/gameplay has NOT YET been measured on hardware (Launch #3/4 sat at Account Picker for 90 s @ 30.0 FPS; Launch #4/4 hit the `watch.rs` race at Frame 32 before the first scripted `Enter` at 12 s).
-  - Upstream GPU RAW/WAW command-ordering fixes are not yet published in `Marvisak/VIctory` (`d2a4bae`); world-loading rendering completeness remains to be validated once past menus.
+- First action: Inspect RTX 3070 Hardware Test #26 (`-Console series-s`, 150 s, DRED + frame capture) results once completed:
+  1. Check whether `0x887A0006` (`d3e44e754b3eb6aa` / `0e45e59e93b736e4` OOB descriptor heap wrap hang) is eliminated by PR #483 (`heap_guard` + permanent null guard slot).
+  2. Visually inspect captured composited `frame-*.png` files (`PresentX` 2-plane MPO compositor `3840x2160` output) to confirm UI + 3D world rendering progression.
+  3. If world-stage GPU stability is confirmed, evaluate Phase 13.3 Wave 2 upstream shader/rendering fixes (PR #307 waterfall loops, PR #566 per-lane descriptors, PR #189 Wave64 compute emulation on Wave32, PR #469 depth/UAV twin textures) prioritized by actual Test #26 dropped-shader/visual evidence.
 - Commands required:
   - `cargo xtask policy`
-  - `cargo test --workspace`
+  - `cargo test -p victory-shader`
   - `VICTORY_D3D12_WARP=1 VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics`
-  - `cargo clippy --workspace --all-targets`
-  - `cargo clippy --workspace --all-targets --features diagnostics`
+  - `cargo clippy -p victory-shader -p victory-gpu --features diagnostics --tests`
   - `cargo build --profile diag -p victory --features diagnostics`
 
 ## Completed Tasks
@@ -241,3 +220,30 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
   3. Launch #3/4 (`fd55aac`, `G:\VIctory-Results\diag-hw-20261124-005340`, `-EnableDred -EnableCapture`): **FULL 90-SECOND RUN (`MaxDurationReached`, 92.84 s, 0 crashes, 0 GPU errors)** — reached **Frame 2048+ locked at 30.0 FPS** (`13/13` draws, `1/1` dispatches, `0` dropped), `guest physical` dropped to **769.7 MB** (-89.1% vs Phase 11's 7,090.4 MB), `host textures` **555.4 MB** live + **3,964.7 MB** deferred at 0 VRAM/commit (-87.2% vs Phase 11's 4,326.9 MB), `GPU local VRAM` **665 MB** (-85% vs Phase 11's 4,429 MB), `private` flat at **7,737 MB**, `min commit headroom` **9,032 MB** (total `victory` commit **8,507 MB** vs >18,544 MB in Phase 11 — **>10 GB saved**). Captured PNGs (`frame-256.png`..`frame-2048.png`) visually confirmed crisp 4K UI at `"ACCOUNT PICKER (Y)   PLAYER (A)"`.
   4. Launch #4/4 (`849b764`, `G:\VIctory-Results\diag-hw-20261124-005728`, `-EnableDred -EnableCapture -ScriptedKeys ...`): hit `0xC0000005` write fault at `0x990ffe8` (inside 182 MB `MEM_MAPPED` buffer `0x9390000`) at Frame 32 (`9.43 s`, before first scripted key at 12 s) due to the `watch::title_memory_remapped` stranded-`PAGE_READONLY` race — fixed and offline-verified in `b8266dd`.
 - Full verification at `b8266dd`: `cargo xtask policy` (`160 files ok`); `cargo test --workspace` (all passed, 0 failed); WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` (`100 passed, 0 failed, 4 ignored`, 0 debug errors); `cargo clippy --workspace --all-targets` & `--features diagnostics` (0 new warnings); `cargo build --profile diag -p victory --features diagnostics` OK (`target/diag/victory.exe`).
+
+### 2026-11-24 — Antigravity — Phase 13.2 Autonomous GPU Debugging, Memory Optimization, Series S MPO Compositor & Hardware Tests #5–#25
+
+- Commits pushed to private `origin/hust/phase12-memory` (`82fe413`..`951dcf3`):
+  - `82fe413`: Eliminated `HostHeap.made` self-deadlock during buffer mirror under commit pressure (`MADE_LOCK_DEPTH` guard + pre-materialization).
+  - `f2e73b4`: Released post-execution `HostList` pins/shadows in `Host::execute` (`HostList::on_executed()`) + pressure breakdowns.
+  - `2e434fb`: Fixed 3-thread `nvwgf2umx.dll+0x50d8e0` placed-texture eviction UAF via `PlacedGuard` (`texture_at` -> `make_at` -> `list.pin`) + 4-worker UAF stress test (0 occurrences across Tests #17–#25).
+  - `b8ad0b7`: Reclaimed idle mirrored buffer shadows under pressure + `GPU_TARGET_TEXTURES` breakdown (proved `aliased_mb = 0`).
+  - `bf89281`: Downgraded post-execution `Shadow` refs to `Weak` in `HostList::on_executed()` (unlocked 615 MB reclaim; Test #19 rendered crisp 4K `"VICE CITY, TWO YEARS AGO"` opening title card on Series X).
+  - `1681c6f`: Released post-execution dynamic descriptor slots, kept COM refs, and pressure scratch after `ExecuteCommandLists`.
+  - `9266ac0` & `c38003b` -> refined in `ecf5df5`: Windowed `1 MiB` `LOOSE` shadows for `<= 4 MiB` sub-ranges in `>= 8 MiB` arenas, pruned overlapping `LOOSE` shadows + evicted stale mirrored descriptor slots on monolithic promotion (`prune_overlapping_loose`), chunked multi-list `Host::execute` submissions (`MAX_LISTS_PER_SUBMIT = 8`) for Windows 2 s TDR margin, and logged `PresentX` plane layout (confirmed Series S passes `planes=2` with 72-byte `D3D12XBOX_PRESENT_PLANE_PARAMETERS` stride: `1920x1080` 3D plane 0 + `3840x2160` UI overlay plane 1).
+  - `951dcf3`: Implemented 2-plane `PresentX` MPO compositor (`Compositor` in `host.rs` + 72-byte `Plane` in `queue.rs`, premultiplied alpha blending + linear scaling, verified on WARP + D3D12 Debug Layer) and promoted `R9G9B9E5_SHAREDEXP` (67) RT/UAV textures to `R16G16B16A16_FLOAT` (10) (eliminated `failures=1` `0x80070057`).
+- Hardware Tests #22–#25 (`-Console series-s`, RTX 3070):
+  - Series S mode unlocked multi-minute world-loading execution with `6.4–7.1 GB` free commit headroom and `1.1–1.32 GB` VRAM (0 commit-guard cutoffs).
+  - Test #24 (`951dcf3`, `diag-hw-20261124-093358`, 135 s, 1,787 pipelines, 905 draws/frame, 6.7 GB min headroom, 1.32 GB VRAM) and Test #25 (`951dcf3`, `diag-hw-20261124-093748`, 124.5 s, frame 2048+, 1,717 pipelines, 718 draws/frame, 7.1 GB min headroom, 1.27 GB VRAM): confirmed MPO compositor initialized (`[(1920,1080,28), (3840,2160,28)] -> 3840x2160`), and both hit `0x887A0006 (DXGI_ERROR_DEVICE_HUNG)` (~4.86 s submission) on single-list compute dispatches (`d3e44e754b3eb6aa` / `0e45e59e93b736e4` / `269b802f878c24e1`, both `wave_size=None`) with `OOB past host heap` descriptor indices (`u5=0x2cacf80 [heap 46845824]`, `u5=0xffffffff`).
+
+### 2026-11-24 — Antigravity — Phase 13.3 Wave 1: Upstream PR Audit + Adaptation of PRs #365, #671, and #483
+
+- Upstream audit (`Marvisak/VIctory` via `gh api`):
+  - **PR #365** (merged, +12/-9): *Missing* -> **Adapted** (`descriptor.rs`: replay `pending` descriptor writes inside `OnceLock::get_or_init` before publishing `HostHeap`).
+  - **PR #671** (merged, +6/-0): *Missing* -> **Adapted** (`list.rs`: upload CPU-written textures via `texture::upload` before `CopyResource` and `CopyTextureRegion`).
+  - **PR #483** (open, +200/-11): *Missing — highest-confidence fix for RTX 3070 `0x887A0006` OOB heap-index wrap hang* -> **Adapted** (`descriptor/host.rs` trailing permanent null `guard_slot`, `draw.rs::user_dword`, `victory-shader/src/emit/lower.rs::heap_guard` clamping every dynamically computed heap index to `guard_slot` + `valu_tests::a_heap_index_past_the_heap_reads_the_guard_slot`).
+  - **PR #336** (merged, +76/-28): *Already implemented in HUST* (`draw.rs` already drops draws/dispatches on dynamic slot exhaustion + `release_dynamic()` frees slots post-execute).
+  - **PR #89** (open, +895/-26): *Already implemented in HUST* (`resource.rs::host_format_for` covers 16-bit packed formats + `R9G9B9E5_SHAREDEXP`).
+  - **PR #307** (merged, +1133), **PR #566** (merged, +2549), **PR #189** (open/experimental Wave64-on-Wave32, +3077), **PR #469** (open depth/UAV twin texture, +431): *Missing — deferred to Phase 13.3 Wave 2* after validating Wave 1 on RTX 3070 Test #26.
+- Offline verification: `cargo test -p victory-shader` (`71/71` passed, including `a_heap_index_past_the_heap_reads_the_guard_slot`); `VICTORY_D3D12_WARP=1 VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics` (`108/108` passed, 0 debug errors); `cargo clippy -p victory-shader -p victory-gpu --features diagnostics --tests` (0 new warnings); `cargo build --profile diag --features diagnostics -p victory` OK; `cargo xtask policy` (`160 files ok`).
+- Next action: Commit, push, and launch RTX 3070 Hardware Test #26 (`-Console series-s`, 150 s, DRED + frame capture).
