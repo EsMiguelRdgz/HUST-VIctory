@@ -977,10 +977,10 @@ pub(crate) fn has_populated_title_data(this: This) -> bool {
 }
 
 /// Runs `f` while no host GPU submission is executing (`Host::with_gpu_idle`),
-/// or directly if no host GPU device has been created.
+/// or directly if no host GPU device has been created yet.
 #[cfg(windows)]
 fn with_host_gpu_idle<R>(f: impl FnOnce() -> R) -> R {
-    match crate::host::host() {
+    match crate::host::existing_host() {
         Some(h) => h.with_gpu_idle(f),
         None => f(),
     }
@@ -1609,6 +1609,13 @@ fn release_placed_entry(res: usize, host_bytes: u64) -> u64 {
 /// bytes freed.
 #[cfg(windows)]
 fn drain_retired_placed() -> u64 {
+    if RETIRED_PLACED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+    {
+        return 0;
+    }
     with_host_gpu_idle(|| {
         let mut retired = RETIRED_PLACED.lock().unwrap_or_else(|e| e.into_inner());
         let mut ready = Vec::new();

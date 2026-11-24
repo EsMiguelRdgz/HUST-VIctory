@@ -409,10 +409,17 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
+/// Returns the host GPU only if it has already been initialized, without
+/// triggering lazy D3D12 device creation (for memory-remap / eviction guards).
+pub(crate) fn existing_host() -> Option<&'static Host> {
+    HOST.get().and_then(Option::as_ref)
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(made) => {
             crate::memstat::start_monitor(

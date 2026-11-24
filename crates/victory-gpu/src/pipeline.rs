@@ -180,11 +180,10 @@ struct Pipeline {
     shaders: Vec<Arc<Shader>>,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
-    /// The rest of a stream's graphics state, for the host pipeline.
+    /// What its host pipeline is made from, and the host pipeline once made
+    /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
-    graphics: Option<Box<host::GraphicsState>>,
-    #[cfg(windows)]
-    host: OnceLock<Option<host::HostPipeline>>,
+    host: Arc<make::Pending>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -212,17 +211,22 @@ pub(crate) fn bound(this: This) {
     }
 }
 
-/// The host pipeline of a title pipeline, made on first use; `None` if one
-/// of its shaders does not translate or the host refuses it.
+/// The host pipeline of a title pipeline; `None` if one of its shaders does
+/// not translate, the host refuses it, or it is still being made (its first
+/// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    let p = pipeline(this);
-    p.host
-        .get_or_init(|| host::HostPipeline::new(&p.shaders, p.graphics.as_deref()))
-        .as_ref()
+    make::ready(&pipeline(this).host)
+}
+
+/// Host pipelines queued and not made yet.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn making() -> u64 {
+    make::waiting()
 }
 
 /// The stage's container, if it has one.
@@ -243,15 +247,17 @@ fn hand_out(
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    #[cfg(windows)]
+    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    #[cfg(windows)]
+    make::early(&host);
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
+        #[cfg(windows)]
+        host,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
-        #[cfg(windows)]
-        graphics,
-        #[cfg(windows)]
-        host: OnceLock::new(),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
@@ -419,6 +425,23 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod library;
+#[cfg(windows)]
+mod make;
+
+/// Keeps compiled host pipelines, and the list of title pipelines to start
+/// early, in `dir` (a folder of the cache) across runs.
+#[cfg(windows)]
+pub fn use_pipeline_cache(dir: std::path::PathBuf) {
+    library::use_pipeline_cache(dir);
+}
+
+/// Saves the pipeline cache now if anything was added (at the end of a run).
+#[cfg(windows)]
+pub fn save_pipeline_cache() {
+    library::save(true);
+}
 
 #[cfg(test)]
 mod tests {
@@ -546,7 +569,7 @@ mod tests {
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
-            let g = pipeline(p).graphics.as_deref().unwrap();
+            let g = pipeline(p).host.graphics.as_deref().unwrap();
             assert_eq!(g.topology.0, 3);
             assert_eq!(
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
