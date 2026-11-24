@@ -490,6 +490,63 @@ impl HostHeap {
         };
     }
 
+    /// Counts mirrored (`slot < self.count`) buffer-shadow references held by
+    /// this heap's `owners` map into `counts`, keyed by `Arc::as_ptr(s) as usize`.
+    /// Returns `false` if an open bindless command list currently pins this heap
+    /// (in which case callers must not evict buffer descriptors from it).
+    pub(crate) fn count_mirrored_buffers(
+        &self,
+        counts: &mut std::collections::HashMap<usize, usize>,
+    ) -> bool {
+        if self.sampler {
+            return true;
+        }
+        if Arc::strong_count(&self.bindless_guard) > 1 {
+            return false;
+        }
+        let owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        for (&slot, shadow) in owners.iter() {
+            if slot < self.count {
+                *counts.entry(Arc::as_ptr(shadow) as usize).or_insert(0) += 1;
+            }
+        }
+        true
+    }
+
+    /// Evicts mirrored (`slot < self.count`) buffer descriptors whose shadow
+    /// pointer is in `targets`: resets `made[slot] = 0`, writes a NULL view,
+    /// and drops this heap's `Arc<Shadow>` reference (outside heap locks).
+    /// Never touches dynamic slots (`slot >= self.count`) or heaps pinned by an
+    /// active bindless list. Returns the number of evicted descriptor slots.
+    pub(crate) fn evict_buffers(&self, targets: &std::collections::HashSet<usize>) -> usize {
+        if self.sampler || targets.is_empty() || Arc::strong_count(&self.bindless_guard) > 1 {
+            return 0;
+        }
+        let mut dropped: Vec<Arc<Shadow>> = Vec::new();
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let _depth = MadeDepthGuard::enter();
+            let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+            let slots: Vec<u32> = owners
+                .iter()
+                .filter_map(|(&slot, shadow)| {
+                    (slot < self.count && targets.contains(&(Arc::as_ptr(shadow) as usize)))
+                        .then_some(slot)
+                })
+                .collect();
+            for slot in slots {
+                if let Some(shadow) = owners.remove(&slot) {
+                    dropped.push(shadow);
+                }
+                made[slot as usize] = 0;
+                null_view_on(&self.device, self.cpu(slot));
+            }
+        }
+        let count = dropped.len();
+        drop(dropped);
+        count
+    }
+
     /// Re-nulls every slot pointing to `resource` (optionally restricted to
     /// slots holding the exact evicted host `ID3D12Resource` pointer
     /// `only_host_ptr`), writing a type- and dimension-compatible NULL

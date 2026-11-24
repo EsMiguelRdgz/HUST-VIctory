@@ -1378,6 +1378,11 @@ fn hand_out_resource_inner(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(at);
+        } else if (desc.flags & 0x7) != 0 {
+            GPU_TARGET_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(at);
         }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
@@ -1389,6 +1394,10 @@ impl Drop for Resource {
         let at = std::ptr::from_ref::<Resource>(self) as usize;
         if self.desc.dimension != BUFFER {
             TITLE_WRITTEN_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&at);
+            GPU_TARGET_TEXTURES
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&at);
@@ -1564,6 +1573,13 @@ pub(crate) extern "system" fn create_at_address(
 /// holds their authoritative pixels.
 #[cfg(windows)]
 static TITLE_WRITTEN_TEXTURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Live GPU-written textures (`flags & 0x7 != 0`: RT, DSV, UAV), tracked for
+/// pressure diagnostics (aliasing overlap, staleness, top allocations).
+#[cfg(windows)]
+static GPU_TARGET_TEXTURES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::LazyLock::new(Default::default);
 
@@ -1754,19 +1770,20 @@ pub(crate) fn on_title_memory_remapped(at: u64, len: u64) {
 #[cfg(windows)]
 pub(crate) fn evict_idle_textures(incoming: u64) -> u64 {
     use windows::core::Interface;
-    let (placed_live_bytes, placed_pinned_bytes) = {
+    let (placed_live_bytes, placed_list_pinned_bytes, placed_bindless_pinned_bytes) = {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         let mut live = 0u64;
-        let mut pinned = 0u64;
+        let mut list_pin = 0u64;
+        let mut bindless_pin = 0u64;
         for e in map.values() {
             live += e.host_bytes;
-            if std::sync::Arc::strong_count(&resource(e.resource as This).list_guard) != 1
-                || crate::descriptor::is_texture_pinned_by_bindless(e.resource)
-            {
-                pinned += e.host_bytes;
+            if std::sync::Arc::strong_count(&resource(e.resource as This).list_guard) != 1 {
+                list_pin += e.host_bytes;
+            } else if crate::descriptor::is_texture_pinned_by_bindless(e.resource) {
+                bindless_pin += e.host_bytes;
             }
         }
-        (live, pinned)
+        (live, list_pin, bindless_pin)
     };
     let placed_freed = reclaim_placed_textures(0);
     let mut freed = placed_freed;
@@ -1885,7 +1902,8 @@ pub(crate) fn evict_idle_textures(incoming: u64) -> u64 {
             total_mb = mib(total_host_tex),
             gpu_targets_mb = mib(gpu_targets),
             placed_mb = mib(placed_live_bytes),
-            placed_pinned_mb = mib(placed_pinned_bytes),
+            placed_list_pin_mb = mib(placed_list_pinned_bytes),
+            placed_bindless_pin_mb = mib(placed_bindless_pinned_bytes),
             placed_freed_mb = mib(placed_freed),
             title_mb = mib(title_live_bytes),
             title_list_pin_mb = mib(title_list_pinned),
@@ -1894,8 +1912,101 @@ pub(crate) fn evict_idle_textures(incoming: u64) -> u64 {
             title_freed_mb = mib(title_freed),
             "texture eviction breakdown"
         );
+        log_gpu_targets_breakdown();
     }
     freed
+}
+
+/// Logs a concise diagnostic breakdown of live GPU-target textures (RT/DSV/UAV):
+/// total MB, aliased address-overlap MB, RT/DSV/UAV split, idle/stale MB, and
+/// the 5 largest textures. Runs only during commit-pressure relief.
+#[cfg(windows)]
+fn log_gpu_targets_breakdown() {
+    let now_tick = TEXTURE_TICK.load(std::sync::atomic::Ordering::Relaxed);
+    let mut entries: Vec<(u64, u64, u64, u32, u64, u32, u32, u64, bool)> = Vec::new();
+    {
+        let set = GPU_TARGET_TEXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for &res in set.iter() {
+            let r = resource(res as This);
+            if !r.host_live.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            let bytes = r
+                .host
+                .try_lock()
+                .map(|s| s.bytes)
+                .unwrap_or_else(|_| footprint(&r.desc).map_or(KIB_64, |i| i.size));
+            let addr = r.data() as u64;
+            let span = footprint(&r.desc).map_or(bytes, |i| i.size).max(1);
+            let last = r.last_used.load(std::sync::atomic::Ordering::Relaxed);
+            let idle = std::sync::Arc::strong_count(&r.list_guard) == 1;
+            entries.push((
+                addr,
+                addr.saturating_add(span),
+                bytes,
+                r.desc.flags,
+                r.desc.width,
+                r.desc.height,
+                r.desc.format,
+                last,
+                idle,
+            ));
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    // Sort by title address to compute overlapping (aliased) footprint bytes.
+    entries.sort_unstable_by_key(|e| (e.0, e.1));
+    let mut max_end = 0u64;
+    let mut aliased_bytes = 0u64;
+    let (mut rt_b, mut dsv_b, mut uav_b, mut stale_b, mut live_b) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for &(start, end, bytes, flags, _, _, _, last, idle) in &entries {
+        live_b += bytes;
+        if flags & 1 != 0 {
+            rt_b += bytes;
+        }
+        if flags & 2 != 0 {
+            dsv_b += bytes;
+        }
+        if flags & 4 != 0 {
+            uav_b += bytes;
+        }
+        if idle && now_tick.saturating_sub(last) > 1000 {
+            stale_b += bytes;
+        }
+        if start != 0 && start < max_end {
+            aliased_bytes += bytes;
+        }
+        if start != 0 && end > max_end {
+            max_end = end;
+        }
+    }
+    entries.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+    let top5: Vec<String> = entries
+        .iter()
+        .take(5)
+        .map(|&(addr, _, bytes, flags, w, h, fmt, _, _)| {
+            format!(
+                "{w}x{h} f{fmt} fl{flags:#x} @{addr:#x} {}MB",
+                bytes / (1 << 20)
+            )
+        })
+        .collect();
+    let mib = |b: u64| b / (1 << 20);
+    tracing::info!(
+        count = entries.len(),
+        live_mb = mib(live_b),
+        aliased_mb = mib(aliased_bytes),
+        rt_mb = mib(rt_b),
+        dsv_mb = mib(dsv_b),
+        uav_mb = mib(uav_b),
+        stale_mb = mib(stale_b),
+        ?top5,
+        "gpu targets breakdown"
+    );
 }
 
 /// Live reference to a placed texture returned by [`texture_at`]. Holds a clone

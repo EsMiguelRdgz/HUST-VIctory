@@ -732,9 +732,13 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        // Prepare & pin the resource/shadow on `list` BEFORE mirroring into
+        // `HostHeap`, closing any window where concurrent pressure relief could
+        // evict the mirrored slot between `mirror` and `readable`.
+        if let Some(view) = crate::descriptor::view(handle) {
             readable(list, u, &view);
         }
+        let _ = host.mirror(index, handle, true);
     }
 
     /// The descriptors a shader reads through tables. Tables holding a

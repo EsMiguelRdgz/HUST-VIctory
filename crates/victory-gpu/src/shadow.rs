@@ -637,8 +637,8 @@ const WINDOW: u64 = 1 << 20;
 /// recently used first, before another is made. Freeing is safe: such a
 /// copy holds nothing title memory does not (shader writes went back), and
 /// a later use makes and fills a new one.
-const LOOSE_BUDGET: u64 = 128 << 20;
-const ALIGNED_BUDGET: u64 = 64 << 20;
+const LOOSE_BUDGET: u64 = 64 << 20;
+const ALIGNED_BUDGET: u64 = 32 << 20;
 
 /// Frees least recently used copies in `map` that nothing else holds until
 /// `live` bytes (of the map's kind) plus `incoming` fit in `budget`.
@@ -681,14 +681,18 @@ fn reclaim(
     freed
 }
 
-/// Frees idle buffer-object host copies (`BUFFERS`) that no list, descriptor
-/// slot, or pending GPU write currently holds, oldest-used first. Title memory
-/// remains authoritative, so a later `find()` cleanly recreates and refreshes
-/// the copy. Returns bytes freed.
+/// Frees idle buffer-object host copies (`BUFFERS`) that no list, dynamic
+/// descriptor slot, or pending GPU write currently holds, oldest-used first.
+/// Under pressure, also evicts idle buffer shadows held solely by mirrored
+/// shader-visible descriptor slots (`strong_count == 1 + mirrored_refs`, when
+/// no bindless list is active and the host GPU is idle), resetting those slots
+/// so the next draw cleanly recreates and refreshes the copy from title memory.
+/// Returns bytes freed.
 fn reclaim_buffers(incoming: u64) -> u64 {
     let mut dropped: Vec<Arc<Shadow>> = Vec::new();
     let mut freed = 0u64;
-    let (mut live_bytes, mut busy_bytes, mut pending_bytes) = (0u64, 0u64, 0u64);
+    let (mut live_bytes, mut list_held_bytes, mut heap_only_bytes, mut pending_bytes) =
+        (0u64, 0u64, 0u64, 0u64);
     {
         let mut map = buffers();
         let mut idle: Vec<(u64, (u64, usize), u64)> = map
@@ -708,7 +712,6 @@ fn reclaim_buffers(incoming: u64) -> u64 {
                 if Arc::strong_count(s) == 1 {
                     Some((s.used.load(Ordering::Relaxed), key, s.bytes))
                 } else {
-                    busy_bytes += s.bytes;
                     None
                 }
             })
@@ -728,13 +731,98 @@ fn reclaim_buffers(incoming: u64) -> u64 {
         }
     }
     drop(dropped);
+
+    // Pass 2: reclaim idle buffer shadows held ONLY by `BUFFERS` + mirrored
+    // shader-visible descriptor slots (`slot < count`), with zero open command
+    // lists or dynamic slots holding them.
+    if !crate::descriptor::in_heap_made_lock()
+        && let Some(host_gpu) = host()
+    {
+        let mut heap_dropped: Vec<Arc<Shadow>> = Vec::new();
+        host_gpu.with_gpu_idle(|| {
+            let (mirrored_counts, bindless_active) = crate::descriptor::mirrored_buffer_counts();
+            let mut candidates: Vec<(u64, (u64, usize), usize, u64)> = Vec::new();
+            {
+                let map = buffers();
+                for (&key, entry) in map.iter() {
+                    let Some(s) = entry.shadow.as_ref() else {
+                        continue;
+                    };
+                    let has_pending = !s
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty();
+                    if has_pending {
+                        continue;
+                    }
+                    let sc = Arc::strong_count(s);
+                    let ptr = Arc::as_ptr(s) as usize;
+                    let m = mirrored_counts.get(&ptr).copied().unwrap_or(0);
+                    if m > 0 && sc == 1 + m {
+                        heap_only_bytes += s.bytes;
+                        if !bindless_active {
+                            candidates.push((s.used.load(Ordering::Relaxed), key, ptr, s.bytes));
+                        }
+                    } else if sc > 1 {
+                        list_held_bytes += s.bytes;
+                    }
+                }
+            }
+            if bindless_active || candidates.is_empty() || (incoming > 0 && freed >= incoming) {
+                return;
+            }
+            candidates.sort_unstable_by_key(|c| c.0);
+            let mut target_ptrs = std::collections::HashSet::new();
+            let mut planned = 0u64;
+            let want = if incoming == 0 {
+                u64::MAX
+            } else {
+                incoming.saturating_sub(freed)
+            };
+            for &(_, _, ptr, bytes) in &candidates {
+                if planned >= want {
+                    break;
+                }
+                target_ptrs.insert(ptr);
+                planned = planned.saturating_add(bytes);
+            }
+            let _ = crate::descriptor::evict_buffer_slots(&target_ptrs);
+            let mut map = buffers();
+            for (_, key, ptr, bytes) in candidates {
+                if !target_ptrs.contains(&ptr) {
+                    continue;
+                }
+                if incoming > 0 && freed >= incoming {
+                    break;
+                }
+                if let Some(entry) = map.get_mut(&key)
+                    && let Some(s) = entry.shadow.as_ref()
+                    && Arc::as_ptr(s) as usize == ptr
+                    && Arc::strong_count(s) == 1
+                    && s.pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                    && let Some(shadow) = entry.shadow.take()
+                {
+                    heap_dropped.push(shadow);
+                    freed += bytes;
+                    memstat::count(memstat::Event::Reclaimed, 1);
+                }
+            }
+        });
+        drop(heap_dropped);
+    }
+
     if freed > 0 {
         memstat::count(memstat::Event::ReclaimedBytes, freed);
     }
     if live_bytes > 0 {
         tracing::info!(
             live_mb = live_bytes / (1 << 20),
-            busy_mb = busy_bytes / (1 << 20),
+            heap_only_mb = heap_only_bytes / (1 << 20),
+            list_held_mb = list_held_bytes / (1 << 20),
             pending_mb = pending_bytes / (1 << 20),
             freed_mb = freed / (1 << 20),
             "buffer shadow pressure breakdown"
@@ -1547,5 +1635,112 @@ mod tests {
         }
         unregister(fake_id, base as u64);
         let _ = host_gpu;
+    }
+
+    /// Idle buffer shadows held solely by `BUFFERS` + mirrored shader-visible
+    /// `HostHeap.owners` slots (`strong_count == 1 + mirrored_refs`) are
+    /// evicted under pressure and cleanly recreated/re-mirrored on next draw,
+    /// while shadows also held by an open list stay untouched.
+    #[test]
+    fn idle_mirrored_buffer_shadow_evicts_and_remirrors_cleanly() {
+        use crate::object::{S_OK, This, slot};
+        type Release = extern "system" fn(This) -> u32;
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let mut sheap: This = std::ptr::null();
+        let hdesc = [0u32, 16, 1, 0]; // CBV_SRV_UAV, 16 slots, SHADER_VISIBLE
+        assert_eq!(
+            crate::descriptor::create_heap(null, hdesc.as_ptr().cast(), &heap_iid, &mut sheap),
+            S_OK
+        );
+        let start = slot::<extern "system" fn(This) -> u64>(sheap, 0x48)(sheap);
+
+        let mut idle_mem = vec![0x77u8; 256 << 10];
+        let mut busy_mem = vec![0x88u8; 256 << 10];
+        let idle_addr = idle_mem.as_mut_ptr() as u64;
+        let busy_addr = busy_mem.as_mut_ptr() as u64;
+        let idle_id = (idle_addr as usize) ^ 0x5555_6666;
+        let busy_id = (busy_addr as usize) ^ 0x7777_8888;
+        register(idle_id, idle_addr, idle_mem.len() as u64);
+        register(busy_id, busy_addr, busy_mem.len() as u64);
+
+        // Create raw-buffer Placed SRV views in slots 0 and 1 of the shader-visible heap.
+        let make_srv_view = |addr: u64, len: u64, slot_idx: u64| {
+            let mut res_words = [0u32; 14];
+            res_words[0] = 1; // BUFFER
+            res_words[4] = len as u32;
+            res_words[5] = (len >> 32) as u32;
+            let mut srv_words = [0u32; 16];
+            srv_words[0] = 39; // DXGI_FORMAT_R32_TYPELESS
+            srv_words[1] = 1; // D3D12_SRV_DIMENSION_BUFFER
+            srv_words[2] = 0x1688;
+            srv_words[6] = (len / 4) as u32; // NumElements
+            srv_words[8] = 1; // D3D12_BUFFER_SRV_FLAG_RAW
+            srv_words[10] = addr as u32;
+            srv_words[11] = (addr >> 32) as u32;
+            let handle = start + slot_idx * 32;
+            crate::descriptor::create_placed_srv(
+                null,
+                res_words.as_ptr().cast(),
+                srv_words.as_ptr().cast(),
+                handle,
+            );
+            handle
+        };
+        let h0 = make_srv_view(idle_addr, idle_mem.len() as u64, 0);
+        let h1 = make_srv_view(busy_addr, busy_mem.len() as u64, 1);
+
+        // Mirror both slots as draws do (`for_draw = true`), putting both into `HostHeap.owners`.
+        let host_heap = crate::descriptor::host_heap_for_test(sheap);
+        assert!(host_heap.mirror(0, h0, true).is_some());
+        assert!(host_heap.mirror(1, h1, true).is_some());
+
+        // Hold an extra `Arc<Shadow>` on `busy` (simulating an open command list).
+        let busy_arc = find(busy_addr, busy_mem.len() as u64).expect("busy shadow");
+        let idle_weak = Arc::downgrade(&find(idle_addr, idle_mem.len() as u64).expect("idle"));
+        assert_eq!(
+            Arc::strong_count(&idle_weak.upgrade().unwrap()),
+            3 // BUFFERS + HostHeap.owners + this temp upgrade
+        );
+
+        let freed = reclaim_buffers(0);
+        assert!(
+            freed >= 256 << 10,
+            "idle mirrored buffer shadow must be evicted: freed={freed}"
+        );
+        assert!(
+            idle_weak.upgrade().is_none(),
+            "idle mirrored buffer shadow must be dropped"
+        );
+        assert_eq!(
+            Arc::strong_count(&busy_arc),
+            3,
+            "busy buffer shadow held by open list + heap must stay live"
+        );
+
+        // Next draw re-mirrors slot 0 cleanly and recreates the shadow.
+        assert!(host_heap.mirror(0, h0, true).is_some());
+        let remade = find(idle_addr, idle_mem.len() as u64).expect("remade shadow");
+        assert!(remade.update(idle_addr as usize, 4096) >= 4096);
+        // SAFETY: `[0, 4096)` lies inside the shadow mapping.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(remade.data, 8) },
+            &[0x77u8; 8]
+        );
+
+        drop(remade);
+        drop(busy_arc);
+        unregister(idle_id, idle_addr);
+        unregister(busy_id, busy_addr);
+        assert_eq!(slot::<Release>(sheap, 0x10)(sheap), 0);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 }

@@ -630,6 +630,55 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn host_heap_for_test<'a>(heap: This) -> &'a host::HostHeap {
+    // SAFETY: `heap` is a live `Heap` created by `create_heap` in tests.
+    unsafe { &*heap.cast::<Heap>() }
+        .host()
+        .expect("shader-visible host heap")
+}
+
+/// Counts mirrored (`slot < count`) buffer-shadow references across all
+/// shader-visible view heaps, keyed by `Arc::as_ptr(shadow) as usize`.
+/// Returns `(counts, any_bindless_active)`.
+#[cfg(windows)]
+pub(crate) fn mirrored_buffer_counts() -> (std::collections::HashMap<usize, usize>, bool) {
+    let mut counts = std::collections::HashMap::new();
+    let mut bindless_active = false;
+    let list = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in list.iter() {
+        // SAFETY: registered heaps are live while SHADER_HEAPS holds them.
+        if let Some(h) = unsafe { &*(at as *const Heap) }
+            .host
+            .get()
+            .and_then(|h| h.as_ref())
+            && !h.count_mirrored_buffers(&mut counts)
+        {
+            bindless_active = true;
+        }
+    }
+    (counts, bindless_active)
+}
+
+/// Evicts mirrored (`slot < count`) buffer descriptors matching `targets`
+/// across all shader-visible view heaps not currently pinned by a bindless list.
+#[cfg(windows)]
+pub(crate) fn evict_buffer_slots(targets: &std::collections::HashSet<usize>) -> usize {
+    let mut evicted = 0usize;
+    let list = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in list.iter() {
+        // SAFETY: registered heaps are live while SHADER_HEAPS holds them.
+        if let Some(h) = unsafe { &*(at as *const Heap) }
+            .host
+            .get()
+            .and_then(|h| h.as_ref())
+        {
+            evicted += h.evict_buffers(targets);
+        }
+    }
+    evicted
+}
+
 /// Evicts every shader-visible `HostHeap` descriptor slot pointing to
 /// `resource` (optionally matching only the exact evicted `ID3D12Resource`
 /// pointer `only_host_ptr` so concurrent re-materialization is never
