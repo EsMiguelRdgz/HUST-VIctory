@@ -1,31 +1,46 @@
 # Current Project Status
 
 - Current milestone: Phase 11 — P0 RAM / system-commit exhaustion investigation (supersedes Phase 10 performance tuning)
-- Current subphase: Phase 11A — memory ownership audit (started 2026-11-23)
+- Current subphase: Phase 11 A-E implemented (audit, instrumentation, physical-page chunking, transient texture staging, pressure relief); F (synthetic benchmark report, full matrix) in progress
 - Current branch: `hust/nvidia-rtx3070`
-- Latest verified commit: `05d6207` (end of Phase 10 work; Phase 10 left open pending hardware validation)
-- Current working-tree status: clean at Phase 11 start
+- Latest verified commit: `a773911` (Phase 11 commits: `c7564ce`, `5f2044c`, `83e9969`, `de0870e`, `a773911`)
+- Current working-tree status: clean except this checkpoint
 - Active agent: Claude Code
 - Model: Claude Opus 5.5
 - Last checkpoint timestamp: 2026-11-23 (Phase 11 start)
 - Current build status: PASS at `dc93210`
-- Current test status: workspace 258/0/3 at `dc93210`
+- Current test status: `cargo test -p victory-gpu` 76/76 (30 parallel stress runs 0 failures); `cargo test -p victory-hle` 83 passed / 1 ignored (benchmark)
 
 ## Phase 11 trigger (user report, RTX 3070 test 1)
 
 - Windows 11, RTX 3070 8 GB, 32 GB RAM. Task Manager: RAM 26.8/31.9 GB, available 5.1 GB, system commit 49.5/50.5 GB (~1 GB headroom); game unresponsive; manually closed; no new frame captures; no GPU crash confirmed.
-- `G:\VIctory-Resultstx3070-test-1.txt` has no application log (transcript only). It shows the run used `VICTORY_D3D12_DEBUG=1` (D3D12 debug layer ON), `VICTORY_D3D12_DRED=1`, `VICTORY_COPY_WORKERS=1`, `VICTORY_LOG=victory_gpu=info,info`, `VICTORY_CAPTURE` set, diag build `target\diagictory.exe`.
+- `G:\VIctory-Results
+tx3070-test-1.txt` has no application log (transcript only). It shows the run used `VICTORY_D3D12_DEBUG=1` (D3D12 debug layer ON), `VICTORY_D3D12_DRED=1`, `VICTORY_COPY_WORKERS=1`, `VICTORY_LOG=victory_gpu=info,info`, `VICTORY_CAPTURE` set, diag build `target\diagictory.exe`.
 - Earlier logs (`phase9-rtx3070/run-20261123-205042/console.txt`, UTF-16LE) predate memstat: only 8 "large buffer copied" lines (>=16 MiB) totalling ~465 MB; no commit data.
+
+## Phase 11 findings (source-level, ranked by expected commit contribution)
+
+Commit charge is what exhausted the system (49.5/50.5 GB). Reservations cost nothing; committed private memory and committed section pages are charged whether touched or not; working set is only what is resident.
+
+1. EXPECTED RESIDENCY — guest title memory. `console::title_memory()` advertises Series X 10 GiB GPU-optimal + 3.5 GiB standard = 13.5 GiB, and the title sizes its pools to it: `XMemVirtualAlloc` passes the title's own MEM_COMMIT through (private commit, write-watched), physical pages (`XMemAllocatePhysicalPages`, 6.1 GiB in one call for GTA VI) are SEC_RESERVE sections committed page by page when mapped/written (`commit()`), title D3D12 heaps come from `resource::Memory::new` (`alloc_zeroed`: fully committed at creation). Up to ~13.5 GiB is legitimate.
+2. DUPLICATION — every title buffer the GPU uses gets a full-size host copy (`shadow::find`, CUSTOM write-back L0 = system memory, committed), plus loose 4 MiB windows and aligned copies; every title texture gets a host texture (`resource.rs` create, DEFAULT heap, created eagerly for every title texture; spills to system memory when the 8 GB VRAM budget is exceeded).
+3. DUPLICATION (FIXED `a773911`) — every title-written texture kept a permanent full-size UPLOAD-heap staging buffer (system memory, committed) for its whole life, i.e. a second system copy of all sampled title textures. Now lent per submission from a 256 MiB pool and only when contents changed.
+4. RETENTION (FIXED `de0870e`) — physical-page sections were one per allocation; committed section pages cannot be decommitted individually, so a pool stayed fully committed until its LAST page was freed. Measured (synthetic, 512 MiB, system commit delta, `bench_physical_page_commit`): after freeing 7/8 of the pages BEFORE +515 MiB retained, AFTER +67 MiB (the 1/8 still allocated); all freed ~+3 MiB both. Now 16 MiB sections.
+5. CONFOUNDER — the failing run used `VICTORY_D3D12_DEBUG=1` (debug layer: per-object tracking, shadow descriptor state, stored messages) and `VICTORY_D3D12_DRED=1`; both add memory not present in normal runs and must be off for the next measurement.
+6. VISIBILITY GAP (FIXED `5f2044c`) — the memory line was logged only on presented frames, so a stalled title stopped reporting; now a monitor thread logs every 5 s (address-space walk every 30 s) and can write `VICTORY_MEMORY_REPORT_DIR` files.
+7. MINOR / BOUNDED — descriptor heaps (~32 MB per 1M-slot heap, now counted), list scratch/uploads (until list reset, now counted), snapshot pool (64 MiB), texture read pool (128 MiB), DirectStorage staging (32 MiB), shader cache (weak refs since Phase 10).
+8. NOT A LEAK (verified by tests) — loose/aligned copies are freed when idle (descriptor ownership keeps in-use ones); fence waits are synchronous so no submission retains resources past `Host::execute`; list uploads die at reset.
+
+Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host textures exceed VRAM and spill, and how much the debug layer added. The new telemetry answers all three.
 
 ## Active Task
 
-- Objective: Final verification matrix at `318c2ca`, then hand off for the authorized hardware run.
-- Current implementation: matrix PASSED (recorded in Completed Tasks); waiting for the user's authorized hardware run.
-- Known risks: all thresholds/budgets (`PARALLEL_REFRESH` 8 MiB, `PARALLEL_DETILE` 8 MiB, `LOOSE_BUDGET` 512 MiB, `ALIGNED_BUDGET` 256 MiB, snapshot pool 64 MiB, texture read pool 128 MiB) are unmeasured defaults.
+- Objective: Phase 11F — synthetic memory benchmark report in `G:\VIctory-Results\memory-investigation\`, full verification matrix, final ranked report and GO/NO-GO.
+- Current implementation: IN_PROGRESS.
 
 ## Immediate Resume Instructions
 
-- First action: ask the user for the hardware-run log lines described in Manual validation; record them here; then tune budgets/thresholds and make the priority-8 decision from the numbers.
+- First action: if `G:\\VIctory-Results\\memory-investigation\\` has no `synthetic-*.txt`, run the `bench_*` ignored tests (`cargo test -p victory-gpu --lib bench_ -- --ignored --test-threads=1 --nocapture`, `cargo test -p victory-hle --lib bench_ -- --ignored --test-threads=1 --nocapture`) and record their numbers; then run the full matrix.
 - Next implementation step (only after hardware numbers exist): decide on priority 8 GPU detiling (see evaluation in Completed Tasks); tune budgets/thresholds from `host memory` and frame-rate lines; consider removing the permanent per-texture upload staging copy if `texture staging` dominates.
 - Pending tests: authorized hardware run (manual, below). No automated test is pending.
 - Known blockers: hardware validation must be done by the user (agents must not launch the game or GPU workloads).
@@ -101,6 +116,10 @@
 - VERIFIED — Full Phase 10 verification matrix at `318c2ca` (Claude, 2026-11-23): `cargo xtask policy` → `asset policy: 152 files ok`; `cargo test --workspace` → 256 passed, 0 failed, 3 ignored (the 3 need external reference data, as at baseline); `cargo clippy --workspace --all-targets` exit 0, only pre-existing `list.rs:1398` undocumented-unsafe warning; `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets` exit 0, same single warning; `cargo build --profile diag -p victory --features diagnostics` exit 0 → `target/diag/victory.exe` (not launched).
 
 - VERIFIED — Priority F title-sized allocations (`dc93210`): audit of `vec!`/`with_capacity`/`resize` in host/list/draw/resource/queue/shadow/texture/descriptor found three title-controlled infallible allocations: `allocate_upload` (now `try_reserve_exact`, returns null as documented), `SetRenderTargets` one-range handle list (count capped at D3D12's 8), root constants `resize` to title offset (writes ending past 65,536 DWORDs dropped). Others are bounded by API limits, internal sizes, or debug-layer message sizes. Tests `title_sized_upload_allocations_fail_softly`, `root_constant_offsets_are_bounded`. Workspace 258/0/3.
+
+- VERIFIED — Phase 11 instrumentation (`5f2044c`, `83e9969`): memstat kinds for host textures, list uploads, descriptor heaps, title heaps, guest physical; D3D12 lifetime tracking via private-data tracker (test proves uncount at destruction); available physical; address-space walk (test: 256 MiB reserve vs commit vs release); pressure floor; monitor thread; report file. 74/74 at the time.
+- VERIFIED — Phase 11 physical-page chunking (`de0870e`): before/after numbers in Phase 11 findings #4; tests `partly_freed_physical_pages_return_their_commit` (mutation: CHUNK=1<<30 makes it FAIL) and `physical_page_commit_is_accounted`. victory-hle 83/0/1.
+- VERIFIED — Phase 11 transient texture staging + pressure relief (`a773911`): test `title_texture_contents_are_uploaded_when_they_change` on the host device (mutation dropping `upload.record` FAILS it), `pressure_relief_frees_idle_copies_and_pools`; 76/76; 30 stress runs 0 failures. A first version of the pressure test was flaky in parallel (heap address reuse let another test's never-freed loose window cover it); fixed by a synthetic address range.
 
 ## Incomplete Tasks
 
