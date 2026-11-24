@@ -217,24 +217,107 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    /// The text of an `ID3DBlob` error message from the host serializer, then
+    /// releases it. Null (no message) is tolerated.
+    fn error_text(error: *mut c_void) -> String {
+        if error.is_null() {
+            return "(no error blob)".to_string();
+        }
+        let blob = error.cast_const().cast::<Object>();
+        let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
+        let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
+        let text = if data.is_null() || size == 0 {
+            "(empty error blob)".to_string()
+        } else {
+            // SAFETY: the blob owns `size` bytes at `data` until released below.
+            let bytes = unsafe { std::slice::from_raw_parts(data, size) };
+            String::from_utf8_lossy(bytes)
+                .trim_end_matches('\0')
+                .trim()
+                .to_string()
+        };
+        slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+        text
+    }
+
+    /// Fails with the host's own message when serialization did not succeed;
+    /// releases any message it left on success.
+    fn assert_serialized(name: &str, hr: HRESULT, error: *mut c_void) {
+        if hr != S_OK {
+            panic!(
+                "{name} returned {:#010x}; host error blob: {}",
+                hr as u32,
+                error_text(error)
+            );
+        }
+        if !error.is_null() {
+            error_text(error);
+        }
+    }
+
+    /// Our descriptions are read by the host's serializer as its own
+    /// `D3D12_ROOT_SIGNATURE_DESC` / `D3D12_VERSIONED_ROOT_SIGNATURE_DESC`,
+    /// so their x64 layouts must match `d3d12.h` exactly.
+    #[cfg(windows)]
+    #[test]
+    fn descriptions_match_the_host_layout() {
+        use std::mem::{offset_of, size_of};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_ROOT_PARAMETER, D3D12_ROOT_SIGNATURE_DESC as Host,
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC as HostVersioned,
+        };
+        assert_eq!(size_of::<Desc>(), size_of::<Host>());
+        assert_eq!(
+            offset_of!(Desc, parameter_count),
+            offset_of!(Host, NumParameters)
+        );
+        assert_eq!(offset_of!(Desc, parameters), offset_of!(Host, pParameters));
+        assert_eq!(
+            offset_of!(Desc, sampler_count),
+            offset_of!(Host, NumStaticSamplers)
+        );
+        assert_eq!(
+            offset_of!(Desc, samplers),
+            offset_of!(Host, pStaticSamplers)
+        );
+        assert_eq!(offset_of!(Desc, flags), offset_of!(Host, Flags));
+        assert_eq!(size_of::<VersionedDesc>(), size_of::<HostVersioned>());
+        assert_eq!(
+            offset_of!(VersionedDesc, version),
+            offset_of!(HostVersioned, Version)
+        );
+        assert_eq!(
+            offset_of!(VersionedDesc, desc),
+            offset_of!(HostVersioned, Anonymous)
+        );
+        // A root parameter's union holds a pointer (descriptor tables), so on
+        // x64 it starts at 8 and the visibility follows it at 24.
+        assert_eq!(size_of::<D3D12_ROOT_PARAMETER>(), 32);
+        assert_eq!(offset_of!(D3D12_ROOT_PARAMETER, Anonymous), 8);
+        assert_eq!(offset_of!(D3D12_ROOT_PARAMETER, ShaderVisibility), 24);
+    }
+
     /// One 32-bit constant at b0, serialized by the host, then created.
     #[cfg(windows)]
     #[test]
     fn host_serialized_blobs_create_root_signatures() {
-        #[repr(C)]
-        struct Constants {
-            kind: u32,
-            register: u32,
-            space: u32,
-            count: u32,
-            visibility: u32,
-        }
-        let parameter = Constants {
-            kind: 1,
-            register: 0,
-            space: 0,
-            count: 1,
-            visibility: 0,
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY_ALL,
+        };
+        // The host's own definition: a hand-packed five-u32 struct put the
+        // constants at the wrong offsets and left the visibility (offset 24)
+        // past its end, so the serializer read stack garbage.
+        let parameter = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 1,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         };
         let desc = Desc {
             parameter_count: 1,
@@ -244,7 +327,8 @@ mod tests {
             flags: 0x0100_0001,
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize(&desc, 1, &mut blob, &mut error), S_OK);
+        let hr = serialize(&desc, 1, &mut blob, &mut error);
+        assert_serialized("D3D12SerializeRootSignature", hr, error);
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
@@ -257,6 +341,50 @@ mod tests {
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+    }
+
+    /// What the old hand-packed test parameter amounted to on x64: the host
+    /// read register 0, space 1, no 32-bit values, and a shader visibility
+    /// from past the end of the struct. With an out-of-range visibility the
+    /// host refuses it and explains why in its error blob.
+    #[cfg(windows)]
+    #[test]
+    fn invalid_parameters_return_the_hosts_error() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY,
+        };
+        let parameter = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 1,
+                    Num32BitValues: 0,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY(0x7fff_ffff),
+        };
+        let desc = Desc {
+            parameter_count: 1,
+            parameters: (&raw const parameter).cast(),
+            sampler_count: 0,
+            samplers: std::ptr::null(),
+            flags: 1,
+        };
+        let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let hr = serialize(&desc, 1, &mut blob, &mut error);
+        let produced = !blob.is_null();
+        if produced {
+            let blob = blob.cast_const().cast::<Object>();
+            slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+        }
+        let text = error_text(error);
+        assert_eq!(hr, E_INVALIDARG, "host error blob: {text}");
+        assert!(!produced, "no blob for an invalid description");
+        // GitHub windows-latest (image win25-vs2026 20261116.315.1) says:
+        // "Unsupported ShaderVisibility value 2147483647 (root parameter [0])."
+        assert!(!text.starts_with('('), "the host explains the refusal");
     }
 
     /// The host's deserializer reads our blobs back (the upscaler's call).
@@ -276,7 +404,8 @@ mod tests {
             },
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+        let hr = serialize_versioned(&desc, &mut blob, &mut error);
+        assert_serialized("D3D12SerializeVersionedRootSignature", hr, error);
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
@@ -312,7 +441,8 @@ mod tests {
             },
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+        let hr = serialize_versioned(&desc, &mut blob, &mut error);
+        assert_serialized("D3D12SerializeVersionedRootSignature", hr, error);
         let blob = blob.cast_const().cast::<Object>();
         assert!(slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob) > 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);

@@ -3,9 +3,10 @@
 # Manual only. GitHub-hosted runners have NO hardware GPU: every D3D12 test
 # here runs on WARP (Microsoft's software rasterizer), so passing tests prove
 # translation/correctness on WARP, not behaviour or performance on the
-# RTX 3070. The D3D12 debug layer (Graphics Tools) is not installed on these
-# images, so VICTORY_D3D12_DEBUG validation is not performed. No title is
-# ever launched. Hardware runs go through home-rtx3070-diagnostic.yml.
+# RTX 3070. VICTORY_D3D12_DEBUG is not set, so D3D12 debug-layer validation
+# does not run here (the image does ship d3d12SDKLayers.dll; the job records
+# it). No title is ever launched. Hardware runs go through
+# home-rtx3070-diagnostic.yml.
 name: Windows CI
 
 on:
@@ -25,7 +26,7 @@ on:
         type: boolean
         default: false
       fmt_base:
-        description: "Base ref for the formatting gate (only .rs files changed since this ref must be rustfmt-clean)"
+        description: "Formatting-gate base: a branch (merge-base with origin/<branch>) or a commit SHA (e.g. the default branch's previous tip after a rebase-merge or multi-commit push). If HEAD is already in it, HEAD's first parent is used"
         type: string
         default: hust/phase12-memory
 
@@ -117,20 +118,77 @@ jobs:
           FMT_BASE: ${{ inputs.fmt_base }}
         run: |
           # The tree carries pre-existing rustfmt debt, so (per AGENTS.md) only
-          # files changed since FMT_BASE must be clean; the rest is reported.
+          # the .rs files this change touches must be clean; the rest is reported.
+          #
+          # Which base: on a feature branch, the merge-base with origin/FMT_BASE.
+          # When HEAD is already contained in origin/FMT_BASE (a run on the
+          # default branch itself, e.g. right after a merge), that diff is empty,
+          # so fall back to HEAD's first parent: for a merge or squash commit that
+          # covers the whole merged PR, for a direct commit only that commit. A
+          # rebase-merge or a multi-commit push lands several commits at once and
+          # dispatch has no "before" SHA, so pass the previous tip as fmt_base
+          # to gate the whole range.
+          $log = "$env:LOG_DIR\fmt.log"
           cargo fmt --all -- --check 2>&1 | Out-File -FilePath "$env:LOG_DIR\fmt-full.log" -Encoding utf8
-          $unformatted = @(Select-String -Path "$env:LOG_DIR\fmt-full.log" -Pattern '^Diff in (.+?):\d+:' |
-            ForEach-Object { (Resolve-Path -Relative $_.Matches[0].Groups[1].Value) -replace '\\','/' -replace '^\./','' } |
-            Sort-Object -Unique)
-          $changed = @()
-          if ($env:FMT_BASE -and (git rev-parse --verify --quiet "origin/$env:FMT_BASE")) {
-            $changed = @(git diff --name-only --diff-filter=ACMR "origin/$env:FMT_BASE...HEAD" -- '*.rs')
+          $ws = ([IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\') + '\')
+          $unformatted = @(Select-String -Path "$env:LOG_DIR\fmt-full.log" -Pattern '^Diff in (.+?\.rs):\d+:' |
+            ForEach-Object {
+              $p = $_.Matches[0].Groups[1].Value -replace '^\\\\\?\\', ''
+              if ($p.StartsWith($ws, [StringComparison]::OrdinalIgnoreCase)) { $p = $p.Substring($ws.Length) }
+              $p -replace '\\', '/'
+            } | Sort-Object -Unique)
+
+          $base = $null
+          $reason = ''
+          $baseRef = ''
+          $resolved = $false
+          if ($env:FMT_BASE -and ($env:FMT_BASE -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$')) {
+            "fmt_base '$($env:FMT_BASE)' is not a branch name or SHA" | Tee-Object -FilePath $log
+            exit 1
+          }
+          if ($env:FMT_BASE) {
+            # A branch name resolves through origin/; otherwise accept a commit-ish (SHA).
+            foreach ($candidate in @("origin/$env:FMT_BASE", $env:FMT_BASE)) {
+              if (git rev-parse --verify --quiet "$candidate^{commit}") { $baseRef = $candidate; $resolved = $true; break }
+            }
+            if (-not $resolved) { $baseRef = $env:FMT_BASE }
+          }
+          if ($resolved) {
+            $mb = (git merge-base $baseRef HEAD).Trim()
+            $head = (git rev-parse HEAD).Trim()
+            if ($mb -and $mb -ne $head) {
+              $base = $mb
+              $reason = "merge-base with $baseRef"
+            } else {
+              $reason = "HEAD is already in $baseRef"
+            }
+          } elseif ($baseRef) {
+            $reason = "fmt_base '$baseRef' not found"
+          } else {
+            $reason = 'fmt_base empty'
+          }
+          if (-not $base) {
+            $parent = git rev-parse --verify --quiet 'HEAD^1^{commit}'
+            if ($parent) {
+              $base = $parent.Trim()
+              $reason += "; using HEAD's first parent"
+            }
+          }
+          if ($base) {
+            $changed = @(git diff --name-only --diff-filter=ACMR "$base" HEAD -- '*.rs')
+            $scope = "files changed in $base..HEAD ($reason)"
+          } else {
+            # Root commit or no history: every file is new, gate them all.
+            $changed = @(git ls-files -- '*.rs')
+            $scope = "all tracked files ($reason; no parent commit)"
           }
           $blocking = @($unformatted | Where-Object { $changed -contains $_ })
-          "files with pre-existing rustfmt differences (advisory): $($unformatted.Count)" | Tee-Object -FilePath "$env:LOG_DIR\fmt.log"
-          "rust files changed since origin/$($env:FMT_BASE): $($changed.Count)" | Tee-Object -FilePath "$env:LOG_DIR\fmt.log" -Append
-          "changed files needing rustfmt (blocking): $($blocking.Count)" | Tee-Object -FilePath "$env:LOG_DIR\fmt.log" -Append
-          $blocking | Tee-Object -FilePath "$env:LOG_DIR\fmt.log" -Append
+          "formatting gate base: $scope" | Tee-Object -FilePath $log
+          "rust files in gate scope: $($changed.Count)" | Tee-Object -FilePath $log -Append
+          "files with rustfmt differences anywhere in the tree (advisory): $($unformatted.Count)" | Tee-Object -FilePath $log -Append
+          $unformatted | ForEach-Object { "  advisory: $_" } | Tee-Object -FilePath $log -Append
+          "changed files needing rustfmt (blocking): $($blocking.Count)" | Tee-Object -FilePath $log -Append
+          $blocking | ForEach-Object { "  blocking: $_" } | Tee-Object -FilePath $log -Append
           if ($blocking.Count -gt 0) { exit 1 }
           exit 0
 
@@ -199,7 +257,7 @@ jobs:
           $s.Add("")
           $s.Add("### Limitations")
           $s.Add("- GitHub-hosted ``windows-latest`` has **no hardware GPU**. D3D12 tests ran on **WARP** (software); results do not cover RTX 3070 driver behaviour, timing, VRAM or TDR.")
-          $s.Add("- D3D12 debug layer present on this image: **$env:DEBUG_LAYER**. When false, ``VICTORY_D3D12_DEBUG`` validation did not run.")
+          $s.Add("- D3D12 debug layer (d3d12SDKLayers.dll) present on this image: **$env:DEBUG_LAYER**. This workflow does not set ``VICTORY_D3D12_DEBUG``, so debug-layer validation did not run.")
           $s.Add("- Tests that need real title files or external reference data skip themselves (environment variables unset).")
           $s.Add("- No title or game executable was launched or downloaded.")
           $s -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
