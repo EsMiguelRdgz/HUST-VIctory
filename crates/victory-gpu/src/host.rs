@@ -645,12 +645,19 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Post-execution downgraded `Refresh`: drops the strong `Arc<Shadow>` as
+    /// soon as the list completes on the GPU so idle buffer/loose shadows can
+    /// be reclaimed before `Reset()`, while still resolving via `Weak::upgrade`
+    /// or `shadow::find` if a closed list is re-executed.
+    ExecutedRefresh(std::sync::Weak<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Post-execution downgraded `GpuWrite` (see `ExecutedRefresh`).
+    ExecutedGpuWrite(std::sync::Weak<crate::shadow::Shadow>, usize, usize),
     /// Brings a title texture's host copy (title resource, host texture) up
     /// to date if its memory changed: in the submission's prelude. Holds the
     /// resource's active-list guard until list reset.
@@ -794,8 +801,22 @@ impl Host {
         let mut uploads: Vec<crate::texture::Upload> = Vec::new();
         for list in runs {
             if list.executed.load(Ordering::Acquire) {
+                let copies_len = list.deferred().copies.len();
+                let pipelines: Vec<String> = list
+                    .pipelines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned()
+                    .collect();
                 static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| tracing::warn!("host command list re-executed without reset"));
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        copies_len,
+                        ?pipelines,
+                        "host command list re-executed without reset"
+                    );
+                });
             }
             let mine = list.run_deferred(&mut batch);
             if let Some(prelude) = list.prelude(&mine) {
@@ -812,16 +833,24 @@ impl Host {
         let mut gpu_writes: Vec<ShadowRanges> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
+                let resolved = match step {
+                    Step::GpuWrite(shadow, address, len) => Some((shadow.clone(), *address, *len)),
+                    Step::ExecutedGpuWrite(weak, address, len) => weak
+                        .upgrade()
+                        .or_else(|| crate::shadow::find(*address as u64, (*len).max(1) as u64))
+                        .map(|s| (s, *address, *len)),
+                    _ => None,
+                };
+                if let Some((shadow, address, len)) = resolved {
                     if let Some((_, ranges)) = gpu_writes
                         .iter_mut()
-                        .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+                        .find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow))
                     {
-                        if !ranges.contains(&(*address, *len)) {
-                            ranges.push((*address, *len));
+                        if !ranges.contains(&(address, len)) {
+                            ranges.push((address, len));
                         }
                     } else {
-                        gpu_writes.push((shadow.clone(), vec![(*address, *len)]));
+                        gpu_writes.push((shadow, vec![(address, len)]));
                     }
                 }
             }
@@ -1144,26 +1173,48 @@ impl HostList {
     }
 
     /// Releases post-execution eviction pins (`list_guard`, `bindless_guard`)
-    /// as soon as the host GPU finishes running this list, so idle textures
-    /// can be evicted before the title calls `Reset()` frames later while
-    /// keeping recorded `kept` COM refs, `copies`, `uploads`, `writes`, and
-    /// `scratch` intact in case the title re-executes a closed list without
-    /// calling `Reset()`.
+    /// and downgrades strong `Arc<Shadow>` refs in `Step::Refresh` /
+    /// `Step::GpuWrite` to `Weak<Shadow>` as soon as the host GPU finishes
+    /// running this list, so idle textures and buffer/loose shadows can be
+    /// reclaimed before the title calls `Reset()` frames later while keeping
+    /// recorded `kept` COM refs, `uploads`, `writes`, and `scratch` intact in
+    /// case the title re-executes a closed list without calling `Reset()`.
     fn on_executed(&self) {
         self.executed.store(true, Ordering::Release);
+        let mut dropped_shadows: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
         let mut guards = {
             let mut deferred = self.deferred();
             let mut out = std::mem::take(&mut deferred.guards);
             for step in &mut deferred.copies {
-                if let Step::Texture { _guard, .. } = step
-                    && let Some(g) = _guard.take()
-                {
-                    out.push(g);
+                match step {
+                    Step::Texture { _guard, .. } => {
+                        if let Some(g) = _guard.take() {
+                            out.push(g);
+                        }
+                    }
+                    Step::Refresh(shadow, addr, len) => {
+                        let weak = std::sync::Arc::downgrade(shadow);
+                        let (a, l) = (*addr, *len);
+                        let old = std::mem::replace(step, Step::ExecutedRefresh(weak, a, l));
+                        if let Step::Refresh(s, _, _) = old {
+                            dropped_shadows.push(s);
+                        }
+                    }
+                    Step::GpuWrite(shadow, addr, len) => {
+                        let weak = std::sync::Arc::downgrade(shadow);
+                        let (a, l) = (*addr, *len);
+                        let old = std::mem::replace(step, Step::ExecutedGpuWrite(weak, a, l));
+                        if let Step::GpuWrite(s, _, _) = old {
+                            dropped_shadows.push(s);
+                        }
+                    }
+                    _ => {}
                 }
             }
             out
         };
         guards.clear();
+        drop(dropped_shadows);
         let state_guards: Vec<Option<std::sync::Arc<()>>> = {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
             states.values_mut().map(|entry| entry.2.take()).collect()
@@ -1566,6 +1617,20 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
+                Step::ExecutedRefresh(weak, address, len) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Refreshes, 1);
+                        add(C::RefreshBytes, *len as u64);
+                    }
+                    if let Some(shadow) = weak
+                        .upgrade()
+                        .or_else(|| crate::shadow::find(*address as u64, (*len).max(1) as u64))
+                    {
+                        batch.add(&shadow, *address, *len);
+                    }
+                    continue;
+                }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
@@ -1582,6 +1647,16 @@ impl HostList {
                     // The shaders start from the title's data.
                     batch.flush();
                     shadow.writing(*address, *len);
+                    continue;
+                }
+                Step::ExecutedGpuWrite(weak, address, len) => {
+                    batch.flush();
+                    if let Some(shadow) = weak
+                        .upgrade()
+                        .or_else(|| crate::shadow::find(*address as u64, (*len).max(1) as u64))
+                    {
+                        shadow.writing(*address, *len);
+                    }
                     continue;
                 }
                 Step::Texture {

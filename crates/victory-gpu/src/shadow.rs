@@ -1731,16 +1731,58 @@ mod tests {
         let remade = find(idle_addr, idle_mem.len() as u64).expect("remade shadow");
         assert!(remade.update(idle_addr as usize, 4096) >= 4096);
         // SAFETY: `[0, 4096)` lies inside the shadow mapping.
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts(remade.data, 8) },
-            &[0x77u8; 8]
-        );
+        let head = unsafe { std::slice::from_raw_parts(remade.data, 8) };
+        assert_eq!(head, &[0x77u8; 8]);
 
         drop(remade);
         drop(busy_arc);
         unregister(idle_id, idle_addr);
         unregister(busy_id, busy_addr);
         assert_eq!(slot::<Release>(sheap, 0x10)(sheap), 0);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Once `Host::execute` finishes running a command list, its `Step::Refresh`
+    /// and `Step::GpuWrite` entries downgrade to `Weak<Shadow>` immediately so
+    /// idle buffer shadows are reclaimable even before the title calls `Reset()`.
+    #[test]
+    fn executed_list_releases_buffer_shadows_before_reset() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mut mem = vec![0x33u8; 256 << 10];
+        let addr = mem.as_mut_ptr() as u64;
+        let id = (addr as usize) ^ 0x9999_AAAA;
+        register(id, addr, mem.len() as u64);
+
+        let list = host_gpu.new_list().expect("host list");
+        let weak = {
+            let shadow = find(addr, mem.len() as u64).expect("shadow");
+            shadow.refresh(&list, addr, 4096);
+            Arc::downgrade(&shadow)
+        };
+        // While open (not yet executed), `list` holds `Arc<Shadow>` strongly.
+        let _ = reclaim_buffers(0);
+        assert!(
+            weak.upgrade().is_some(),
+            "open list must keep its buffer shadow alive"
+        );
+
+        list.close();
+        host_gpu.execute(&[&list]);
+        // Even BEFORE `list.reset()`, `on_executed()` downgraded the refresh step.
+        let freed = reclaim_buffers(0);
+        assert!(
+            freed >= 256 << 10,
+            "completed list's buffer shadow must reclaim before Reset(): freed={freed}"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "completed list's buffer shadow must be dropped before Reset()"
+        );
+
+        list.reset();
+        unregister(id, addr);
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 }

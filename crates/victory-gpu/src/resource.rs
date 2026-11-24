@@ -1922,8 +1922,19 @@ pub(crate) fn evict_idle_textures(incoming: u64) -> u64 {
 /// the 5 largest textures. Runs only during commit-pressure relief.
 #[cfg(windows)]
 fn log_gpu_targets_breakdown() {
+    struct TargetInfo {
+        start: u64,
+        end: u64,
+        bytes: u64,
+        flags: u32,
+        width: u64,
+        height: u32,
+        format: u32,
+        last_used: u64,
+        idle: bool,
+    }
     let now_tick = TEXTURE_TICK.load(std::sync::atomic::Ordering::Relaxed);
-    let mut entries: Vec<(u64, u64, u64, u32, u64, u32, u32, u64, bool)> = Vec::new();
+    let mut entries: Vec<TargetInfo> = Vec::new();
     {
         let set = GPU_TARGET_TEXTURES
             .lock()
@@ -1940,58 +1951,63 @@ fn log_gpu_targets_breakdown() {
                 .unwrap_or_else(|_| footprint(&r.desc).map_or(KIB_64, |i| i.size));
             let addr = r.data() as u64;
             let span = footprint(&r.desc).map_or(bytes, |i| i.size).max(1);
-            let last = r.last_used.load(std::sync::atomic::Ordering::Relaxed);
+            let last_used = r.last_used.load(std::sync::atomic::Ordering::Relaxed);
             let idle = std::sync::Arc::strong_count(&r.list_guard) == 1;
-            entries.push((
-                addr,
-                addr.saturating_add(span),
+            entries.push(TargetInfo {
+                start: addr,
+                end: addr.saturating_add(span),
                 bytes,
-                r.desc.flags,
-                r.desc.width,
-                r.desc.height,
-                r.desc.format,
-                last,
+                flags: r.desc.flags,
+                width: r.desc.width,
+                height: r.desc.height,
+                format: r.desc.format,
+                last_used,
                 idle,
-            ));
+            });
         }
     }
     if entries.is_empty() {
         return;
     }
     // Sort by title address to compute overlapping (aliased) footprint bytes.
-    entries.sort_unstable_by_key(|e| (e.0, e.1));
+    entries.sort_unstable_by_key(|e| (e.start, e.end));
     let mut max_end = 0u64;
     let mut aliased_bytes = 0u64;
     let (mut rt_b, mut dsv_b, mut uav_b, mut stale_b, mut live_b) = (0u64, 0u64, 0u64, 0u64, 0u64);
-    for &(start, end, bytes, flags, _, _, _, last, idle) in &entries {
-        live_b += bytes;
-        if flags & 1 != 0 {
-            rt_b += bytes;
+    for e in &entries {
+        live_b += e.bytes;
+        if e.flags & 1 != 0 {
+            rt_b += e.bytes;
         }
-        if flags & 2 != 0 {
-            dsv_b += bytes;
+        if e.flags & 2 != 0 {
+            dsv_b += e.bytes;
         }
-        if flags & 4 != 0 {
-            uav_b += bytes;
+        if e.flags & 4 != 0 {
+            uav_b += e.bytes;
         }
-        if idle && now_tick.saturating_sub(last) > 1000 {
-            stale_b += bytes;
+        if e.idle && now_tick.saturating_sub(e.last_used) > 1000 {
+            stale_b += e.bytes;
         }
-        if start != 0 && start < max_end {
-            aliased_bytes += bytes;
+        if e.start != 0 && e.start < max_end {
+            aliased_bytes += e.bytes;
         }
-        if start != 0 && end > max_end {
-            max_end = end;
+        if e.start != 0 && e.end > max_end {
+            max_end = e.end;
         }
     }
-    entries.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+    entries.sort_unstable_by_key(|e| std::cmp::Reverse(e.bytes));
     let top5: Vec<String> = entries
         .iter()
         .take(5)
-        .map(|&(addr, _, bytes, flags, w, h, fmt, _, _)| {
+        .map(|e| {
             format!(
-                "{w}x{h} f{fmt} fl{flags:#x} @{addr:#x} {}MB",
-                bytes / (1 << 20)
+                "{}x{} f{} fl{:#x} @{:#x} {}MB",
+                e.width,
+                e.height,
+                e.format,
+                e.flags,
+                e.start,
+                e.bytes / (1 << 20)
             )
         })
         .collect();
