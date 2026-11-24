@@ -789,9 +789,24 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them. Returns `true` if the GPU fence
-    /// confirmed completion.
+    /// Runs closed lists and waits for them. Large multi-list submissions are
+    /// executed in sequential chunks so GPU execution stays well below Windows'
+    /// 2-second WDDM TDR watchdog and copy-back completes between chunks.
+    /// Returns `true` if the GPU fence confirmed completion for all chunks.
     pub(crate) fn execute(&self, runs: &[&HostList]) -> bool {
+        const MAX_LISTS_PER_SUBMIT: usize = 8;
+        if runs.len() <= MAX_LISTS_PER_SUBMIT {
+            return self.execute_batch(runs);
+        }
+        for chunk in runs.chunks(MAX_LISTS_PER_SUBMIT) {
+            if !self.execute_batch(chunk) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn execute_batch(&self, runs: &[&HostList]) -> bool {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);

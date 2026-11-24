@@ -623,9 +623,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             break (map, key);
         }
         let buf_len = entry.end - key.0;
-        if buf_len >= WINDOWED_BUFFER_MIN
-            && (req_len <= WINDOWED_MAX_REQ || buf_len >= req_len.saturating_mul(2))
-        {
+        if buf_len >= WINDOWED_BUFFER_MIN && req_len <= WINDOWED_MAX_REQ {
             drop(map);
             return loose(address, end);
         }
@@ -639,40 +637,96 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         relieve_pressure(bytes);
         relieved = true;
     };
-    let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        let buf_len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let bytes = buf_len.next_multiple_of(1 << 16);
-        let (buffer, data) = host_buffer(Kind::Buffer, bytes)?;
-        crate::host::name(&buffer, || {
-            format!("title buffer {:#x}+{buf_len:#x}", key.0)
-        });
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if buf_len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len = buf_len,
-                req_len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len = buf_len,
-                "buffer copied to the host"
-            );
+    let (shadow, promoted) = {
+        let entry = map.get_mut(&key)?;
+        let mut promoted = None;
+        if entry.shadow.is_none() {
+            let buf_len = entry.end - key.0;
+            // Rounded up so that views ending in the buffer's last 256 bytes fit.
+            // Shaders write some buffers (unordered access), so not upload memory.
+            let bytes = buf_len.next_multiple_of(1 << 16);
+            let (buffer, data) = host_buffer(Kind::Buffer, bytes)?;
+            crate::host::name(&buffer, || {
+                format!("title buffer {:#x}+{buf_len:#x}", key.0)
+            });
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            if buf_len >= 16 << 20 {
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len = buf_len,
+                    req_len,
+                    "large buffer copied to the host"
+                );
+            } else {
+                tracing::debug!(
+                    start = format_args!("{:#x}", key.0),
+                    len = buf_len,
+                    "buffer copied to the host"
+                );
+            }
+            entry.shadow = Some(Arc::new(Shadow::new(
+                (buffer, data, gpu, bytes),
+                Kind::Buffer,
+                key.0,
+                buf_len,
+            )));
+            promoted = Some((key.0, entry.end));
         }
-        entry.shadow = Some(Arc::new(Shadow::new(
-            (buffer, data, gpu, bytes),
-            Kind::Buffer,
-            key.0,
-            buf_len,
-        )));
+        (entry.shadow.as_ref().map(Shadow::touch), promoted)
+    };
+    drop(map);
+    if let Some((buf_start, buf_end)) = promoted {
+        prune_overlapping_loose(buf_start, buf_end, None);
     }
-    entry.shadow.as_ref().map(Shadow::touch)
+    shadow
+}
+
+/// Removes any `LOOSE` shadows overlapping `[range_start, range_end)` (other
+/// than `keep_ptr`, if given) and resets mirrored descriptor slots pointing to
+/// them so a promoted monolithic buffer shadow or expanded loose window never
+/// aliases a stale smaller `LOOSE` copy.
+fn prune_overlapping_loose(range_start: u64, range_end: u64, keep_ptr: Option<usize>) {
+    let mut stale_ptrs = std::collections::HashSet::new();
+    let mut dropped: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let mut loose_map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = loose_map
+            .iter()
+            .filter_map(|(&(l_start, l_len), s)| {
+                let ptr = Arc::as_ptr(s) as usize;
+                if keep_ptr == Some(ptr) {
+                    return None;
+                }
+                let l_end = l_start.saturating_add(l_len);
+                (l_start < range_end && l_end > range_start).then_some((l_start, l_len))
+            })
+            .collect();
+        for k in keys {
+            if let Some(s) = loose_map.remove(&k) {
+                stale_ptrs.insert(Arc::as_ptr(&s) as usize);
+                dropped.push(s);
+            }
+        }
+    }
+    if !stale_ptrs.is_empty()
+        && !crate::descriptor::in_heap_made_lock()
+        && let Some(host_gpu) = host()
+    {
+        host_gpu.with_gpu_idle(|| {
+            let evicted = crate::descriptor::evict_buffer_slots(&stale_ptrs);
+            if evicted > 0 {
+                tracing::debug!(
+                    start = format_args!("{range_start:#x}"),
+                    end = format_args!("{range_end:#x}"),
+                    removed = dropped.len(),
+                    evicted,
+                    "pruned overlapping loose shadows after promotion"
+                );
+            }
+        });
+    }
+    drop(dropped);
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -685,9 +739,10 @@ const WINDOW: u64 = 1 << 20;
 /// holds (no list, no descriptor, no pending shader write) are freed, least
 /// recently used first, before another is made. Freeing is safe: such a
 /// copy holds nothing title memory does not (shader writes went back), and
-/// a later use makes and fills a new one.
-const LOOSE_BUDGET: u64 = 64 << 20;
-const ALIGNED_BUDGET: u64 = 32 << 20;
+/// a later use makes and fills a new one. Under commit pressure,
+/// [`relieve_pressure`] still reclaims all idle copies down to zero.
+const LOOSE_BUDGET: u64 = 256 << 20;
+const ALIGNED_BUDGET: u64 = 64 << 20;
 
 /// Frees least recently used copies in `map` that nothing else holds until
 /// `live` bytes (of the map's kind) plus `incoming` fit in `budget`.
@@ -1066,7 +1121,10 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         start,
         len,
     ));
+    let keep_ptr = Arc::as_ptr(&shadow) as usize;
     map.insert((start, len), shadow.clone());
+    drop(map);
+    prune_overlapping_loose(start, start.saturating_add(len), Some(keep_ptr));
     Some(shadow)
 }
 
@@ -1865,19 +1923,24 @@ mod tests {
         // SAFETY: `[off, off + 8)` lies inside `sub`'s mapped host buffer.
         let got = unsafe { std::slice::from_raw_parts(sub.data.add(off), 8) };
         assert_eq!(got, &[0x5Au8; 8]);
+        let weak_sub = Arc::downgrade(&sub);
         drop(sub);
 
-        // A 5 MiB slice inside a 16 MiB arena (`buf_len >= 2 * req_len`) also stays windowed.
-        let mid = find(addr, 5 << 20).expect("windowed mid-range shadow");
-        assert_eq!(mid.kind, Kind::Loose);
-        assert!(mid.bytes <= 6 << 20, "mid shadow bounded: {}", mid.bytes);
-        drop(mid);
-
-        // Full-range access (> WINDOWED_MAX_REQ and > half the buffer) falls back
-        // to the monolithic Buffer shadow cleanly.
-        let full = find(addr, 10 << 20).expect("monolithic fallback shadow");
+        // Accessing > WINDOWED_MAX_REQ (e.g. 5 MiB) promotes to the monolithic
+        // Buffer shadow AND prunes the overlapping earlier LOOSE window so both
+        // views never alias separate GPU copies (zero split-brain).
+        let full = find(addr, 5 << 20).expect("monolithic fallback shadow");
         assert_eq!(full.kind, Kind::Buffer);
         assert_eq!(full.bytes, 16 << 20);
+        assert!(
+            weak_sub.upgrade().is_none(),
+            "monolithic buffer promotion must prune overlapping LOOSE windows"
+        );
+        // Subsequent small sub-range lookups inside the promoted arena reuse the
+        // monolithic shadow instead of creating a new LOOSE window.
+        let sub_after = find(addr + 0x2000, 4096).expect("post-promotion subrange");
+        assert!(Arc::ptr_eq(&full, &sub_after));
+        drop(sub_after);
         drop(full);
 
         unregister(id, addr);

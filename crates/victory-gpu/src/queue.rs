@@ -294,6 +294,31 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        {
+            static LAST_LAYOUT: std::sync::Mutex<(u32, u32)> = std::sync::Mutex::new((0, 0));
+            let mut last = LAST_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
+            if *last != (planes, plane.count) {
+                *last = (planes, plane.count);
+                let mut extra_words = [0u64; 12];
+                if planes > 1 {
+                    crate::host::copy_mapped(
+                        extra_words.as_mut_ptr().cast::<u8>(),
+                        plane_parameters.cast::<u8>(),
+                        std::mem::size_of_val(&extra_words),
+                        false,
+                    );
+                }
+                tracing::info!(
+                    frame,
+                    planes,
+                    plane0_count = plane.count,
+                    plane0_token = format_args!("{:#x}", plane.token),
+                    plane0_resources = ?plane.resources,
+                    extra_words = ?(if planes > 1 { &extra_words[..] } else { &[][..] }),
+                    "PresentX plane layout"
+                );
+            }
+        }
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);

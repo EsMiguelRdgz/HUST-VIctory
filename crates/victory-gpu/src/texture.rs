@@ -137,6 +137,7 @@ fn lend(size: u64) -> Option<Lent> {
         crate::shadow::relieve_pressure(size);
     }
     let Some((buffer, data)) = host()?.upload_buffer(size) else {
+        tracing::warn!(size, "no host upload buffer for texture staging");
         memstat::count(memstat::Event::Failures, 1);
         return None;
     };
