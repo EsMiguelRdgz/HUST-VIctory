@@ -9,9 +9,9 @@ In particular:
   recovery findings and the resume point in `progress.md` first.
 - Keep `progress.md` (repository root) current after every significant finding, source
   change, test run, commit, or blocker; append a handoff entry for every session.
-- Ask for explicit user confirmation immediately before every Git mutation, including
-  each commit. Never use destructive Git operations, and never fetch, merge, rebase, or
-  import upstream development.
+- Verified local commits during Phase 10 are pre-authorized (see `AGENTS.md`); ask for
+  explicit confirmation before destructive Git operations, remote pushes, or major scope
+  changes. Never fetch, merge, rebase, or import upstream development.
 - Never launch the game, another application, or a GPU workload automatically; leave
   exact manual validation instructions instead. Do not claim hardware performance or
   memory improvements without measurements from an authorized hardware run.
