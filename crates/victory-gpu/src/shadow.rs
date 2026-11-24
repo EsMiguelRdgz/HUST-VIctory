@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -44,6 +44,27 @@ pub(crate) struct Shadow {
     /// What the host buffer is for and its size, as counted in [`memstat`].
     kind: Kind,
     bytes: u64,
+    /// When it was last looked up ([`TICK`]), for reclaiming unused copies.
+    used: AtomicU64,
+}
+
+/// Numbers lookups of loose and aligned copies, oldest first.
+static TICK: AtomicU64 = AtomicU64::new(1);
+
+impl Shadow {
+    /// Whether descriptors made on this copy must keep it alive: loose
+    /// windows and aligned copies, which [`reclaim`] frees once nothing
+    /// holds them. Copies of buffer objects live until the title releases
+    /// the buffer, as before.
+    pub(crate) fn kept_by_views(&self) -> bool {
+        matches!(self.kind, Kind::Loose | Kind::Aligned)
+    }
+
+    fn touch(self: &Arc<Self>) -> Arc<Self> {
+        self.used
+            .store(TICK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        self.clone()
+    }
 }
 
 impl Drop for Shadow {
@@ -221,6 +242,7 @@ impl Shadow {
             pending: Mutex::default(),
             kind,
             bytes,
+            used: AtomicU64::new(TICK.fetch_add(1, Ordering::Relaxed)),
         }
     }
 
@@ -538,10 +560,58 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+/// gets copies of the aligned windows it touches; a request inside an
+/// existing window uses it rather than another overlapping copy.
 const WINDOW: u64 = 4 << 20;
+
+/// Bytes of loose windows, and of aligned copies, past which copies nothing
+/// holds (no list, no descriptor, no pending shader write) are freed, least
+/// recently used first, before another is made. Freeing is safe: such a
+/// copy holds nothing title memory does not (shader writes went back), and
+/// a later use makes and fills a new one.
+/// shortcut: fixed budgets, not measured; tune with an authorized run's
+/// `host memory` lines.
+const LOOSE_BUDGET: u64 = 512 << 20;
+const ALIGNED_BUDGET: u64 = 256 << 20;
+
+/// Frees least recently used copies in `map` that nothing else holds until
+/// `live` bytes (of the map's kind) plus `incoming` fit in `budget`.
+/// Returns bytes freed.
+fn reclaim(
+    map: &mut BTreeMap<(u64, u64), Arc<Shadow>>,
+    live: u64,
+    budget: u64,
+    incoming: u64,
+) -> u64 {
+    if live.saturating_add(incoming) <= budget {
+        return 0;
+    }
+    let mut idle: Vec<(u64, (u64, u64), u64)> = map
+        .iter()
+        .filter(|(_, s)| {
+            Arc::strong_count(s) == 1
+                && s.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()
+        })
+        .map(|(&k, s)| (s.used.load(Ordering::Relaxed), k, s.bytes))
+        .collect();
+    idle.sort_unstable();
+    let (mut freed, mut over) = (0, live.saturating_add(incoming) - budget);
+    for (_, key, bytes) in idle {
+        if over == 0 {
+            break;
+        }
+        map.remove(&key);
+        freed += bytes;
+        over = over.saturating_sub(bytes);
+    }
+    if freed > 0 {
+        tracing::debug!(freed, "unused host copies of title memory freed");
+    }
+    freed
+}
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
@@ -571,11 +641,17 @@ pub(crate) fn find_aligned(address: u64, len: u64, align: u64) -> Option<Arc<Sha
                 && start.saturating_add(slen) >= end
                 && (address - start).is_multiple_of(align)
         })
-        .map(|(_, s)| s.clone())
+        .map(|(_, s)| s.touch())
     {
         return Some(existing);
     }
     let bytes = len.max(align).next_multiple_of(1 << 16);
+    reclaim(
+        &mut map,
+        memstat::live(Kind::Aligned).0,
+        ALIGNED_BUDGET,
+        bytes,
+    );
     let (buffer, data) = host()?.shared_buffer(bytes)?;
     crate::host::name(&buffer, || {
         format!("aligned buffer {address:#x}+{bytes:#x} (align {align})")
@@ -602,9 +678,17 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
+    // Windows start on window boundaries, so one holding the range starts at
+    // or before `start`; there are few, so look at all that do.
+    if let Some(shadow) = map
+        .range(..=(start, u64::MAX))
+        .rev()
+        .find(|&(&(s, l), _)| s.saturating_add(l) >= end)
+        .map(|(_, s)| s.touch())
+    {
+        return Some(shadow);
     }
+    reclaim(&mut map, memstat::live(Kind::Loose).0, LOOSE_BUDGET, len);
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
@@ -929,6 +1013,69 @@ mod tests {
             weak.upgrade().is_none(),
             "unregister pruned the aligned copy"
         );
+        let _ = host_gpu;
+    }
+
+    /// Reclaiming frees only copies nothing holds, least recently used
+    /// first, and only as many as the budget needs.
+    #[test]
+    fn reclaim_frees_only_idle_copies_oldest_first() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let make = |start: u64| {
+            let (buffer, data) = host_gpu.shared_buffer(PAGE as u64).expect("buffer");
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let shadow = Arc::new(Shadow::new(
+                (buffer, data, gpu, PAGE as u64),
+                Kind::Loose,
+                start,
+                PAGE as u64,
+            ));
+            shadow.touch()
+        };
+        let page = PAGE as u64;
+        let mut map = BTreeMap::new();
+        for (n, start) in [0x10_0000u64, 0x20_0000, 0x30_0000, 0x40_0000]
+            .into_iter()
+            .enumerate()
+        {
+            let shadow = make(start);
+            // Distinct ascending use order regardless of other tests' ticks.
+            shadow.used.store(n as u64 + 1, Ordering::Relaxed);
+            map.insert((start, page), shadow);
+        }
+        let held = map[&(0x10_0000, page)].clone(); // a list or descriptor
+        map[&(0x20_0000, page)].writing(0x20_0000, 16); // shader write pending
+
+        // Under budget: nothing is freed.
+        assert_eq!(reclaim(&mut map, 0, 4 * page, page), 0);
+        assert_eq!(map.len(), 4);
+        // One page over: only the oldest idle copy goes.
+        assert_eq!(reclaim(&mut map, 4 * page, 4 * page, 1), page);
+        assert!(!map.contains_key(&(0x30_0000, page)));
+        // Far over: every idle copy goes, held and pending ones stay.
+        assert_eq!(reclaim(&mut map, 100 * page, 0, page), page);
+        assert_eq!(
+            map.keys().copied().collect::<Vec<_>>(),
+            [(0x10_0000, page), (0x20_0000, page)]
+        );
+        drop(held);
+    }
+
+    /// A range inside an existing loose window uses it instead of making an
+    /// overlapping copy.
+    #[test]
+    fn loose_requests_inside_a_window_share_it() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let memory = vec![0u8; 3 * WINDOW as usize];
+        let at = (memory.as_ptr() as u64).next_multiple_of(WINDOW);
+        let wide = loose(at, at + WINDOW + 16).expect("two-window copy");
+        let inside = loose(at + 64, at + 128).expect("copy");
+        assert!(Arc::ptr_eq(&wide, &inside));
         let _ = host_gpu;
     }
 }

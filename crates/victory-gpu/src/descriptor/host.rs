@@ -5,14 +5,16 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::shadow::Shadow;
 
 pub(crate) struct HostHeap {
     device: ID3D12Device,
@@ -32,6 +34,11 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Host copies of title memory that slots' views are made on and that
+    /// nothing else keeps (loose windows and aligned copies, see
+    /// [`crate::shadow::Shadow::kept_by_views`]): held while a slot shows
+    /// them, so reclaiming unused copies never frees one a slot reads.
+    owners: Mutex<HashMap<u32, Arc<Shadow>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -187,6 +194,7 @@ impl HostHeap {
             capped,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            owners: Mutex::default(),
             next: Mutex::new((0, vec![false; dynamic_count as usize])),
             capped_mirrors: AtomicU64::new(0),
             dynamic_exhausted: AtomicU64::new(0),
@@ -380,20 +388,41 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a type-compatible null
     /// view if the host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        if !make_on(&self.device, view, self.cpu(index)) {
+        let mut owner = None;
+        if !make_owned(&self.device, view, self.cpu(index), &mut owner) {
             self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
             null_for_on(&self.device, view, self.cpu(index));
         }
+        self.own(index, owner);
+    }
+
+    /// Slot `index` now shows `owner`'s memory (or none of a copy that
+    /// needs keeping).
+    fn own(&self, index: u32, owner: Option<Arc<Shadow>>) {
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        match owner {
+            Some(shadow) => owners.insert(index, shadow),
+            None => owners.remove(&index),
+        };
+    }
+
+    /// Host copies the slots keep alive (diagnostics and tests).
+    #[cfg(test)]
+    fn owned(&self, index: u32) -> Option<Arc<Shadow>> {
+        let owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        owners.get(&index).cloned()
     }
 
     /// Makes slot `index` a type-compatible null view for `view`.
     pub(crate) fn make_null_for(&self, view: &View, index: u32) {
         self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
         null_for_on(&self.device, view, self.cpu(index));
+        self.own(index, None);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.own(index, None);
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -457,12 +486,16 @@ impl HostHeap {
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
-            if (later || !make_on(&self.device, &view, self.cpu(index))) && !self.sampler {
+            let mut owner = None;
+            if (later || !make_owned(&self.device, &view, self.cpu(index), &mut owner))
+                && !self.sampler
+            {
                 if !later {
                     self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
                 }
                 null_for_on(&self.device, &view, self.cpu(index));
             }
+            self.own(index, owner);
         }
         Some(view)
     }
@@ -611,12 +644,20 @@ fn unordered_access(base: u64, words: &[u32; 10]) -> Option<(u64, u64, u64)> {
     ))
 }
 
+/// `shadow` if a descriptor made on it must keep it alive.
+fn keep(shadow: Arc<Shadow>, owner: &mut Option<Arc<Shadow>>) {
+    if shadow.kept_by_views() {
+        *owner = Some(shadow);
+    }
+}
+
 fn buffer_srv(
     device: &ID3D12Device,
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    owner: &mut Option<Arc<Shadow>>,
 ) -> bool {
     let element = element_size(&desc);
     if element == 0 {
@@ -645,6 +686,7 @@ fn buffer_srv(
     buffer.FirstElement += offset / element;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe { device.CreateShaderResourceView(&shadow.buffer, Some(&desc), at) };
+    keep(shadow, owner);
     true
 }
 
@@ -659,6 +701,7 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    owner: &mut Option<Arc<Shadow>>,
 ) -> bool {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -702,6 +745,7 @@ fn buffer_uav(
     unsafe {
         device.CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
+    keep(shadow, owner);
     true
 }
 
@@ -760,7 +804,19 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 }
 
 /// Makes the host descriptor for `view` at `at` on `device`; false if it cannot.
+#[cfg_attr(not(test), allow(dead_code))]
 fn make_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    make_owned(device, view, at, &mut None)
+}
+
+/// As [`make_on`], setting `owner` to the host copy the descriptor reads if
+/// the descriptor must keep it alive.
+fn make_owned(
+    device: &ID3D12Device,
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    owner: &mut Option<Arc<Shadow>>,
+) -> bool {
     match view {
         &View::Constant(address, size) => {
             let Some(shadow) = crate::shadow::find(address, u64::from(size.max(1))) else {
@@ -780,6 +836,7 @@ fn make_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) 
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            keep(shadow, owner);
             true
         }
         View::Shader(0, Some(words)) => {
@@ -808,7 +865,7 @@ fn make_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) 
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(device, data as u64, len, srv_desc(desc), at)
+                buffer_srv(device, data as u64, len, srv_desc(desc), at, owner)
             } else {
                 false
             }
@@ -833,7 +890,7 @@ fn make_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) 
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(device, data as u64, len, uav_desc(desc), at)
+                        buffer_uav(device, data as u64, len, uav_desc(desc), at, owner)
                     }
                     _ => false,
                 };
@@ -872,7 +929,7 @@ fn make_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) 
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make_on(device, &view, at);
+                return make_owned(device, &view, at, owner);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -890,9 +947,9 @@ fn make_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) 
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(device, address, len, uav_desc(words), at)
+                buffer_uav(device, address, len, uav_desc(words), at, owner)
             } else {
-                buffer_srv(device, address, len, srv_desc(words), at)
+                buffer_srv(device, address, len, srv_desc(words), at, owner)
             }
         }
     }
@@ -1622,5 +1679,51 @@ mod tests {
         crate::host::assert_no_debug_errors(&host_gpu.device);
 
         crate::shadow::unregister(fake_res_id, base);
+    }
+
+    /// A slot made on an aligned copy keeps that copy alive until the slot
+    /// shows something else; slots on buffer-object copies keep nothing.
+    #[test]
+    fn slots_keep_the_copies_they_need_alive() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let heap =
+            HostHeap::new_capped_for_test(host_gpu.device.clone(), 16, 16, 4).expect("host heap");
+        let backing = vec![0u8; 64 * 1024];
+        let base = backing.as_ptr() as u64;
+        let fake_res_id = (base as usize) ^ 0x0BE7_0A11;
+        crate::shadow::register(fake_res_id, base, backing.len() as u64);
+
+        let view_addr = base + 16;
+        let mut res_desc = [0u32; 14];
+        res_desc[0] = 1; // BUFFER
+        res_desc[4] = 4096;
+        let mut words = [0u32; 16];
+        words[0] = DXGI_FORMAT_UNKNOWN.0 as u32;
+        words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        words[6] = 32; // NumElements
+        words[7] = 32; // StructureByteStride
+        words[10] = view_addr as u32;
+        words[11] = (view_addr >> 32) as u32;
+        heap.make_at(0, &View::Placed(false, res_desc, words));
+        let owner = heap.owned(0).expect("aligned copy kept");
+        assert!(owner.kept_by_views());
+
+        // An aligned view of the buffer copy itself needs no keeping.
+        words[10] = base as u32;
+        words[11] = (base >> 32) as u32;
+        heap.make_at(1, &View::Placed(false, res_desc, words));
+        assert!(heap.owned(1).is_none());
+
+        let weak = Arc::downgrade(&owner);
+        drop(owner);
+        crate::shadow::unregister(fake_res_id, base); // prunes the aligned map
+        assert!(weak.upgrade().is_some(), "the slot still reads it");
+        heap.make_null(0);
+        assert!(heap.owned(0).is_none());
+        assert!(weak.upgrade().is_none(), "freed once no slot shows it");
+        crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 }
