@@ -380,11 +380,11 @@ mod tests {
             slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
         }
         let text = error_text(error);
-        // TEMPORARY (one CI run): show the host's message in the log.
-        panic!(
-            "hr={:#010x} blob_produced={produced} host error blob: {text}",
-            hr as u32
-        );
+        assert_eq!(hr, E_INVALIDARG, "host error blob: {text}");
+        assert!(!produced, "no blob for an invalid description");
+        // GitHub windows-latest (image win25-vs2026 20261116.315.1) says:
+        // "Unsupported ShaderVisibility value 2147483647 (root parameter [0])."
+        assert!(!text.starts_with('('), "the host explains the refusal");
     }
 
     /// The host's deserializer reads our blobs back (the upscaler's call).
