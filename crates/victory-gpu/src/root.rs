@@ -255,24 +255,69 @@ mod tests {
         }
     }
 
+    /// Our descriptions are read by the host's serializer as its own
+    /// `D3D12_ROOT_SIGNATURE_DESC` / `D3D12_VERSIONED_ROOT_SIGNATURE_DESC`,
+    /// so their x64 layouts must match `d3d12.h` exactly.
+    #[cfg(windows)]
+    #[test]
+    fn descriptions_match_the_host_layout() {
+        use std::mem::{offset_of, size_of};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_ROOT_PARAMETER, D3D12_ROOT_SIGNATURE_DESC as Host,
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC as HostVersioned,
+        };
+        assert_eq!(size_of::<Desc>(), size_of::<Host>());
+        assert_eq!(
+            offset_of!(Desc, parameter_count),
+            offset_of!(Host, NumParameters)
+        );
+        assert_eq!(offset_of!(Desc, parameters), offset_of!(Host, pParameters));
+        assert_eq!(
+            offset_of!(Desc, sampler_count),
+            offset_of!(Host, NumStaticSamplers)
+        );
+        assert_eq!(
+            offset_of!(Desc, samplers),
+            offset_of!(Host, pStaticSamplers)
+        );
+        assert_eq!(offset_of!(Desc, flags), offset_of!(Host, Flags));
+        assert_eq!(size_of::<VersionedDesc>(), size_of::<HostVersioned>());
+        assert_eq!(
+            offset_of!(VersionedDesc, version),
+            offset_of!(HostVersioned, Version)
+        );
+        assert_eq!(
+            offset_of!(VersionedDesc, desc),
+            offset_of!(HostVersioned, Anonymous)
+        );
+        // A root parameter's union holds a pointer (descriptor tables), so on
+        // x64 it starts at 8 and the visibility follows it at 24.
+        assert_eq!(size_of::<D3D12_ROOT_PARAMETER>(), 32);
+        assert_eq!(offset_of!(D3D12_ROOT_PARAMETER, Anonymous), 8);
+        assert_eq!(offset_of!(D3D12_ROOT_PARAMETER, ShaderVisibility), 24);
+    }
+
     /// One 32-bit constant at b0, serialized by the host, then created.
     #[cfg(windows)]
     #[test]
     fn host_serialized_blobs_create_root_signatures() {
-        #[repr(C)]
-        struct Constants {
-            kind: u32,
-            register: u32,
-            space: u32,
-            count: u32,
-            visibility: u32,
-        }
-        let parameter = Constants {
-            kind: 1,
-            register: 0,
-            space: 0,
-            count: 1,
-            visibility: 0,
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY_ALL,
+        };
+        // The host's own definition: a hand-packed five-u32 struct put the
+        // constants at the wrong offsets and left the visibility (offset 24)
+        // past its end, so the serializer read stack garbage.
+        let parameter = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 1,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         };
         let desc = Desc {
             parameter_count: 1,
