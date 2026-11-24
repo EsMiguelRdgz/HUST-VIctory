@@ -965,6 +965,16 @@ fn wave_a_1a_bindless_s_buffer_load_reads_srv_and_cbv_slots() {
     }
     words.push(S_ENDPGM);
     let shader = lower_cs(&words);
+    // The source descriptor really is data-indexed (bindless): the lowering
+    // passed it the heap guard, as for `a_heap_index_past_the_heap_reads_the_guard_slot`.
+    assert!(
+        shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::ResourceHeap),
+        "the load did not take the data-indexed heap path: {:?}",
+        shader.user_data
+    );
 
     let want = [0x1111_0001u32, 0x2222_0002, 0x3333_0003, 0x4444_0004];
     let views = [
@@ -985,11 +995,10 @@ fn wave_a_1a_bindless_s_buffer_load_reads_srv_and_cbv_slots() {
     let mut wrong = Vec::new();
     for (slot, what) in cases {
         // A fresh WARP device per case: a wrong-kind read may remove the
-        // device, which must not hide the other cases' outcomes.
-        let Ok(host) = Host::new(true) else {
-            eprintln!("no SM 6.6 WARP device; skipped");
-            return;
-        };
+        // device, which must not hide the other cases' outcomes. No WARP is a
+        // failure, never a silent pass (and never a fallback to hardware).
+        let host = Host::new(true)
+            .unwrap_or_else(|e| panic!("no SM 6.6 WARP device; the regression did not run: {e}"));
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("warp: compute_pipeline failed: {e}"));

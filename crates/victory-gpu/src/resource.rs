@@ -3961,6 +3961,74 @@ pub(crate) mod tests {
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 
+    /// `D3D12_TEXTURE_COPY_LOCATION` as the Wave A helpers pass it to the
+    /// host's `CopyTextureRegion`: resource, type (0 = subresource index,
+    /// 1 = placed footprint), then the union. Pinned to the host's definition
+    /// by `copy_location_matches_the_host_layout`.
+    #[cfg(windows)]
+    #[repr(C)]
+    struct CopyLocation {
+        resource: *const c_void,
+        kind: u32,
+        footprint: PlacedFootprint,
+    }
+
+    /// The helpers' copy locations are read by the host as its own
+    /// `D3D12_TEXTURE_COPY_LOCATION` / `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`.
+    #[cfg(windows)]
+    #[test]
+    fn copy_location_matches_the_host_layout() {
+        use std::mem::{offset_of, size_of};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT as HostFootprint, D3D12_SUBRESOURCE_FOOTPRINT,
+            D3D12_TEXTURE_COPY_LOCATION as HostLocation,
+        };
+        assert_eq!(size_of::<CopyLocation>(), size_of::<HostLocation>());
+        assert_eq!(
+            offset_of!(CopyLocation, resource),
+            offset_of!(HostLocation, pResource)
+        );
+        assert_eq!(
+            offset_of!(CopyLocation, kind),
+            offset_of!(HostLocation, Type)
+        );
+        assert_eq!(
+            offset_of!(CopyLocation, footprint),
+            offset_of!(HostLocation, Anonymous)
+        );
+        assert_eq!(size_of::<PlacedFootprint>(), size_of::<HostFootprint>());
+        assert_eq!(
+            offset_of!(PlacedFootprint, offset),
+            offset_of!(HostFootprint, Offset)
+        );
+        let footprint = offset_of!(HostFootprint, Footprint);
+        assert_eq!(
+            offset_of!(PlacedFootprint, format),
+            footprint + offset_of!(D3D12_SUBRESOURCE_FOOTPRINT, Format)
+        );
+        assert_eq!(
+            offset_of!(PlacedFootprint, row_pitch),
+            footprint + offset_of!(D3D12_SUBRESOURCE_FOOTPRINT, RowPitch)
+        );
+    }
+
+    /// Restores a placed-texture test's global state even when the test
+    /// panics (an expected failure of a known-defect test included): evicts
+    /// every placed texture over `[address, address + len)` while its backing
+    /// memory still lives. Declare it after the backing so it drops first.
+    #[cfg(windows)]
+    struct PlacedCleanup {
+        address: usize,
+        len: usize,
+    }
+
+    #[cfg(windows)]
+    impl Drop for PlacedCleanup {
+        fn drop(&mut self) {
+            crate::title_memory_remapped(self.address, self.len);
+        }
+    }
+
     /// Copies `texels` (one 32-bit texel each) into mip 0 of `image`'s host
     /// texture through an upload buffer, as a host GPU write would leave it.
     #[cfg(windows)]
@@ -4021,12 +4089,6 @@ pub(crate) mod tests {
         let host_image = host_resource(image).unwrap();
         let list = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x400).unwrap();
-        #[repr(C)]
-        struct Location {
-            resource: *const c_void,
-            kind: u32,
-            footprint: PlacedFootprint,
-        }
         let rows = PlacedFootprint {
             offset: 0,
             format,
@@ -4035,12 +4097,12 @@ pub(crate) mod tests {
             depth: 1,
             row_pitch: pitch,
         };
-        let to = Location {
+        let to = CopyLocation {
             resource: host_image.as_raw().cast_const(),
             kind: 0,
             footprint: rows,
         };
-        let from = Location {
+        let from = CopyLocation {
             resource: upload.as_raw().cast_const(),
             kind: 1,
             footprint: rows,
@@ -4110,12 +4172,6 @@ pub(crate) mod tests {
         let host_image = host_resource(image).unwrap();
         let list = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
-        #[repr(C)]
-        struct Location {
-            resource: *const c_void,
-            kind: u32,
-            footprint: PlacedFootprint,
-        }
         let rows = PlacedFootprint {
             offset: 0,
             format,
@@ -4124,12 +4180,12 @@ pub(crate) mod tests {
             depth: 1,
             row_pitch: pitch,
         };
-        let to = Location {
+        let to = CopyLocation {
             resource: readback.as_raw().cast_const(),
             kind: 1,
             footprint: rows,
         };
-        let from = Location {
+        let from = CopyLocation {
             resource: host_image.as_raw().cast_const(),
             kind: 0,
             footprint: rows,
@@ -4194,19 +4250,28 @@ pub(crate) mod tests {
         let _serial = TEXTURE_GLOBAL_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if std::env::var_os("VICTORY_D3D12_WARP").is_none() {
-            eprintln!("Wave A 1B regression runs on WARP only (VICTORY_D3D12_WARP=1); skipped");
-            return;
-        }
-        let Some(host_gpu) = crate::host::host() else {
-            return;
-        };
+        // Never a silent pass: without WARP this test must not run at all, so
+        // it fails loudly instead of returning early.
+        assert!(
+            std::env::var_os("VICTORY_D3D12_WARP").is_some(),
+            "Wave A 1B regression runs on WARP only: set VICTORY_D3D12_WARP=1 (never on hardware)"
+        );
+        let host_gpu = crate::host::host().expect("no host device: the regression did not run");
+        assert!(
+            host_adapter_is_software(&host_gpu.device),
+            "the host device is not WARP; refusing to run a known-defect test on hardware"
+        );
         const R32_FLOAT: u32 = 41;
         const R32_UINT: u32 = 42;
         let (width, height) = (64u32, 64u32);
         // Title memory for both views, 64 KiB aligned, never written by the title.
         let backing = vec![0u8; 2 << 20];
         let addr = (backing.as_ptr() as u64).next_multiple_of(64 << 10);
+        // Dropped before `backing` (declared after it), even on panic.
+        let _cleanup = PlacedCleanup {
+            address: addr as usize,
+            len: backing.len() - (addr as usize - backing.as_ptr() as usize),
+        };
         let words = |d: &ResourceDesc| -> [u32; 14] {
             // SAFETY: `ResourceDesc` is 56 bytes = 14 u32 words.
             unsafe { std::ptr::from_ref(d).cast::<[u32; 14]>().read_unaligned() }
@@ -4252,14 +4317,36 @@ pub(crate) mod tests {
             &got[..4],
             &want[..4]
         );
+        assert_eq!(got.len(), want.len(), "read back every texel");
         assert_eq!(
             differing, 0,
             "the R32_FLOAT view of the same memory does not see the R32_UINT view's GPU write"
         );
-        drop(reader);
-        drop(writer);
-        crate::title_memory_remapped(addr as usize, 1 << 20);
-        drop(backing);
+    }
+
+    /// Whether `device` runs on a software adapter (WARP), from its LUID.
+    #[cfg(windows)]
+    fn host_adapter_is_software(
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    ) -> bool {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
+            IDXGIAdapter1, IDXGIFactory4,
+        };
+        // SAFETY: plain adapter queries with valid out values.
+        unsafe {
+            let luid = device.GetAdapterLuid();
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return false;
+            };
+            let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+                return false;
+            };
+            adapter
+                .GetDesc1()
+                .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        }
     }
 
     /// Idle title-written host textures are evicted under commit pressure and
