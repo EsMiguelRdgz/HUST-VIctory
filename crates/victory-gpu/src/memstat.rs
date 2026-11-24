@@ -427,7 +427,7 @@ pub(crate) fn start_monitor(video: fn() -> Option<Video>) {
                     let line = summary(video());
                     tracing::info!("{line}");
                     report(&line);
-                    if tick % 6 == 0 {
+                    if tick.is_multiple_of(6) {
                         let line = space_summary();
                         tracing::info!("{line}");
                         report(&line);
