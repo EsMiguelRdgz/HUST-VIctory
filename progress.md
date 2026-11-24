@@ -1,30 +1,30 @@
 # Current Project Status
 
 - Current milestone: Phase 10 — memory architecture, copy-back performance, bounded parallelism, GPU acceleration, resource budgeting, and robustness
-- Current subphase: Phase 10B — partial-diff freshness VERIFIED (package level); fixed a pre-existing flaky/hang-prone watch test; verified work committed; next is snapshot isolation
+- Current subphase: Phase 10B/10A — snapshot isolation and fence-wait handling VERIFIED and committed; next: memory/lifetime accounting (Priority 3)
 - Current branch: `hust/nvidia-rtx3070`
-- Latest verified commit: `bc9d31b` (Phase 10 commits `941d966`, `2fcebdf`, `bc9d31b`, plus the docs commit that adds this line)
-- Current working-tree status: clean after the docs commit
+- Latest verified commit: `e24bc28` (fence waits). Phase 10 commits so far: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`
+- Current working-tree status: clean except this progress.md checkpoint (committed with the next change)
 - Active agent: Claude Code
 - Model: Claude Opus 5.5
 - Last checkpoint timestamp: 2026-11-23 (Claude recovery checkpoint)
 - Current build status: PASS (`cargo test --workspace --no-run`)
-- Current test status: `victory-gpu` 52/52 pass; `cargo xtask policy` 150 files ok; `cargo test --workspace` 239 passed / 0 failed / 3 ignored
+- Current test status: `cargo test -p victory-gpu` 55/55 after `e24bc28`; last full workspace run 239/0/3 at `bc9d31b` (rerun pending after the next change)
 
 ## Active Task
 
-- Objective: Prevent diff-only copy-back from marking a whole 64 KiB shadow page current when concurrent title-CPU writes in that page were preserved but not synchronized into the shadow.
-- Current implementation: VERIFIED (package). Claude's recovery audit found that `copy_back_ranges` in the working tree NO LONGER calls `watch::writes`/`copied.fill(now)` (OpenCode made the edit but recorded the task as NOT_STARTED). The missing piece is the full-page MEM_WRITE_WATCH regression test.
-- Files involved: `crates/victory-gpu/src/shadow.rs` (copy-back bookkeeping, tests); `crates/victory-gpu/src/watch.rs` read-only reference.
-- Expected behavior: GPU-changed bytes and concurrent CPU-changed bytes in one watched page both reach title memory; a later `update` brings the preserved CPU bytes into the shadow and the shadow stays in watched mode.
-- Known risks: a later redundant page refresh (copy-back's own WriteProcessMemory dirties the watch bit); correctness first, no performance claim.
+- Objective: Priority 3 — memory allocation and resource lifetime accounting for shadow copies, snapshot buffers and other host allocations, so excessive committed memory can be attributed on an authorized run.
+- Current implementation: NOT_STARTED.
+- Plan: (1) process-wide byte counters for live shadow host buffers by kind (buffer / loose window / aligned), snapshot-pool retained bytes and in-flight snapshot bytes; (2) report them with process private bytes / commit (`GetProcessMemoryInfo`, PROCESS_MEMORY_COUNTERS_EX.PrivateUsage) and DXGI local/non-local budget (`IDXGIAdapter3::QueryVideoMemoryInfo`) on the existing periodic stats line; (3) a byte budget for `SNAPSHOT_POOL` (currently 8 buffers by count, unbounded bytes).
+- Known risks: none yet.
 
 ## Immediate Resume Instructions
 
-- First action: start Priority B snapshot isolation (see next step).
-- Next implementation step: Priority B snapshot isolation. Plan: make `Shadow::snapshot_ranges` return the snapshot `(base_off, Vec<u8>)` instead of storing it in the shared `Shadow.before` slot, take snapshots in `Host::execute` (host.rs ~639) AFTER acquiring `self.submitted` (host.rs ~642) so each submission's baseline is its own and taken right before its GPU work, pass it into `copy_back_ranges`, remove the `before` field. Then checked fence waits: check `WaitForSingleObject` return (host.rs ~654) and `Signal`/`SetEventOnCompletion` errors; on an unconfirmed wait verify `fence.GetCompletedValue() >= submitted` before reading shadows for copy-back.
-- Pending tests: focused shadow tests, full `victory-gpu`, modified-file rustfmt, workspace tests/clippy, diagnostics clippy/build, final Phase 10 matrix.
-- Known blockers: none; commits require explicit per-commit user confirmation. No hardware logs available.
+- First action: implement the accounting plan above in `crates/victory-gpu/src/shadow.rs` (counters next to `SNAPSHOT_POOL`, `Shadow::new`, `Drop`) and find the periodic frame-rate/stats log in `host.rs` (`SUBMISSION_US`, `COPY_BACK` are reported there).
+- Then: Priority 4/5 — bounded snapshot pool, reclamation of `LOOSE` windows and loose-derived `ALIGNED` shadows (currently never freed), Priority 6 copy-back timing split (snapshot memcpy vs diff vs WriteProcessMemory), Priority 7 bounded CPU parallelism, Priority 8 GPU-side evaluation.
+- Pending tests: focused tests for each change, `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets`, `cargo build --profile diag -p victory --features diagnostics`.
+- Known blockers: none. Verified local commits are pre-authorized (AGENTS.md); pushes/destructive Git still need the user.
+- Remaining known risk: a thread's `run_deferred` refresh (before it takes the submission lock) can still write a shadow while another thread's submission GPU work reads/writes it; the snapshot fix does not cover this broader shared-shadow concurrency.
 - Commands required:
   - `cargo xtask policy`
   - `cargo test --workspace`
@@ -66,11 +66,15 @@
 - VERIFIED — `cargo xtask policy` (Claude, 2026-11-23): `asset policy: 150 files ok`.
 - VERIFIED — Workspace rerun after the watch-test fix (Claude, 2026-11-23): `cargo test --workspace` exit 0, 239 passed, 0 failed, 3 ignored (baseline 236 + 3 new Phase 10 tests). `cargo clippy --workspace --all-targets` exit 0; only the pre-existing `list.rs:1398` undocumented-unsafe warning (plus a victory-shader "1 warning" line that does not reproduce on `cargo clippy -p victory-shader`, likely incremental-cache noise; crate unmodified). rustfmt check on modified files and `git diff --check` passed.
 
+- VERIFIED — Standing commit authorization recorded in `AGENTS.md`/`CLAUDE.md` (`54a7346`).
+- VERIFIED — Priority B snapshot isolation (`8f834d1`): `Shadow.before` slot removed; `snapshot_ranges` returns an owned `Snapshot` (buffer returned to the pool on drop) taken in `Host::execute` under the `submitted` lock; `copy_back_ranges(ranges, Option<&Snapshot>)`. New test `overlapping_submissions_keep_their_own_snapshots`. `cargo test -p victory-gpu` 53/53; clippy (default and `--features diagnostics`) only the old `list.rs:1398` warning; rustfmt OK.
+- VERIFIED — Fence-wait robustness (`e24bc28`): `host::wait_fence` confirms `GetCompletedValue() >= value`, treats `u64::MAX` (device removed), a never-accepted Signal, and stale wakes of the shared auto-reset event as unconfirmed, and polls up to 10 s if the event wait/arming fails. Unconfirmed submissions skip copy-back, log an error with a running count (`UNCONFIRMED_WAITS`), and call new `Shadow::release` for their pending ranges; bottom-of-pipe markers are still written (trade-off: avoids title deadlock; such cases coincide with device removal, which `fail()`s right after). Tests `fence_waits_confirm_only_real_completion` (real D3D12 fence, CPU signals incl. `u64::MAX`) and `released_gpu_writes_allow_refreshes_again`. `cargo test -p victory-gpu` 55/55; clippy both feature sets clean apart from the old warning.
+
 ## Incomplete Tasks
 
-- NOT_STARTED — Priority B snapshot isolation: prevent overlapping submissions from replacing/consuming each other's pre-GPU baselines.
 - NOT_STARTED — Remaining Priority A: shadow/staging lifetime audit, snapshot-pool byte budgets/accounting, additional bounded allocation, and allocation-failure handling.
 - NOT_STARTED — Priority B measurement: separate scanning, snapshot memcpy, comparison, title writes, page protection, fence API/event waits, synchronization, and temporary allocation costs.
+- NOT_STARTED — Priority 3 (user numbering): memory allocation and resource lifetime accounting (ACTIVE).
 - NOT_STARTED — Priority C: evaluate justified bounded CPU parallelism with duplicate-job and memory-growth controls.
 - NOT_STARTED — Priority D: evaluate documented D3D12 compute/copy-queue acceleration and GPU-local intermediates where measurements justify them.
 - NOT_STARTED — Priority E: process/system/DXGI memory reporting, bounded caches, temporary reuse, and safe reclamation.
@@ -104,3 +108,4 @@
 - Audit of the freshness edit: correct and conservative. With the old code, `watch::writes` inside copy-back consumed the kernel dirty bit for a page containing a preserved concurrent CPU write and stamped the page fresh, so a later `copy_stale` saw `write <= copied` and never pulled the CPU bytes into the shadow. After removal, the next `update` re-queries and copies the page.
 - Created `CLAUDE.md` (defers to `AGENTS.md`).
 - Resume point: add the full-page write-watch regression, then run focused/full tests.
+- Session 2 (same agent, after user granted standing commit authorization): committed `54a7346`, `8f834d1`, `e24bc28` as recorded in Completed Tasks. Resume at Priority 3 accounting.
