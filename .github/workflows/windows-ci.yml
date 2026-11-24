@@ -26,7 +26,7 @@ on:
         type: boolean
         default: false
       fmt_base:
-        description: "Base branch for the formatting gate: .rs files changed since the merge-base must be rustfmt-clean (on that branch itself, HEAD's first parent is used)"
+        description: "Formatting-gate base: a branch (merge-base with origin/<branch>) or a commit SHA (e.g. the default branch's previous tip after a rebase-merge or multi-commit push). If HEAD is already in it, HEAD's first parent is used"
         type: string
         default: hust/phase12-memory
 
@@ -123,8 +123,11 @@ jobs:
           # Which base: on a feature branch, the merge-base with origin/FMT_BASE.
           # When HEAD is already contained in origin/FMT_BASE (a run on the
           # default branch itself, e.g. right after a merge), that diff is empty,
-          # so fall back to HEAD's first parent: for a merge commit that covers
-          # the whole merged PR, for a direct commit that commit.
+          # so fall back to HEAD's first parent: for a merge or squash commit that
+          # covers the whole merged PR, for a direct commit only that commit. A
+          # rebase-merge or a multi-commit push lands several commits at once and
+          # dispatch has no "before" SHA, so pass the previous tip as fmt_base
+          # to gate the whole range.
           $log = "$env:LOG_DIR\fmt.log"
           cargo fmt --all -- --check 2>&1 | Out-File -FilePath "$env:LOG_DIR\fmt-full.log" -Encoding utf8
           $ws = ([IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\') + '\')
@@ -137,8 +140,20 @@ jobs:
 
           $base = $null
           $reason = ''
-          $baseRef = if ($env:FMT_BASE) { "origin/$env:FMT_BASE" } else { '' }
-          if ($baseRef -and (git rev-parse --verify --quiet "$baseRef^{commit}")) {
+          $baseRef = ''
+          $resolved = $false
+          if ($env:FMT_BASE -and ($env:FMT_BASE -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$')) {
+            "fmt_base '$($env:FMT_BASE)' is not a branch name or SHA" | Tee-Object -FilePath $log
+            exit 1
+          }
+          if ($env:FMT_BASE) {
+            # A branch name resolves through origin/; otherwise accept a commit-ish (SHA).
+            foreach ($candidate in @("origin/$env:FMT_BASE", $env:FMT_BASE)) {
+              if (git rev-parse --verify --quiet "$candidate^{commit}") { $baseRef = $candidate; $resolved = $true; break }
+            }
+            if (-not $resolved) { $baseRef = $env:FMT_BASE }
+          }
+          if ($resolved) {
             $mb = (git merge-base $baseRef HEAD).Trim()
             $head = (git rev-parse HEAD).Trim()
             if ($mb -and $mb -ne $head) {
@@ -148,7 +163,7 @@ jobs:
               $reason = "HEAD is already in $baseRef"
             }
           } elseif ($baseRef) {
-            $reason = "$baseRef not found"
+            $reason = "fmt_base '$baseRef' not found"
           } else {
             $reason = 'fmt_base empty'
           }
