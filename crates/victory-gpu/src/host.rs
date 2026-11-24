@@ -1722,6 +1722,107 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
+/// Returns `true` if `[start, end)` is entirely committed, writable `MEM_PRIVATE`
+/// memory (which `XMemMapPhysicalPages` never unmaps).
+fn all_private_writable(start: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+        VirtualQuery,
+    };
+    let mut cur = start & !0xFFF;
+    for _ in 0..32 {
+        if cur >= end {
+            return true;
+        }
+        // SAFETY: plain `VirtualQuery` output struct.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid output pointer of the right size.
+        let n = unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) };
+        if n == 0
+            || info.RegionSize == 0
+            || info.State != MEM_COMMIT
+            || info.Type != MEM_PRIVATE
+            || (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0
+        {
+            return false;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= cur {
+            return false;
+        }
+        cur = next;
+    }
+    cur >= end
+}
+
+/// Copies a list of changed `(start, end)` byte runs from `src` into title
+/// memory starting at `base`. Callers must have already prepared the covering
+/// span via `kernel_will_write`.
+///
+/// Uses direct byte-exact `ptr::copy_nonoverlapping` on verified committed
+/// `MEM_PRIVATE | PAGE_READWRITE` regions (avoiding millions of kernel
+/// `WriteProcessMemory` syscalls and VAD-lock stalls), and coalesced
+/// `WriteProcessMemory` on `MEM_MAPPED` views where pages may be unmapped.
+pub(crate) fn write_runs_prepared(base: usize, src: &[u8], runs: &[(usize, usize)]) {
+    let (Some(&(first_start, _)), Some(&(_, last_end))) = (runs.first(), runs.last()) else {
+        return;
+    };
+    let span_start = base.saturating_add(first_start);
+    let span_end = base.saturating_add(last_end);
+    if all_private_writable(span_start, span_end) {
+        for &(run_start, run_end) in runs {
+            let len = run_end - run_start;
+            // SAFETY: `all_private_writable` verified `[span_start, span_end)` is
+            // committed writable `MEM_PRIVATE` memory, and `run_end <= src.len()`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(run_start),
+                    (base + run_start) as *mut u8,
+                    len,
+                );
+            }
+        }
+        return;
+    }
+    if runs.len() <= 64 {
+        for &(run_start, run_end) in runs {
+            write_mapped_prepared(
+                (base + run_start) as *mut u8,
+                // SAFETY: `run_start < run_end <= src.len()`.
+                unsafe { src.as_ptr().add(run_start) },
+                run_end - run_start,
+            );
+        }
+        return;
+    }
+    // Dense GPU-written `MEM_MAPPED` buffers (e.g. struct arrays where zero
+    // bytes stay zero between changed fields) can produce >1M tiny runs;
+    // coalesce gaps <= 16 bytes so `WriteProcessMemory` runs in a few calls.
+    const COALESCE_GAP: usize = 16;
+    let mut cur_start = runs[0].0;
+    let mut cur_end = runs[0].1;
+    for &(run_start, run_end) in &runs[1..] {
+        if run_start <= cur_end.saturating_add(COALESCE_GAP) {
+            cur_end = cur_end.max(run_end);
+        } else {
+            write_mapped_prepared(
+                (base + cur_start) as *mut u8,
+                // SAFETY: `cur_start < cur_end <= src.len()`.
+                unsafe { src.as_ptr().add(cur_start) },
+                cur_end - cur_start,
+            );
+            cur_start = run_start;
+            cur_end = run_end;
+        }
+    }
+    write_mapped_prepared(
+        (base + cur_start) as *mut u8,
+        // SAFETY: `cur_start < cur_end <= src.len()`.
+        unsafe { src.as_ptr().add(cur_start) },
+        cur_end - cur_start,
+    );
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone. Callers must first ensure
 /// the covering range is committed and write-watch guards are open via

@@ -373,15 +373,8 @@ impl Shadow {
                     crate::kernel_will_write(from + first_start, last_end - first_start);
                     let prep_elapsed = t0.elapsed();
                     let t1 = std::time::Instant::now();
-                    let mut range_changed = 0usize;
-                    for (run_start, run_end) in runs {
-                        crate::host::write_mapped_prepared(
-                            (from + run_start) as *mut u8,
-                            after[run_start..].as_ptr(),
-                            run_end - run_start,
-                        );
-                        range_changed += run_end - run_start;
-                    }
+                    let range_changed: usize = runs.iter().map(|&(s, e)| e - s).sum();
+                    crate::host::write_runs_prepared(from, after, &runs);
                     let write_elapsed = t1.elapsed();
                     changed_total += range_changed;
                     writing += prep_elapsed + write_elapsed;
@@ -735,29 +728,37 @@ pub(crate) fn relieve_pressure(incoming: u64) -> u64 {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500)) {
             return 0;
         }
         *last = Some(std::time::Instant::now());
     }
     memstat::count(memstat::Event::PressureReclaims, 1);
     let target = memstat::pressure_deficit(incoming);
-    let mut freed = 0;
+    let mut loose_freed = 0u64;
     for map in [&LOOSE, &ALIGNED] {
         let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
-        freed += reclaim(&mut map, u64::MAX / 2, 0, 0);
+        loose_freed += reclaim(&mut map, u64::MAX / 2, 0, 0);
     }
-    freed += reclaim_buffers(target.saturating_sub(freed));
-    freed += drain_snapshot_pool();
-    freed += crate::texture::drain_pools();
+    let buf_freed = reclaim_buffers(target.saturating_sub(loose_freed));
+    let pool_freed = drain_snapshot_pool() + crate::texture::drain_pools();
+    let mut freed = loose_freed + buf_freed + pool_freed;
     let remaining = target.saturating_sub(freed);
-    if remaining > 0 || incoming == 0 {
-        freed += crate::resource::evict_idle_textures(if incoming == 0 { 0 } else { remaining });
-    }
+    let tex_freed = if remaining > 0 || incoming == 0 {
+        crate::resource::evict_idle_textures(if incoming == 0 { 0 } else { remaining })
+    } else {
+        0
+    };
+    freed += tex_freed;
     let headroom = memstat::system_commit().map(|(total, limit)| limit.saturating_sub(total));
     tracing::warn!(
         incoming,
+        target,
         freed,
+        loose_freed,
+        buf_freed,
+        pool_freed,
+        tex_freed,
         headroom,
         "memory pressure: idle host copies and pools freed"
     );
@@ -1481,6 +1482,44 @@ mod tests {
         drop(bound_arc);
         unregister(idle_id, idle_addr);
         unregister(bound_id, bound_addr);
+        let _ = host_gpu;
+    }
+
+    /// Reproduces the Test #12 2,048-run copy-back pattern (1 byte changed
+    /// every 16 bytes in a 32 KiB private buffer): must complete quickly via
+    /// the direct `MEM_PRIVATE` fast path while preserving every interleaved
+    /// concurrent title CPU write byte-for-byte.
+    #[test]
+    fn copy_back_many_tiny_runs_preserves_interleaved_cpu_writes_fast() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mut title_mem = vec![0u8; 32 << 10];
+        let base = title_mem.as_mut_ptr() as usize;
+        let fake_id = base ^ 0x71A2_B3C4;
+        register(fake_id, base as u64, title_mem.len() as u64);
+        let shadow = find(base as u64, title_mem.len() as u64).expect("shadow buffer");
+        shadow.update(base, title_mem.len());
+        let ranges = [(base, title_mem.len())];
+        shadow.writing(base, title_mem.len());
+        let snapshot = shadow.snapshot_ranges(&ranges).expect("snapshot");
+        // SAFETY: inside the shadow's 32 KiB mapping.
+        let copy = unsafe { std::slice::from_raw_parts_mut(shadow.data, title_mem.len()) };
+        for i in 0..2048usize {
+            copy[i * 16] = 0xAA;
+            title_mem[i * 16 + 1] = 0x55; // concurrent title CPU write on adjacent byte
+        }
+        let (changed, write_us) = shadow.copy_back_timed(&ranges, Some(&snapshot));
+        assert_eq!(changed, 2048);
+        assert!(
+            write_us < 100_000,
+            "2,048 tiny runs in MEM_PRIVATE should take <100ms, took {write_us}us"
+        );
+        for i in 0..2048usize {
+            assert_eq!(title_mem[i * 16], 0xAA);
+            assert_eq!(title_mem[i * 16 + 1], 0x55);
+        }
+        unregister(fake_id, base as u64);
         let _ = host_gpu;
     }
 }
