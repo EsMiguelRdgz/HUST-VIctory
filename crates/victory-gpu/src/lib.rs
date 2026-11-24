@@ -32,6 +32,7 @@ mod host;
 pub mod list;
 mod memstat;
 pub mod object;
+mod par;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;

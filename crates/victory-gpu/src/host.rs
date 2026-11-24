@@ -1342,6 +1342,10 @@ impl HostList {
     }
 }
 
+/// Requested bytes of a batch past which its refreshes share threads.
+/// shortcut: not measured; tune from an authorized run's preparing times.
+const PARALLEL_REFRESH: usize = 8 << 20;
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -1361,16 +1365,40 @@ impl Batch {
         }
     }
 
+    /// Brings the batched ranges up to date. Each entry is a distinct copy
+    /// (its own host buffer), so big batches are shared among a few
+    /// threads ([`crate::par`]); small ones run here, as before.
     fn flush(&mut self) {
-        for (shadow, from, to) in self.0.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        if self.0.is_empty() {
+            return;
         }
+        let started = std::time::Instant::now();
+        // Biggest first, for an even share among threads.
+        self.0
+            .sort_unstable_by_key(|&(_, from, to)| std::cmp::Reverse(to - from));
+        let copied = AtomicU64::new(0);
+        crate::par::for_each(
+            &self.0,
+            crate::par::workers(),
+            PARALLEL_REFRESH,
+            |&(_, from, to)| to - from,
+            |(shadow, from, to)| {
+                #[cfg(feature = "diagnostics")]
+                let range_started = std::time::Instant::now();
+                let bytes = shadow.update(*from, to - from);
+                copied.fetch_add(bytes as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(
+                    *from,
+                    to - from,
+                    range_started.elapsed().as_micros() as u64,
+                    0,
+                );
+            },
+        );
+        self.0.clear();
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied.into_inner(), Ordering::Relaxed);
     }
 }
 
