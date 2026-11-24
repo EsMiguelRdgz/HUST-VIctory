@@ -172,6 +172,10 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Compute shader with `wave64`, `group_threads == 64`, no cross-lane ops,
+    /// and provably uniform CFG: explicit TGSM barriers are emitted around LDS
+    /// accesses so the shader runs without `[WaveSize(64)]` on Wave32 GPUs.
+    sync_lds: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -338,6 +342,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut sync_lds = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -387,8 +392,30 @@ impl<'a> Lower<'a> {
                 32
             };
             let one_wave = group_threads <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if console_lanes {
                 s.wave_size = Some(wave);
+            } else if one_wave && s.lds_dwords > 0 {
+                // Without cross-lane ops, a single-wave64 shader only depended
+                // on lockstep LDS visibility. When the entire CFG is provably
+                // uniform (no lane-divergent guards or branches), explicit
+                // threadgroup TGSM barriers preserve exact semantics on both
+                // Wave32 and Wave64 without requiring `[WaveSize(64)]`.
+                let uniform_cfg = x.st.guards.iter().flatten().all(|g| g.is_none())
+                    && x.st.exits.iter().all(|exit| match *exit {
+                        LaneExit::Jump(_) | LaneExit::End => true,
+                        LaneExit::Branch { when, .. } => {
+                            x.st.bools
+                                .support(when)
+                                .iter()
+                                .all(|a| matches!(a, Atom::Uniform(_)))
+                        }
+                        LaneExit::Indirect => false,
+                    });
+                if wave == 64 && uniform_cfg {
+                    sync_lds = true;
+                } else {
+                    s.wave_size = Some(wave);
+                }
             }
         }
         let mut no_barrier = HashSet::new();
@@ -473,6 +500,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            sync_lds,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2043,6 +2071,12 @@ impl<'a> Lower<'a> {
             } else {
                 return Err("an LDS read of bytes or halves");
             };
+            if self.sync_lds {
+                let mode = self.s.m.i32(1 | 8);
+                let void = self.s.t.void;
+                self.s
+                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
             let reg = dst_reg.ok_or("an LDS read result")?;
             let mut n = 0;
             for (off, w) in elements {
@@ -2076,6 +2110,12 @@ impl<'a> Lower<'a> {
                 self.s.m.store(self.cur, p, x);
             }
             self.end_guarded(at, &[]);
+            if self.sync_lds {
+                let mode = self.s.m.i32(1 | 8);
+                let void = self.s.t.void;
+                self.s
+                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -2121,6 +2161,12 @@ impl<'a> Lower<'a> {
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
+        }
+        if self.sync_lds {
+            let mode = self.s.m.i32(1 | 8);
+            let void = self.s.t.void;
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
         Ok(())
     }
@@ -3895,6 +3941,23 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_swap_b32" => {
+                if v.abs != 0 || v.neg != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+                    return Err("v_swap_b32 modifiers");
+                }
+                let (
+                    Some(Operand::Vector { reg: dst, .. }),
+                    Some(&Operand::Vector { reg: src, .. }),
+                ) = (v.dst, v.src.first())
+                else {
+                    return Err("v_swap_b32 operands");
+                };
+                let old_dst = self.i32_of(inst.read(Reg::V(dst)).ok_or("v_swap_b32 dst")?)?;
+                let old_src = self.i32_of(inst.read(Reg::V(src)).ok_or("v_swap_b32 src")?)?;
+                self.write(inst, Reg::V(dst), old_src, guard);
+                self.write(inst, Reg::V(src), old_dst, guard);
+                Ok(())
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -4513,6 +4576,12 @@ impl<'a> Lower<'a> {
                     _ => (Bin::Mul, a, b),
                 };
                 self.s.m.bin(c, op, a, b)
+            }
+            "v_xnor_b32" => {
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let x = self.s.m.bin(c, Bin::Xor, a, b);
+                let ones = k(self, u32::MAX);
+                self.s.m.bin(c, Bin::Xor, x, ones)
             }
             "v_not_b32" => {
                 let a = s(self, 0)?;
@@ -6567,6 +6636,104 @@ mod tests {
                 .expect("WaveSize(32) compute DXIL validates");
             v.validate(&mut wide.dxil.clone())
                 .expect("WaveSize(64) compute DXIL validates");
+        }
+    }
+
+    #[test]
+    fn xnor_swap_and_uniform_lds_wave64_lower_and_validate() {
+        use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+
+        let lower_cs = |words: &[u32], rsrc2: u32, threads: [u32; 3]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 4,
+                layout: Vec::new(),
+                used: Vec::new(),
+                io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+                code,
+            };
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            super::lower(&super::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .expect("compute shader lowers")
+        };
+
+        // 1. v_mov_b32 v1, 5; v_xnor_b32 v1, v0, v1; v_swap_b32 v1, v0; s_endpgm
+        let alu = lower_cs(
+            &[
+                0x7E02_0285, // v_mov_b32 v1, 5
+                0x3C02_0300, // v_xnor_b32 v1, v0, v1
+                0x7E02_CB00, // v_swap_b32 v1, v0
+                0xBF81_0000, // s_endpgm
+            ],
+            0,
+            [64, 1, 1],
+        );
+        assert_eq!(alu.wave_size, None);
+
+        // 2. Uniform-CFG 64-thread LDS shader (no cross-lane ops): drops WaveSize(64)
+        //    and synchronizes LDS via explicit TGSM barriers.
+        //    ds_write_b32 v0, v0; ds_read_b32 v1, v0; s_endpgm
+        let lds_uniform = lower_cs(
+            &[
+                0xD834_0000,
+                0x0000_0000, // ds_write_b32 v0, v0
+                0xD8D8_0000,
+                0x0100_0000, // ds_read_b32 v1, v0
+                0xBF81_0000, // s_endpgm
+            ],
+            1 << 15, // 512 B LDS
+            [64, 1, 1],
+        );
+        assert_eq!(
+            lds_uniform.wave_size, None,
+            "uniform-CFG 64-thread LDS-only shader must lower without WaveSize(64)"
+        );
+
+        // 3. Divergent-CFG 64-thread LDS shader MUST keep WaveSize(64) rather
+        //    than emitting barriers under lane-divergent control flow.
+        //    v_cmp_eq_u32 vcc, 0, v0; s_cbranch_vccz +1; ds_write_b32 v0, v0; s_endpgm
+        let lds_divergent = lower_cs(
+            &[
+                0x7D94_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBF86_0002, // s_cbranch_vccz +2 dwords (skips 8-byte ds_write_b32)
+                0xD834_0000,
+                0x0000_0000, // ds_write_b32 v0, v0
+                0xBF81_0000, // s_endpgm
+            ],
+            1 << 15, // 512 B LDS
+            [64, 1, 1],
+        );
+        assert_eq!(
+            lds_divergent.wave_size,
+            Some(64),
+            "divergent-CFG 64-thread LDS shader must retain WaveSize(64)"
+        );
+
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut alu.dxil.clone())
+                .expect("v_xnor_b32 + v_swap_b32 DXIL validates");
+            v.validate(&mut lds_uniform.dxil.clone())
+                .expect("uniform LDS-synced DXIL validates");
+            v.validate(&mut lds_divergent.dxil.clone())
+                .expect("divergent WaveSize(64) LDS DXIL validates");
         }
     }
 }
