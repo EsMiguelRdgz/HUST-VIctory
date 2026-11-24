@@ -623,7 +623,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             break (map, key);
         }
         let buf_len = entry.end - key.0;
-        if buf_len >= WINDOWED_BUFFER_MIN && req_len <= WINDOWED_MAX_REQ {
+        if buf_len >= WINDOWED_BUFFER_MIN
+            && (req_len <= WINDOWED_MAX_REQ || buf_len >= req_len.saturating_mul(2))
+        {
             drop(map);
             return loose(address, end);
         }
@@ -1865,8 +1867,15 @@ mod tests {
         assert_eq!(got, &[0x5Au8; 8]);
         drop(sub);
 
-        // Full-range access (> WINDOWED_MAX_REQ) falls back to monolithic Buffer shadow.
-        let full = find(addr, 6 << 20).expect("monolithic fallback shadow");
+        // A 5 MiB slice inside a 16 MiB arena (`buf_len >= 2 * req_len`) also stays windowed.
+        let mid = find(addr, 5 << 20).expect("windowed mid-range shadow");
+        assert_eq!(mid.kind, Kind::Loose);
+        assert!(mid.bytes <= 6 << 20, "mid shadow bounded: {}", mid.bytes);
+        drop(mid);
+
+        // Full-range access (> WINDOWED_MAX_REQ and > half the buffer) falls back
+        // to the monolithic Buffer shadow cleanly.
+        let full = find(addr, 10 << 20).expect("monolithic fallback shadow");
         assert_eq!(full.kind, Kind::Buffer);
         assert_eq!(full.bytes, 16 << 20);
         drop(full);
