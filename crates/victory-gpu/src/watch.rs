@@ -223,21 +223,14 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at + len);
 }
 
-/// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded (and any cached
-/// unmapped holes in the range must be re-checked).
+/// The runtime mapped, unmapped, or demand-committed title memory `[at, at + len)`:
+/// restores `PAGE_READWRITE` on any currently guarded blocks before removing
+/// them from `g.protected` (preventing a race where `guard()` marks a newly
+/// committed block `PAGE_READONLY` right before `title_memory_remapped()` runs
+/// and would otherwise strand the block read-only outside `g.protected`), and
+/// clears any cached unmapped holes in the range.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    let mut g = guards();
-    let range = at / BLOCK..(at + len).div_ceil(BLOCK);
-    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-    }
-    let unmapped: Vec<usize> = g.unmapped.range(range).copied().collect();
-    for block in unmapped {
-        g.unmapped.remove(&block);
-    }
+    open(&mut guards(), at, at + len);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -461,9 +454,14 @@ mod tests {
         let second = guard(view, view + 2 * BLOCK).expect("MEM_MAPPED view");
         assert!(second.is_empty());
 
-        // Remapping clears the cached unmapped state.
+        // Remapping clears the cached unmapped state and restores PAGE_READWRITE
+        // on any guarded block so a write never strands a PAGE_READONLY fault.
         title_memory_remapped(view, 2 * BLOCK);
         assert!(!guards().unmapped.contains(&hole_block));
+        // SAFETY: `view` is a live mapped block whose write protection must be restored.
+        unsafe { (view as *mut u8).write(0x42) };
+        // SAFETY: written above.
+        assert_eq!(unsafe { (view as *const u8).read() }, 0x42);
 
         // SAFETY: our mapped view and reservation.
         unsafe {
@@ -471,6 +469,58 @@ mod tests {
                 Value: view as *mut _,
             });
             VirtualFree(hole, 0, MEM_RELEASE);
+            CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn concurrent_guard_and_title_memory_remapped_never_strands_readonly() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        const PAGES: usize = 8;
+        let len = PAGES * BLOCK;
+        // SAFETY: plain anonymous pagefile-backed section freed below.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: mapping our own section.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize };
+        assert_ne!(view, 0);
+
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = guard(view, view + len);
+                }
+            });
+            for iter in 0..200u32 {
+                for p in 0..PAGES {
+                    let page = view + p * BLOCK;
+                    title_memory_remapped(page, BLOCK);
+                    // SAFETY: inside our mapped view; must never strand PAGE_READONLY.
+                    unsafe { (page as *mut u32).write(iter) };
+                }
+            }
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        title_memory_remapped(view, len);
+        // SAFETY: our mapped view and section handle.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
             CloseHandle(section);
         }
     }

@@ -393,6 +393,16 @@ if (-not $isSynthetic -and -not $NoDiscord -and (Test-Path -LiteralPath $discord
         -RepoRoot $RepoRoot | Out-Null
 }
 
+# Record pre-launch byte offsets of existing crashes.log files so outcome
+# classification inspects only entries appended during THIS run.
+$preCrashLengths = @{}
+$victoryDataRoot = Join-Path $env:LOCALAPPDATA 'victory\data'
+if (Test-Path -LiteralPath $victoryDataRoot) {
+    Get-ChildItem -Path $victoryDataRoot -Filter 'crashes.log' -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        $preCrashLengths[$_.FullName] = $_.Length
+    }
+}
+
 # 5. Launch and monitor process.
 $runStartUtc = [DateTime]::UtcNow
 $proc = New-Object System.Diagnostics.Process
@@ -499,7 +509,7 @@ if ($samples.Count -gt 0) {
 
 # 6. Collect crash logs written/updated during this run (outside repo).
 $collectedCrashes = New-Object System.Collections.Generic.List[string]
-$victoryDataRoot = Join-Path $env:LOCALAPPDATA 'victory\data'
+$newCrashText = ""
 if (Test-Path -LiteralPath $victoryDataRoot) {
     Get-ChildItem -Path $victoryDataRoot -Filter 'crashes.log' -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
         if ($_.LastWriteTimeUtc -ge $runStartUtc.AddSeconds(-5)) {
@@ -507,6 +517,17 @@ if (Test-Path -LiteralPath $victoryDataRoot) {
             $destPath = Join-Path $runDir $destName
             Copy-Item -LiteralPath $_.FullName -Destination $destPath -Force
             $collectedCrashes.Add($destPath)
+            $prevLen = if ($preCrashLengths.ContainsKey($_.FullName)) { [long]$preCrashLengths[$_.FullName] } else { 0L }
+            if ($_.Length -gt $prevLen) {
+                $fs = [System.IO.File]::OpenRead($_.FullName)
+                try {
+                    $fs.Seek($prevLen, [System.IO.SeekOrigin]::Begin) | Out-Null
+                    $sr = New-Object System.IO.StreamReader($fs)
+                    $newCrashText += $sr.ReadToEnd() + "`n"
+                } finally {
+                    $fs.Dispose()
+                }
+            }
         }
     }
 }
@@ -520,9 +541,7 @@ if (Test-Path -LiteralPath $stderrPath) { $combinedText += (Get-Content -Literal
 foreach ($ml in $memLogs) {
     $combinedText += (Get-Content -LiteralPath $ml.FullName -Raw -ErrorAction SilentlyContinue) + "`n"
 }
-foreach ($cl in $collectedCrashes) {
-    $combinedText += (Get-Content -LiteralPath $cl -Raw -ErrorAction SilentlyContinue) + "`n"
-}
+$combinedText += $newCrashText
 
 $classification = 'CleanExit'
 $notifyStatus = 'Success'
