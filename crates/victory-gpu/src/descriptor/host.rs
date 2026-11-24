@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -611,6 +612,7 @@ impl HostHeap {
         }
         let deferred_to_register = {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let _depth = MadeDepthGuard::enter();
             let Some(ref view) = view else {
                 // Not a view of ours (never written, or of a resource the
                 // title released): nothing to read.
@@ -710,13 +712,44 @@ fn deferred_texture_of(view: &View) -> Option<(usize, bool)> {
     }
 }
 
-/// Ensures any deferred or placed texture referenced by `view` is materialized
-/// before taking `HostHeap.made`.
+thread_local! {
+    /// Nesting depth of `HostHeap.made` held by the current thread so
+    /// `shadow::relieve_pressure` never re-enters `HostHeap::evict_texture` on
+    /// the same thread if an inner allocation triggers memory-pressure relief.
+    static MADE_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Whether the current thread holds a `HostHeap.made` lock.
+pub(crate) fn in_heap_made_lock() -> bool {
+    MADE_LOCK_DEPTH.with(|d| d.get() > 0)
+}
+
+struct MadeDepthGuard;
+
+impl MadeDepthGuard {
+    fn enter() -> Self {
+        MADE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
+    }
+}
+
+impl Drop for MadeDepthGuard {
+    fn drop(&mut self) {
+        MADE_LOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Ensures any deferred texture, placed texture, or buffer shadow referenced by
+/// `view` is materialized BEFORE taking `HostHeap.made`, keeping lock order
+/// strictly acyclic (`shadow::relieve_pressure` -> `evict_idle_textures` ->
+/// `HostHeap::evict_texture` -> `HostHeap.made` never re-enters `HostHeap.made`).
 fn ensure_view_materialized(view: &View) {
     if let Some((r, _)) = deferred_texture_of(view) {
         let _ = crate::resource::host_resource(r as crate::object::This);
     } else if matches!(view, View::Placed(false, r, _) if r[0] != 1) {
         let _ = placed_texture(view);
+    } else if let Some((address, len, align)) = buffer_access(view) {
+        let _ = crate::shadow::find_aligned(address, len.max(1), align);
     }
 }
 
@@ -1948,6 +1981,27 @@ mod tests {
             buf_weak.upgrade().is_none(),
             "buffer copy freed once nulled"
         );
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Regression test for the Test #11/#14 `HostHeap.made` self-deadlock:
+    /// calling `shadow::relieve_pressure` while the current thread holds
+    /// `HostHeap.made` must skip texture eviction cleanly instead of
+    /// re-entering `HostHeap::evict_texture` on `self.made`.
+    #[test]
+    fn relieve_pressure_inside_heap_made_lock_never_deadlocks() {
+        let Some(host_gpu) = host() else {
+            return;
+        };
+        let heap = HostHeap::new(false, 8, 0).expect("host view heap");
+        let _made = heap.made.lock().unwrap();
+        let _depth = MadeDepthGuard::enter();
+        assert!(in_heap_made_lock());
+        // Must return without re-entering `heap.made` via `evict_texture`.
+        let _ = crate::shadow::relieve_pressure(0);
+        drop(_depth);
+        drop(_made);
+        assert!(!in_heap_made_lock());
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 }

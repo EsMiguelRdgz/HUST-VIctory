@@ -755,7 +755,7 @@ pub(crate) fn relieve_pressure(incoming: u64) -> u64 {
     let pool_freed = drain_snapshot_pool() + crate::texture::drain_pools();
     let mut freed = loose_freed + buf_freed + pool_freed;
     let remaining = target.saturating_sub(freed);
-    let tex_freed = if remaining > 0 || incoming == 0 {
+    let tex_freed = if (remaining > 0 || incoming == 0) && !crate::descriptor::in_heap_made_lock() {
         crate::resource::evict_idle_textures(if incoming == 0 { 0 } else { remaining })
     } else {
         0

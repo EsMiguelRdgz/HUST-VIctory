@@ -13,6 +13,11 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+#[cfg(windows)]
+pub(crate) fn in_heap_made_lock() -> bool {
+    host::in_heap_made_lock()
+}
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -114,7 +119,10 @@ impl Heap {
         crate::host::check_removed("HostHeap::new/fill_null", self.desc.count);
         for i in pending.drain(..) {
             let v = h.mirror(i, self.start + u64::from(i) * step, false);
-            crate::host::check_removed("Heap::host pending mirror", format_args!("slot={i} view={v:?}"));
+            crate::host::check_removed(
+                "Heap::host pending mirror",
+                format_args!("slot={i} view={v:?}"),
+            );
         }
         Some(h)
     }
