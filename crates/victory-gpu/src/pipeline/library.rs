@@ -154,6 +154,7 @@ pub(crate) fn pipeline(
     if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         l.added += 1;
     }
+    crate::host::check_removed("pipeline::library::StorePipeline", name);
     Ok(pso)
 }
 
@@ -182,6 +183,10 @@ pub(crate) fn save(now: bool) {
             let mut bytes = vec![0u8; l.library.GetSerializedSize()];
             l.library.Serialize(&mut bytes).map(|()| bytes)
         };
+        crate::host::check_removed(
+            "pipeline::library::Serialize",
+            bytes.as_ref().map_or(0, Vec::len),
+        );
         match bytes {
             Ok(bytes) => {
                 l.added = 0;

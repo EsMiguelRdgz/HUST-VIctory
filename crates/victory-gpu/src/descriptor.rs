@@ -111,8 +111,10 @@ impl Heap {
             })
             .as_ref()?;
         let step = u64::from(increment(self.desc.kind)?);
+        crate::host::check_removed("HostHeap::new/fill_null", self.desc.count);
         for i in pending.drain(..) {
-            h.mirror(i, self.start + u64::from(i) * step, false);
+            let v = h.mirror(i, self.start + u64::from(i) * step, false);
+            crate::host::check_removed("Heap::host pending mirror", format_args!("slot={i} view={v:?}"));
         }
         Some(h)
     }

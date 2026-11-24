@@ -382,6 +382,33 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
+/// Logs the FIRST observed D3D12 device-removal transition at `site` with
+/// zero memory overhead (~50 ns query), capturing the exact offending call
+/// site even when the D3D12 Debug Layer is disabled.
+pub(crate) fn check_removed(site: &'static str, detail: impl std::fmt::Display) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(h) = existing_host() else {
+        return;
+    };
+    // SAFETY: plain GetDeviceRemovedReason query on a live device.
+    let Err(reason) = (unsafe { h.device.GetDeviceRemovedReason() }) else {
+        return;
+    };
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        let dbg = h.log_messages();
+        tracing::error!(
+            site,
+            detail = %detail,
+            reason = %reason,
+            debug_layer = ?dbg,
+            thread = ?std::thread::current().id(),
+            frame = crate::queue::presented(),
+            pipelines_making = crate::pipeline::making(),
+            "FIRST D3D12 DEVICE REMOVAL DETECTED"
+        );
+    }
+}
+
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     use std::io::Write;
     let mut text = what.to_string();
@@ -801,6 +828,7 @@ impl Host {
         }
         *submitted += 1;
         let prepared = std::time::Instant::now();
+        check_removed("Host::execute (before ExecuteCommandLists)", lists.len());
         // SAFETY: closed lists; the fence and event are ours.
         let signalled = unsafe {
             self.queue.ExecuteCommandLists(&lists);
@@ -1996,6 +2024,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            check_removed("Host::present", frame);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

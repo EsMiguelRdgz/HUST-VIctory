@@ -1154,86 +1154,27 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
-/// Concrete SRV format acceptable for a D3D12 NULL SRV descriptor.
-fn concrete_null_srv_format(fmt: DXGI_FORMAT) -> DXGI_FORMAT {
-    let f = fmt.0 as u32;
-    match f {
-        40 => DXGI_FORMAT_R32_FLOAT,                // D32_FLOAT
-        45 => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,    // D24_UNORM_S8_UINT
-        55 => DXGI_FORMAT_R16_UNORM,                // D16_UNORM
-        20 => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, // D32_FLOAT_S8X24_UINT
-        1 => DXGI_FORMAT_R32G32B32A32_FLOAT,
-        9 => DXGI_FORMAT_R16G16B16A16_FLOAT,
-        15 => DXGI_FORMAT_R32G32_FLOAT,
-        27 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        33 => DXGI_FORMAT_R16G16_FLOAT,
-        39 => DXGI_FORMAT_R32_FLOAT,
-        48 => DXGI_FORMAT_R8G8_UNORM,
-        53 => DXGI_FORMAT_R16_UNORM,
-        60 => DXGI_FORMAT_R8_UNORM,
-        90 => DXGI_FORMAT_B8G8R8A8_UNORM,
-        0 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        _ => {
-            let fam = crate::resource::family(f);
-            if fam == f && crate::resource::family(f + 1) == f {
-                DXGI_FORMAT_R8G8B8A8_UNORM
-            } else {
-                fmt
-            }
-        }
-    }
-}
-
-/// Concrete UAV format acceptable for a D3D12 NULL UAV descriptor.
-fn concrete_null_uav_format(fmt: DXGI_FORMAT) -> DXGI_FORMAT {
-    let mut f = fmt.0 as u32;
-    if let Some(&(_, linear)) = crate::resource::SRGB.iter().find(|&&(s, _)| s == f) {
-        f = linear;
-    }
-    match f {
-        2 | 3 | 4          // R32G32B32A32_{FLOAT,UINT,SINT}
-        | 10 | 11 | 12 | 13 | 14 // R16G16B16A16_{FLOAT,UNORM,UINT,SNORM,SINT}
-        | 16 | 17 | 18     // R32G32_{FLOAT,UINT,SINT}
-        | 24 | 25          // R10G10B10A2_{UNORM,UINT}
-        | 26               // R11G11B10_FLOAT
-        | 28 | 30 | 31 | 32 // R8G8B8A8_{UNORM,UINT,SNORM,SINT}
-        | 34 | 35 | 36 | 37 | 38 // R16G16_{FLOAT,UNORM,UINT,SNORM,SINT}
-        | 41 | 42 | 43     // R32_{FLOAT,UINT,SINT}
-        | 49 | 50 | 51 | 52 // R8G8_{UNORM,UINT,SNORM,SINT}
-        | 54 | 56 | 57 | 58 | 59 // R16_{FLOAT,UNORM,UINT,SNORM,SINT}
-        | 61 | 62 | 63 | 64 // R8_{UNORM,UINT,SNORM,SINT}
-        | 87 => DXGI_FORMAT(f as i32), // B8G8R8A8_UNORM
-        _ => DXGI_FORMAT_R32_UINT,
-    }
-}
-
 /// Sanitizes an SRV description so `CreateShaderResourceView(None, Some(&desc), at)`
-/// is valid under D3D12 while preserving the shader's expected descriptor dimension
-/// and buffer kind (raw / structured / typed).
+/// is guaranteed valid under D3D12 across all drivers (never passing console-only
+/// formats, typeless/BC-on-1D/MS mismatches, or invalid component-mapping bits)
+/// while preserving the shader's expected descriptor dimension and buffer kind
+/// (raw / structured / typed).
 fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
-    let mapping = if desc.Shader4ComponentMapping & 0x1000 != 0 {
-        desc.Shader4ComponentMapping
-    } else {
-        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
-    };
+    let mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     match desc.ViewDimension {
         D3D12_SRV_DIMENSION_BUFFER => {
             // SAFETY: ViewDimension is BUFFER.
             let b = unsafe { desc.Anonymous.Buffer };
             let (format, flags, stride) = if b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
                 (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_SRV_FLAG_RAW, 0)
-            } else if b.StructureByteStride > 0 {
+            } else if b.StructureByteStride > 0 && b.StructureByteStride <= 2048 {
                 (
                     DXGI_FORMAT_UNKNOWN,
                     D3D12_BUFFER_SRV_FLAG_NONE,
                     b.StructureByteStride,
                 )
             } else {
-                (
-                    concrete_null_srv_format(desc.Format),
-                    D3D12_BUFFER_SRV_FLAG_NONE,
-                    0,
-                )
+                (DXGI_FORMAT_R32_UINT, D3D12_BUFFER_SRV_FLAG_NONE, 0)
             };
             D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: format,
@@ -1242,7 +1183,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_SRV {
                         FirstElement: 0,
-                        NumElements: 0,
+                        NumElements: 1,
                         StructureByteStride: stride,
                         Flags: flags,
                     },
@@ -1250,7 +1191,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
             }
         }
         D3D12_SRV_DIMENSION_TEXTURE1D => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: concrete_null_srv_format(desc.Format),
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE1D,
             Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1261,7 +1202,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
             },
         },
         D3D12_SRV_DIMENSION_TEXTURE1DARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: concrete_null_srv_format(desc.Format),
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
             Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1273,7 +1214,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
             },
         },
         D3D12_SRV_DIMENSION_TEXTURE2D => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: concrete_null_srv_format(desc.Format),
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1284,7 +1225,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
             },
         },
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: concrete_null_srv_format(desc.Format),
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
             Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1296,7 +1237,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
             },
         },
         D3D12_SRV_DIMENSION_TEXTURE2DMS => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: concrete_null_srv_format(desc.Format),
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
             Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1304,7 +1245,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
             },
         },
         D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: concrete_null_srv_format(desc.Format),
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
             Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1315,7 +1256,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
             },
         },
         D3D12_SRV_DIMENSION_TEXTURE3D => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: concrete_null_srv_format(desc.Format),
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE3D,
             Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1326,7 +1267,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
             },
         },
         D3D12_SRV_DIMENSION_TEXTURECUBE => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: concrete_null_srv_format(desc.Format),
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
             Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1337,7 +1278,7 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
             },
         },
         D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: concrete_null_srv_format(desc.Format),
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
             Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1363,8 +1304,8 @@ fn sanitize_null_srv(desc: D3D12_SHADER_RESOURCE_VIEW_DESC) -> D3D12_SHADER_RESO
 }
 
 /// Sanitizes a UAV description so `CreateUnorderedAccessView(None, None, Some(&desc), at)`
-/// is valid under D3D12 while preserving the shader's expected descriptor dimension
-/// and buffer kind.
+/// is guaranteed valid under D3D12 across all drivers while preserving the
+/// shader's expected descriptor dimension and buffer kind.
 fn sanitize_null_uav(desc: D3D12_UNORDERED_ACCESS_VIEW_DESC) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     match desc.ViewDimension {
         D3D12_UAV_DIMENSION_BUFFER => {
@@ -1372,18 +1313,14 @@ fn sanitize_null_uav(desc: D3D12_UNORDERED_ACCESS_VIEW_DESC) -> D3D12_UNORDERED_
             let b = unsafe { desc.Anonymous.Buffer };
             let (format, flags, stride) = if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
                 (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_UAV_FLAG_RAW, 0)
-            } else if b.StructureByteStride > 0 {
+            } else if b.StructureByteStride > 0 && b.StructureByteStride <= 2048 {
                 (
                     DXGI_FORMAT_UNKNOWN,
                     D3D12_BUFFER_UAV_FLAG_NONE,
                     b.StructureByteStride,
                 )
             } else {
-                (
-                    concrete_null_uav_format(desc.Format),
-                    D3D12_BUFFER_UAV_FLAG_NONE,
-                    0,
-                )
+                (DXGI_FORMAT_R32_UINT, D3D12_BUFFER_UAV_FLAG_NONE, 0)
             };
             D3D12_UNORDERED_ACCESS_VIEW_DESC {
                 Format: format,
@@ -1391,7 +1328,7 @@ fn sanitize_null_uav(desc: D3D12_UNORDERED_ACCESS_VIEW_DESC) -> D3D12_UNORDERED_
                 Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_UAV {
                         FirstElement: 0,
-                        NumElements: 0,
+                        NumElements: 1,
                         StructureByteStride: stride,
                         CounterOffsetInBytes: 0,
                         Flags: flags,
@@ -1400,14 +1337,14 @@ fn sanitize_null_uav(desc: D3D12_UNORDERED_ACCESS_VIEW_DESC) -> D3D12_UNORDERED_
             }
         }
         D3D12_UAV_DIMENSION_TEXTURE1D => D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: concrete_null_uav_format(desc.Format),
+            Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1D,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Texture1D: D3D12_TEX1D_UAV::default(),
             },
         },
         D3D12_UAV_DIMENSION_TEXTURE1DARRAY => D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: concrete_null_uav_format(desc.Format),
+            Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
@@ -1417,14 +1354,14 @@ fn sanitize_null_uav(desc: D3D12_UNORDERED_ACCESS_VIEW_DESC) -> D3D12_UNORDERED_
             },
         },
         D3D12_UAV_DIMENSION_TEXTURE2D => D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: concrete_null_uav_format(desc.Format),
+            Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Texture2D: D3D12_TEX2D_UAV::default(),
             },
         },
         D3D12_UAV_DIMENSION_TEXTURE2DARRAY => D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: concrete_null_uav_format(desc.Format),
+            Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
@@ -1434,7 +1371,7 @@ fn sanitize_null_uav(desc: D3D12_UNORDERED_ACCESS_VIEW_DESC) -> D3D12_UNORDERED_
             },
         },
         D3D12_UAV_DIMENSION_TEXTURE3D => D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: concrete_null_uav_format(desc.Format),
+            Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Texture3D: D3D12_TEX3D_UAV {
@@ -1736,7 +1673,7 @@ mod tests {
             0,
         ];
         let sanitized_depth = sanitize_null_srv(srv_desc(&depth_srv_words));
-        assert_eq!(sanitized_depth.Format, DXGI_FORMAT_R32_FLOAT);
+        assert_eq!(sanitized_depth.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
         assert_eq!(
             sanitized_depth.Shader4ComponentMapping,
             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
@@ -1769,6 +1706,88 @@ mod tests {
             &device,
             &View::Shader(0, Some(cube_srv_words)),
             heap.cpu(5),
+        ));
+
+        // Console-only DXGI formats, BC format on 1D/2DMS, garbage component
+        // mapping bits, and oversized buffer stride must all sanitize cleanly
+        // without triggering D3D12 Debug Layer errors or device removal.
+        for (slot, (fmt, dim, mapping)) in [
+            (116u32, D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32, 0xFFFF_FFFF),
+            (
+                117,
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY.0 as u32,
+                0xFFFF_FFFF,
+            ),
+            (189, D3D12_SRV_DIMENSION_TEXTURE3D.0 as u32, 0x1000),
+            (190, D3D12_SRV_DIMENSION_TEXTURE1D.0 as u32, 0xFFFF_1000),
+            (191, D3D12_SRV_DIMENSION_TEXTURE2DMS.0 as u32, 0),
+            (
+                DXGI_FORMAT_BC7_UNORM.0 as u32,
+                D3D12_SRV_DIMENSION_TEXTURE1D.0 as u32,
+                0xFFFF_FFFF,
+            ),
+            (
+                DXGI_FORMAT_BC7_UNORM.0 as u32,
+                D3D12_SRV_DIMENSION_TEXTURE2DMS.0 as u32,
+                0xFFFF_FFFF,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let words = [fmt, dim, mapping, 0, 1, 0, 0, 0, 0, 0];
+            let s = sanitize_null_srv(srv_desc(&words));
+            assert_eq!(s.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+            assert_eq!(
+                s.Shader4ComponentMapping,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+            );
+            assert!(make_on(
+                &device,
+                &View::Shader(0, Some(words)),
+                heap.cpu(9 + slot as u32),
+            ));
+        }
+
+        // Oversized buffer stride must fall back to typed R32_UINT NULL buffer.
+        let bad_stride_srv = [
+            DXGI_FORMAT_UNKNOWN.0 as u32,
+            D3D12_SRV_DIMENSION_BUFFER.0 as u32,
+            0xFFFF_FFFF,
+            0,
+            0,
+            0,
+            0,
+            0xFFFF_FFFF, // oversized StructureByteStride
+            0,
+            0,
+        ];
+        let sanitized_bad_srv = sanitize_null_srv(srv_desc(&bad_stride_srv));
+        assert_eq!(sanitized_bad_srv.Format, DXGI_FORMAT_R32_UINT);
+        assert!(make_on(
+            &device,
+            &View::Shader(0, Some(bad_stride_srv)),
+            heap.cpu(16),
+        ));
+
+        let bad_stride_uav = [
+            DXGI_FORMAT_UNKNOWN.0 as u32,
+            D3D12_UAV_DIMENSION_BUFFER.0 as u32,
+            0,
+            0,
+            0,
+            0xFFFF_FFFF, // oversized StructureByteStride
+            999,
+            0,
+            0,
+            0,
+        ];
+        let sanitized_bad_uav = sanitize_null_uav(uav_desc(&bad_stride_uav));
+        assert_eq!(sanitized_bad_uav.Format, DXGI_FORMAT_R32_UINT);
+        assert!(make_on(
+            &device,
+            &View::Unordered(0, 0, Some(bad_stride_uav)),
+            heap.cpu(17),
         ));
 
         // Null fallbacks for CBV, placed buffer SRV, and placed texture UAV.
