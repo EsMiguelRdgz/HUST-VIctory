@@ -566,16 +566,32 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
+    let mut relieved = false;
+    let (mut map, key) = loop {
+        let map = buffers();
+        let key = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+            .map(|(k, _)| *k);
+        let Some(key) = key else {
+            drop(map);
+            return loose(address, end);
+        };
+        let entry = map.get(&key)?;
+        if entry.shadow.is_some() || relieved {
+            break (map, key);
+        }
+        let bytes = (entry.end - key.0).next_multiple_of(1 << 16);
+        if !memstat::under_pressure(bytes) {
+            break (map, key);
+        }
+        // Release `BUFFERS` before `relieve_pressure` (which locks `BUFFERS`
+        // inside `reclaim_buffers`), preventing self-deadlock on this thread.
         drop(map);
-        return loose(address, end);
+        relieve_pressure(bytes);
+        relieved = true;
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -583,9 +599,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let bytes = len.next_multiple_of(1 << 16);
-        if memstat::under_pressure(bytes) {
-            relieve_pressure(bytes);
-        }
         let (buffer, data) = host_buffer(Kind::Buffer, bytes)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
@@ -617,17 +630,15 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches; a request inside an
 /// existing window uses it rather than another overlapping copy.
-const WINDOW: u64 = 4 << 20;
+const WINDOW: u64 = 1 << 20;
 
 /// Bytes of loose windows, and of aligned copies, past which copies nothing
 /// holds (no list, no descriptor, no pending shader write) are freed, least
 /// recently used first, before another is made. Freeing is safe: such a
 /// copy holds nothing title memory does not (shader writes went back), and
 /// a later use makes and fills a new one.
-/// shortcut: fixed budgets, not measured; tune with an authorized run's
-/// `host memory` lines.
-const LOOSE_BUDGET: u64 = 512 << 20;
-const ALIGNED_BUDGET: u64 = 256 << 20;
+const LOOSE_BUDGET: u64 = 128 << 20;
+const ALIGNED_BUDGET: u64 = 64 << 20;
 
 /// Frees least recently used copies in `map` that nothing else holds until
 /// `live` bytes (of the map's kind) plus `incoming` fit in `budget`.

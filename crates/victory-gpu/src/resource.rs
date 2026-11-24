@@ -1578,7 +1578,7 @@ struct PlacedEntry {
 
 /// Budget for cached `PLACED_TEXTURES` host textures before LRU idle eviction.
 #[cfg(windows)]
-const PLACED_TEXTURE_BUDGET: u64 = 512 << 20;
+const PLACED_TEXTURE_BUDGET: u64 = 256 << 20;
 
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and

@@ -614,7 +614,8 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
 /// the bytes used in it.
 #[derive(Default)]
 struct Scratch {
-    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    /// `(buffer, cpu_ptr, gpu_va, capacity_bytes)`
+    chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
     current: usize,
     used: u64,
 }
@@ -622,6 +623,10 @@ struct Scratch {
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
 unsafe impl Send for Scratch {}
 
+/// Initial per-list upload scratch chunk (256 KiB): GTA VI opens 70+ command
+/// lists concurrently, most using only a few KiB of constants/uploads.
+/// Chunks double geometrically up to [`SCRATCH_CHUNK`] if a list needs more.
+const SCRATCH_CHUNK_MIN: u64 = 256 << 10;
 const SCRATCH_CHUNK: u64 = 4 << 20;
 
 /// One piece of submission-time work, in recorded order.
@@ -1407,19 +1412,24 @@ impl HostList {
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].3 {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            track(&buffer, crate::memstat::Kind::ListUpload, SCRATCH_CHUNK);
-            name(&buffer, || "list scratch".into());
+            let prev_cap = s.chunks.last().map_or(0, |c| c.3);
+            let chunk_cap = prev_cap
+                .saturating_mul(2)
+                .max(len.next_power_of_two())
+                .clamp(SCRATCH_CHUNK_MIN, SCRATCH_CHUNK);
+            let (buffer, data) = host.upload_buffer(chunk_cap)?;
+            track(&buffer, crate::memstat::Kind::ListUpload, chunk_cap);
+            name(&buffer, || format!("list scratch {chunk_cap:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
+            s.chunks.push((buffer, data as usize, gpu, chunk_cap));
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
+        let (_, data, gpu, _) = s.chunks[s.current];
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
