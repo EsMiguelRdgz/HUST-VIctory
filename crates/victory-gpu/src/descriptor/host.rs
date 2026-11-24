@@ -758,6 +758,9 @@ impl HostHeap {
                     index - self.count
                 ));
             }
+            if !self.sampler && index == self.count + self.dynamic_count {
+                return Some("guard slot (null)".to_string());
+            }
             return Some(format!(
                 "OOB past host heap (count={}, requested={})",
                 self.count, self.requested

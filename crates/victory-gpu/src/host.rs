@@ -796,7 +796,7 @@ impl Host {
     /// 2-second WDDM TDR watchdog and copy-back completes between chunks.
     /// Returns `true` if the GPU fence confirmed completion for all chunks.
     pub(crate) fn execute(&self, runs: &[&HostList]) -> bool {
-        const MAX_LISTS_PER_SUBMIT: usize = 8;
+        const MAX_LISTS_PER_SUBMIT: usize = 2;
         if runs.len() <= MAX_LISTS_PER_SUBMIT {
             return self.execute_batch(runs);
         }
