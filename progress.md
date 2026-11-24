@@ -1,35 +1,45 @@
 # Current Project Status
 
 - Current milestone: Phase 10 — memory architecture, copy-back performance, bounded parallelism, GPU acceleration, resource budgeting, and robustness
-- Current subphase: Phase 10 priorities 1-7 implemented and verified by tests (no hardware measurements); next: priority 8 GPU-acceleration evaluation, then remaining allocation audit and the final verification matrix
+- Current subphase: Phase 10 source work for priorities 1-8 committed and unit-verified; Phase 10 is NOT complete: the memory/parallelism/GPU objectives still need an authorized hardware run (see Manual validation) and the GPU-detile decision depends on it
 - Current branch: `hust/nvidia-rtx3070`
-- Latest verified commit: `341fbd6`. Phase 10 commits: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`, `13c97ad`, `ec38425`, `7036da9`, `ba4cb15`, `2798f11`, `6e0728c`, `e9d3629`, `ac7525f`, `341fbd6`
+- Latest verified commit: `318c2ca`. Phase 10 commits: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`, `13c97ad`, `ec38425`, `7036da9`, `ba4cb15`, `2798f11`, `6e0728c`, `e9d3629`, `ac7525f`, `341fbd6`, `24dd7ab`, `bd1e569`, `318c2ca`
 - Current working-tree status: clean except this progress.md checkpoint (committed with the next change)
 - Active agent: Claude Code
 - Model: Claude Opus 5.5
 - Last checkpoint timestamp: 2026-11-23 (Claude recovery checkpoint)
 - Current build status: PASS (`cargo test --workspace --no-run`)
-- Current test status: `cargo test -p victory-gpu` 67/67; 250 parallel stress runs 0 failures (after `e9d3629`); last workspace run 250/0/3 at `ba4cb15`
+- Current test status: full matrix PASSED at `318c2ca` (workspace 256/0/3; policy 152 ok; clippy both configs only the old warning; diag build OK)
 
 ## Active Task
 
-- Objective: Priority 8 — evaluate GPU-accelerated resource processing (texture detiling/upload, GPU-side copy-back dirty detection) and implement only where justified.
-- Current implementation: NOT_STARTED (evaluation).
-- Known risks: no hardware measurements exist; any GPU path must keep the CPU path as fallback and be measured on an authorized run before being made default.
+- Objective: Final verification matrix at `318c2ca`, then hand off for the authorized hardware run.
+- Current implementation: matrix PASSED (recorded in Completed Tasks); waiting for the user's authorized hardware run.
+- Known risks: all thresholds/budgets (`PARALLEL_REFRESH` 8 MiB, `PARALLEL_DETILE` 8 MiB, `LOOSE_BUDGET` 512 MiB, `ALIGNED_BUDGET` 256 MiB, snapshot pool 64 MiB, texture read pool 128 MiB) are unmeasured defaults.
 
 ## Immediate Resume Instructions
 
-- First action: read `crates/victory-gpu/src/texture.rs` upload/detile path and record a priority-8 evaluation (what is CPU-bound, data sizes, D3D12 mechanism, risk) in Completed/Incomplete Tasks.
-- Then: Priority 6 copy-back timing split (snapshot memcpy vs diff vs WriteProcessMemory), Priority 7 bounded CPU parallelism, Priority 8 GPU-side evaluation.
-- Pending tests: focused tests for each change, `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets`, `cargo build --profile diag -p victory --features diagnostics`.
-- Known blockers: none. Verified local commits are pre-authorized (AGENTS.md); pushes/destructive Git still need the user.
-- Remaining known risk: a thread's `run_deferred` refresh (before it takes the submission lock) can still write a shadow while another thread's submission GPU work reads/writes it; the snapshot fix does not cover this broader shared-shadow concurrency.
+- First action: ask the user for the hardware-run log lines described in Manual validation; record them here; then tune budgets/thresholds and make the priority-8 decision from the numbers.
+- Next implementation step (only after hardware numbers exist): decide on priority 8 GPU detiling (see evaluation in Completed Tasks); tune budgets/thresholds from `host memory` and frame-rate lines; consider removing the permanent per-texture upload staging copy if `texture staging` dominates.
+- Pending tests: authorized hardware run (manual, below). No automated test is pending.
+- Known blockers: hardware validation must be done by the user (agents must not launch the game or GPU workloads).
+- Remaining known risks: (1) a thread's `run_deferred` refresh can still write a shared shadow while another thread's submission runs on the GPU (pre-existing broader shared-shadow concurrency; not addressed). (2) Unconfirmed fence waits still write bottom-of-pipe markers (deliberate, avoids title deadlock). (3) Descriptor slots now keep loose/aligned copies alive; stale slots the title never rewrites retain those copies (bounded by what was previously never freed anyway). (4) Pre-existing clippy warning `list.rs:1398` untouched.
+- Diagnostic executable: `cargo build --profile diag -p victory --features diagnostics` → `target/diag/victory.exe` (built by the matrix; not run).
 - Commands required:
   - `cargo xtask policy`
   - `cargo test --workspace`
   - `cargo clippy --workspace --all-targets`
   - `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets`
   - `cargo build --profile diag -p victory --features diagnostics`
+
+## Manual validation (authorized hardware run — to be performed by the user)
+
+1. Build: `cargo build --profile diag -p victory --features diagnostics` (or the normal release build used before).
+2. Run the authorized workload the usual way, once with defaults and once with `VICTORY_COPY_WORKERS=1` set in the environment (serial baseline). Play the same scene for at least 5 minutes each.
+3. From the log, collect every 5 s: the frame-rate line (`preparing: copies … textures …; copy-back X ms Y MB, of it writes Z ms; snapshots A ms B MB`) and the new `host memory:` line (private, working set, system commit, GPU local/non-local usage/budget, and per-kind host copies with peaks).
+4. Compare: (a) `private` and `system commit` growth over time vs the historical (unverified) measurements; (b) which `host copies` kind dominates and whether any grows without bound; (c) `copies`/`textures` ms with workers vs `VICTORY_COPY_WORKERS=1`; (d) copy-back split (writes vs compare vs snapshots).
+5. Watch for new log lines: `host submission completion not confirmed` (should never appear), `unused host copies of title memory freed` (debug level; reclamation activity), `no memory for a copy-back snapshot`, `no memory to read a texture into`.
+6. Record the numbers in this file before any further optimization; do not claim improvements without them.
 
 ## Completed Tasks
 
@@ -78,15 +88,21 @@
 - VERIFIED — Priority 7 bounded CPU parallelism (`ac7525f`): new `crates/victory-gpu/src/par.rs` (`workers()` = hw threads-1 capped at 4, env `VICTORY_COPY_WORKERS`; `for_each` runs on caller below threshold, else scoped threads + atomic index, nothing retained). `Batch::flush` uses it for batches >= 8 MiB (`PARALLEL_REFRESH`, unmeasured). Copy-back intentionally left serial (nested shadows may write the same title bytes). Tests in `par::tests`. 67/67.
 - FAILED → FIXED — Stress after `ac7525f` showed `watch::tests::written_pages_are_reported_to_every_asker` failing 2/200 (`before.is_empty()` at watch.rs:315). Cause: my Phase 10 test `copy_back_does_not_mark_watched_pages_fresh` freed its write-watched page; the process-wide watch journal keeps entries for freed pages, so the reused address looked written. Fixed in test only (`e9d3629`: keep the page). 0/250 afterwards. Production impact of stale journal entries: only extra copies, never skipped ones (new shadows start with copied=0).
 
+- VERIFIED — Texture memory (`bd1e569`): finding — each title-written texture in watched memory kept a full-size `Last.read` buffer for good in addition to its full-size upload staging buffer (two permanent system-memory copies per texture besides the GPU texture). Reads now use a shared pool (4 buffers / 128 MiB, initialized, no clearing needed since `copy_mapped` defines every byte, zeros for unmapped pages). `memstat` gains `TextureStaging` and `TextureRead`. Test `read_buffers_are_pooled_within_bounds`. Remaining copy: the per-texture upload staging buffer is still permanent (needed for re-upload without re-detile); removing it is a candidate after measurement.
+- VERIFIED — Parallel detile (`318c2ca`): textures >= 8 MiB detile subresources on `par::workers()`; a failing subresource no longer aborts the rest. Test `detiling_fills_every_subresource` (512x512x2 slices x3 mips x16 B, SW_64KB_D) checks every row; mutation (skip subresource 4) made it FAIL; restored code passes. 69/69, 50 stress runs 0 failures.
+- DEFERRED — Priority 8 GPU acceleration evaluation (Claude, 2026-11-23): (a) GPU detiling: `victory_formats::texture::Layout` addressing is table-driven (per-column `column()` + per-row `row()` offsets, mip tail, slices), so a compute shader port is feasible: upload raw tiled bytes, run a CS that reads `ByteAddressBuffer` with column/row offset tables and writes the linear footprint buffer (or the texture via UAV), then the existing `CopyTextureRegion`. Blockers: the crate has no HLSL→DXIL build path (would need committed HLSL source plus a reproducible compiled blob or runtime compiler), XOR swizzles are unsupported already, and there is no measurement showing detile CPU time matters. (b) GPU-side copy-back dirty masks: would replace the CPU diff of snapshots with a CS comparing pre/post copies on the GPU and emitting a run list; only worthwhile if `copy-back … of it writes` is small relative to total copy-back time (i.e. comparison dominates). (c) Copy queue for staging→texture uploads: copies already ride the direct list; moving them needs cross-queue fences and gains nothing while `Host::execute` waits synchronously. Decision: defer all three until the manual hardware run reports `textures` ms and the copy-back split; keep CPU paths as fallback if implemented.
+
+- VERIFIED — Full Phase 10 verification matrix at `318c2ca` (Claude, 2026-11-23): `cargo xtask policy` → `asset policy: 152 files ok`; `cargo test --workspace` → 256 passed, 0 failed, 3 ignored (the 3 need external reference data, as at baseline); `cargo clippy --workspace --all-targets` exit 0, only pre-existing `list.rs:1398` undocumented-unsafe warning; `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets` exit 0, same single warning; `cargo build --profile diag -p victory --features diagnostics` exit 0 → `target/diag/victory.exe` (not launched).
+
 ## Incomplete Tasks
 
 - IN_PROGRESS — Remaining Priority A: shadow lifetime audit DONE (see Completed); snapshot pool bounded DONE; remaining: staging/scratch/upload allocations in `host.rs` (`list.scratch`, texture uploads) audit and allocation-failure handling.
 - IN_PROGRESS — Priority B measurement: snapshot memcpy, compare vs title-write split DONE (`6e0728c`); page protection/watch query time already in diagnostics copystat; remaining: authorized hardware run to read the numbers.
 - IMPLEMENTED_UNVERIFIED (hardware) — Priority C bounded CPU parallelism for refresh batches (`ac7525f`); unit-verified, speedup unmeasured.
-- NOT_STARTED — Priority D: evaluate documented D3D12 compute/copy-queue acceleration and GPU-local intermediates where measurements justify them.
-- NOT_STARTED — Priority E: process/system/DXGI memory reporting, bounded caches, temporary reuse, and safe reclamation.
-- NOT_STARTED — Priority F: evidence-based allocation/null/partial-initialization robustness audit.
-- NOT_STARTED — Final Phase 10 verification matrix and manual authorized-workload validation instructions.
+- DEFERRED — Priority D: evaluated (see Completed Tasks); awaiting hardware measurements.
+- IMPLEMENTED_UNVERIFIED (hardware) — Priority E: reporting (`ec38425`), bounded pools (`ec38425`, `bd1e569`), reclamation (`ba4cb15`) done and unit-tested; effect on real commit unmeasured.
+- IN_PROGRESS — Priority F: snapshot and texture-read allocations now fallible (`try_reserve_exact`); `shared_buffer`/`upload_buffer` already return `None` with a warning; remaining: audit other `vec!`/`Vec::with_capacity` of title-controlled sizes in `host.rs`/`list.rs`.
+- VERIFIED (software) / PENDING (hardware) — Final verification matrix passed at `318c2ca`; manual authorized-hardware validation instructions written (see Manual validation) and not yet performed.
 
 ## Agent Handoff History
 
@@ -116,3 +132,4 @@
 - Created `CLAUDE.md` (defers to `AGENTS.md`).
 - Resume point: add the full-page write-watch regression, then run focused/full tests.
 - Session 2 (same agent, after user granted standing commit authorization): committed `54a7346`, `8f834d1`, `e24bc28` as recorded in Completed Tasks. Resume at Priority 3 accounting.
+- Session 2 continued: committed `6e0728c`, `e9d3629`, `ac7525f`, `341fbd6`, `24dd7ab`, `bd1e569`, `318c2ca`. Phase 10 remains open pending the authorized hardware run.
