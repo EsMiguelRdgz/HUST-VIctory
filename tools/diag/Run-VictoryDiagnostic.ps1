@@ -48,6 +48,8 @@ param(
     [string]$VictoryLog = 'info',
     [string]$IsolatedCacheDir = '',
     [string]$TestLabel = '',
+    [string]$ScriptedKeys = '',
+    [string]$CaptureFrames = '',
     [switch]$EnableCapture,
     [switch]$EnableDebugLayer,
     [switch]$EnableDred,
@@ -352,8 +354,19 @@ if ($EnableCapture) {
     $framesDir = Join-Path $runDir 'frames'
     New-Item -ItemType Directory -Path $framesDir -Force | Out-Null
     $psi.EnvironmentVariables['VICTORY_CAPTURE'] = $framesDir
+    if (-not [string]::IsNullOrWhiteSpace($CaptureFrames)) {
+        $psi.EnvironmentVariables['VICTORY_CAPTURE_FRAMES'] = $CaptureFrames
+    } else {
+        $psi.EnvironmentVariables.Remove('VICTORY_CAPTURE_FRAMES')
+    }
 } else {
     $psi.EnvironmentVariables.Remove('VICTORY_CAPTURE')
+    $psi.EnvironmentVariables.Remove('VICTORY_CAPTURE_FRAMES')
+}
+if (-not [string]::IsNullOrWhiteSpace($ScriptedKeys)) {
+    $psi.EnvironmentVariables['VICTORY_KEYS'] = $ScriptedKeys
+} else {
+    $psi.EnvironmentVariables.Remove('VICTORY_KEYS')
 }
 if ($DisableLazyTextures) { $psi.EnvironmentVariables['VICTORY_LAZY_TEXTURES'] = '0' } else { $psi.EnvironmentVariables.Remove('VICTORY_LAZY_TEXTURES') }
 if ($SyncPipelines) { $psi.EnvironmentVariables['VICTORY_SYNC_PIPELINES'] = '1' } else { $psi.EnvironmentVariables.Remove('VICTORY_SYNC_PIPELINES') }
