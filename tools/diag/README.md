@@ -30,3 +30,7 @@ powershell -ExecutionPolicy Bypass -File G:\VIctory\tools\diag\Run-VictoryDiagno
     -MaxDurationSeconds 600 `
     -MinCommitHeadroomGB 5.0
 ```
+
+## GitHub Actions (home RTX 3070 runner)
+
+`.github/workflows/home-rtx3070-diagnostic.yml` can start one harness run on the owner's self-hosted runner (`hust-rtx3070`) for an explicitly selected, reviewed commit. It calls this script unchanged, runs `tools/ci/Test-HardwareSafety.ps1` first, and uploads only the sanitized bundle from `tools/ci/Export-DiagnosticArtifacts.ps1`. Setup: `docs/home-gpu-runner-setup.md`.
