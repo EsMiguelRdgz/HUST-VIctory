@@ -869,11 +869,9 @@ impl State {
                         host.constant_at(index, gpu, copy_len);
                     }
                     Some(view) => {
-                        if let Some((tex_res, host_tex)) = host.make_at(index, &view) {
+                        if let Some((_tex_res, host_tex, guard)) = host.make_at(index, &view) {
                             list.keep(&host_tex);
-                            if let Some(guard) = crate::resource::list_guard(tex_res as This) {
-                                list.pin(guard);
-                            }
+                            list.pin(guard);
                         }
                         for u in &matching {
                             readable(list, u, &view);
@@ -1094,7 +1092,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
-    let view = placed.as_ref().unwrap_or(view);
+    let view = placed.as_ref().map_or(view, |(v, _guard)| v);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((address, len, align)) = crate::descriptor::host::buffer_access(view)

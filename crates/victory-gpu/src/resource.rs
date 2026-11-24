@@ -1898,15 +1898,44 @@ pub(crate) fn evict_idle_textures(incoming: u64) -> u64 {
     freed
 }
 
-/// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// Live reference to a placed texture returned by [`texture_at`]. Holds a clone
+/// of the texture's `list_guard` acquired under `PLACED_TEXTURES` so concurrent
+/// `reclaim_placed_textures` / `on_title_memory_remapped` cannot free the
+/// underlying `Resource` while the caller is creating views or pinning it onto
+/// a command list.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) struct PlacedGuard {
+    resource: This,
+    guard: std::sync::Arc<()>,
+}
+
+#[cfg(windows)]
+impl PlacedGuard {
+    #[cfg(test)]
+    pub(crate) fn resource(&self) -> This {
+        self.resource
+    }
+
+    pub(crate) fn into_parts(self) -> (This, std::sync::Arc<()>) {
+        (self.resource, self.guard)
+    }
+}
+
+/// The resource for a texture placed at `address` with the resource
+/// description `desc` (as words), made on first use, paired with an active-use
+/// guard acquired under `PLACED_TEXTURES` to prevent concurrent eviction UAF.
+#[cfg(windows)]
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<PlacedGuard> {
     {
         let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = map.get_mut(&(address, *desc)) {
             entry.last_used = TEXTURE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Some(entry.resource as This);
+            let res = entry.resource as This;
+            let guard = resource(res).list_guard.clone();
+            return Some(PlacedGuard {
+                resource: res,
+                guard,
+            });
         }
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -1952,7 +1981,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         .bytes;
     let tick = TEXTURE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut duplicate = None;
-    {
+    let guard = {
         let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.get_mut(&(address, *desc)) {
             existing.last_used = tick;
@@ -1970,13 +1999,19 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             );
             PLACED_TEXTURE_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
         }
-    }
+        // Pin BEFORE dropping `PLACED_TEXTURES` so concurrent eviction cannot
+        // release `out` before the caller finishes using it.
+        resource(out).list_guard.clone()
+    };
     if let Some(dup) = duplicate {
         resource_release(dup);
     } else {
         reclaim_placed_textures(PLACED_TEXTURE_BUDGET);
     }
-    Some(out)
+    Some(PlacedGuard {
+        resource: out,
+        guard,
+    })
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -3519,6 +3554,67 @@ pub(crate) mod tests {
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 
+    /// Regression for Test #16 (`nvwgf2umx.dll` crash in `make_at -> make_owned
+    /// -> placed_texture`): multiple worker threads building SRVs for `View::Placed`
+    /// textures concurrently with aggressive `evict_idle_textures(0)` and
+    /// `on_title_memory_remapped` must never use-after-free a placed `Resource`.
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_placed_texture_make_at_and_reclaim_never_uaf() {
+        let _guard = TEXTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let heap = std::sync::Arc::new(
+            crate::descriptor::host::HostHeap::new(false, 16, 0).expect("host view heap"),
+        );
+        let backing = vec![0xA5u8; 256 << 10];
+        let base_addr = backing.as_ptr() as u64;
+        let d = texture(64, 64, 28, 1);
+        // SAFETY: `ResourceDesc` is 56 bytes = 14 u32 words.
+        let words: [u32; 14] =
+            unsafe { std::ptr::from_ref(&d).cast::<[u32; 14]>().read_unaligned() };
+
+        let mut workers = Vec::new();
+        for tid in 0..4u32 {
+            let heap = heap.clone();
+            workers.push(std::thread::spawn(move || {
+                for i in 0..50u64 {
+                    let addr = base_addr + ((i + u64::from(tid)) % 4) * 16384;
+                    let mut srv = [0u32; 16];
+                    srv[0] = 28; // DXGI_FORMAT_R8G8B8A8_UNORM
+                    srv[1] = 4; // D3D12_SRV_DIMENSION_TEXTURE2D
+                    srv[2] = 0x1688; // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+                    srv[4] = 0; // MostDetailedMip = 0 (after union alignment padding)
+                    srv[5] = 1; // MipLevels = 1
+                    srv[10] = addr as u32;
+                    srv[11] = (addr >> 32) as u32;
+                    let view = crate::descriptor::View::Placed(false, words, srv);
+                    let slot = heap.count() + tid;
+                    let bound = heap.make_at(slot, &view);
+                    assert!(bound.is_some(), "placed texture SRV creation must succeed");
+                }
+            }));
+        }
+        let evictor = std::thread::spawn(move || {
+            for i in 0..80u64 {
+                let _ = evict_idle_textures(0);
+                let addr = base_addr + (i % 4) * 16384;
+                on_title_memory_remapped(addr, 16384);
+            }
+        });
+        for w in workers {
+            w.join().expect("worker thread finished");
+        }
+        evictor.join().expect("evictor thread finished");
+        drop(heap);
+        on_title_memory_remapped(base_addr, backing.len() as u64);
+        let _ = evict_idle_textures(0);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
     /// `PLACED_TEXTURES` entries are evicted and freed when the title remaps
     /// their backing address range.
     #[cfg(windows)]
@@ -3536,7 +3632,8 @@ pub(crate) mod tests {
         let evicted_before = crate::memstat::events(crate::memstat::Event::TexturesEvicted);
 
         let res = texture_at(addr, &words).expect("placed texture");
-        assert!(has_host_resource(res));
+        assert!(has_host_resource(res.resource()));
+        drop(res);
         assert!(
             PLACED_TEXTURES
                 .lock()

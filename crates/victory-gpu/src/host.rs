@@ -1143,27 +1143,32 @@ impl HostList {
         }
     }
 
-    /// Releases post-execution pins (`list_guard`, `bindless_guard`), shadow
-    /// references, upload buffers, and kept COM refs as soon as the host GPU
-    /// finishes running this list, so idle textures and buffer shadows can be
-    /// reclaimed under commit pressure without waiting 1-2 frames for `Reset()`.
+    /// Releases post-execution eviction pins (`list_guard`, `bindless_guard`)
+    /// as soon as the host GPU finishes running this list, so idle textures
+    /// can be evicted before the title calls `Reset()` frames later while
+    /// keeping recorded `kept` COM refs, `copies`, `uploads`, `writes`, and
+    /// `scratch` intact in case the title re-executes a closed list without
+    /// calling `Reset()`.
     fn on_executed(&self) {
         self.executed.store(true, Ordering::Release);
-        let old_deferred = std::mem::take(&mut *self.deferred());
-        drop(old_deferred);
+        let mut guards = {
+            let mut deferred = self.deferred();
+            let mut out = std::mem::take(&mut deferred.guards);
+            for step in &mut deferred.copies {
+                if let Step::Texture { _guard, .. } = step
+                    && let Some(g) = _guard.take()
+                {
+                    out.push(g);
+                }
+            }
+            out
+        };
+        guards.clear();
         let state_guards: Vec<Option<std::sync::Arc<()>>> = {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
             states.values_mut().map(|entry| entry.2.take()).collect()
         };
         drop(state_guards);
-        if crate::memstat::under_pressure(0) {
-            let dropped_chunks = {
-                let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-                (scratch.current, scratch.used) = (0, 0);
-                std::mem::take(&mut scratch.chunks)
-            };
-            drop(dropped_chunks);
-        }
     }
 
     /// Only after the list's last submission finished (every one is waited

@@ -437,25 +437,34 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a type-compatible null
-    /// view if the host cannot. Returns `(title_resource, host_texture)` if a
-    /// host texture was bound into the slot so the caller can pin it on the
-    /// open command list.
-    pub(crate) fn make_at(&self, index: u32, view: &View) -> Option<(usize, ID3D12Resource)> {
+    /// view if the host cannot. Returns `(title_resource, host_texture, list_guard)`
+    /// if a host texture was bound into the slot so the caller can pin it on the
+    /// open command list with zero gap against concurrent placed-texture eviction.
+    pub(crate) fn make_at(
+        &self,
+        index: u32,
+        view: &View,
+    ) -> Option<(usize, ID3D12Resource, Arc<()>)> {
         let mut owner = None;
         let mut tex_owner = None;
+        let mut tex_guard = None;
         if !make_owned(
             &self.device,
             view,
             self.cpu(index),
             &mut owner,
             &mut tex_owner,
+            &mut tex_guard,
         ) {
             self.null_fallbacks.fetch_add(1, Ordering::Relaxed);
             null_for_on(&self.device, view, self.cpu(index));
         }
-        let bound = tex_owner
-            .as_ref()
-            .map(|(res, _, tex, _)| (*res, tex.clone()));
+        let bound = tex_owner.as_ref().and_then(|(res, _, tex, _)| {
+            let guard = tex_guard
+                .take()
+                .or_else(|| crate::resource::list_guard(*res as crate::object::This))?;
+            Some((*res, tex.clone(), guard))
+        });
         self.own(index, owner, tex_owner);
         bound
     }
@@ -633,6 +642,7 @@ impl HostHeap {
                 made[index as usize] = if later { 0 } else { key };
                 let mut owner = None;
                 let mut tex_owner = None;
+                let mut tex_guard = None;
                 if (later
                     || !make_owned(
                         &self.device,
@@ -640,6 +650,7 @@ impl HostHeap {
                         self.cpu(index),
                         &mut owner,
                         &mut tex_owner,
+                        &mut tex_guard,
                     ))
                     && !self.sampler
                 {
@@ -1024,18 +1035,20 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 /// Makes the host descriptor for `view` at `at` on `device`; false if it cannot.
 #[cfg_attr(not(test), allow(dead_code))]
 fn make_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
-    make_owned(device, view, at, &mut None, &mut None)
+    make_owned(device, view, at, &mut None, &mut None, &mut None)
 }
 
 /// As [`make_on`], setting `owner` to the host copy the descriptor reads if
-/// the descriptor must keep it alive, and `tex_owner` to any host texture
-/// bound into the slot.
+/// the descriptor must keep it alive, `tex_owner` to any host texture bound
+/// into the slot, and `tex_guard` to any placed-texture active-use guard
+/// keeping the underlying `Resource` alive until the caller pins it.
 fn make_owned(
     device: &ID3D12Device,
     view: &View,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     owner: &mut Option<Arc<Shadow>>,
     tex_owner: &mut Option<(usize, bool, ID3D12Resource, View)>,
+    tex_guard: &mut Option<Arc<()>>,
 ) -> bool {
     match view {
         &View::Constant(address, size) => {
@@ -1152,8 +1165,12 @@ fn make_owned(
             true
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
-                return make_owned(device, &view, at, owner, tex_owner);
+            if let Some((view, guard)) = placed_texture(view) {
+                let ok = make_owned(device, &view, at, owner, tex_owner, tex_guard);
+                if ok {
+                    *tex_guard = Some(guard);
+                }
+                return ok;
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -1180,8 +1197,10 @@ fn make_owned(
 }
 
 /// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
-pub(crate) fn placed_texture(view: &View) -> Option<View> {
+/// of the resource made for that memory (on first use), paired with an
+/// active-use guard that prevents concurrent eviction from freeing the
+/// `Resource` while the caller creates descriptors or pins it onto a list.
+pub(crate) fn placed_texture(view: &View) -> Option<(View, Arc<()>)> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
         return None;
@@ -1190,8 +1209,11 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let (texture, guard) = crate::resource::texture_at(address, resource)?.into_parts();
+    Some((
+        View::Shader(texture as usize, desc[..10].try_into().ok()),
+        guard,
+    ))
 }
 
 /// Sanitizes an SRV description so `CreateShaderResourceView(None, Some(&desc), at)`
