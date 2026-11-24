@@ -636,10 +636,14 @@ impl Host {
                 }
             }
         }
-        for (shadow, ranges) in &gpu_writes {
-            shadow.snapshot_ranges(ranges);
-        }
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Snapshots are this submission's own and taken under `submitted`,
+        // after every earlier submission's GPU work and copy-back: an
+        // overlapping submission can neither replace nor consume them.
+        let snapshots: Vec<_> = gpu_writes
+            .iter()
+            .map(|(shadow, ranges)| shadow.snapshot_ranges(ranges))
+            .collect();
         *submitted += 1;
         let prepared = std::time::Instant::now();
         // SAFETY: closed lists; the fence and event are ours.
@@ -688,9 +692,10 @@ impl Host {
         }
         let copying_back = std::time::Instant::now();
         let mut changed_bytes = 0u64;
-        for (shadow, ranges) in &gpu_writes {
-            changed_bytes += shadow.copy_back_ranges(ranges) as u64;
+        for ((shadow, ranges), snapshot) in gpu_writes.iter().zip(&snapshots) {
+            changed_bytes += shadow.copy_back_ranges(ranges, snapshot.as_ref()) as u64;
         }
+        drop(snapshots);
         if !gpu_writes.is_empty() {
             COPY_BACK[0].fetch_add(copying_back.elapsed().as_micros() as u64, Ordering::Relaxed);
             COPY_BACK[1].fetch_add(changed_bytes, Ordering::Relaxed);

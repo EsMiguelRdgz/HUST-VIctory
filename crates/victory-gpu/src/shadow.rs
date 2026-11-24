@@ -40,9 +40,22 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// Pre-submission snapshot of the bytes covering pending shader writes
-    /// `(base_offset, bytes)`, so copy-back writes only bytes the GPU changed.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+}
+
+/// One submission's pre-GPU copy of the bytes its shaders may write, from
+/// offset `base` of a shadow: copy-back writes only bytes the GPU changed.
+/// Owned by the submission (not the shadow), so overlapping submissions
+/// cannot replace or consume each other's baselines. Its buffer goes back
+/// to the pool when dropped.
+pub(crate) struct Snapshot {
+    base: usize,
+    bytes: Vec<u8>,
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        return_snapshot_buf(std::mem::take(&mut self.bytes));
+    }
 }
 
 /// Reusable snapshot buffers (kept warm to avoid repeated page faults).
@@ -161,7 +174,6 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
-            before: Mutex::default(),
         }
     }
 
@@ -188,8 +200,8 @@ impl Shadow {
 
     /// Before GPU execution: snapshots the union of `ranges` `(address, len)`
     /// inside this shadow so [`Shadow::copy_back_ranges`] writes back only
-    /// bytes the GPU actually modified.
-    pub(crate) fn snapshot_ranges(&self, ranges: &[(usize, usize)]) {
+    /// bytes the GPU actually modified. `None` if no range is inside.
+    pub(crate) fn snapshot_ranges(&self, ranges: &[(usize, usize)]) -> Option<Snapshot> {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut min_off = usize::MAX;
         let mut max_off = 0usize;
@@ -202,29 +214,30 @@ impl Shadow {
             }
         }
         if min_off >= max_off {
-            return;
+            return None;
         }
         let span = max_off - min_off;
         let mut buf = take_snapshot_buf(span);
         // SAFETY: `[min_off, max_off)` lies inside this shadow's persistent mapping.
         let src = unsafe { std::slice::from_raw_parts(self.data.add(min_off), span) };
         buf.extend_from_slice(src);
-        let prev = self
-            .before
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace((min_off, buf));
-        if let Some((_, old)) = prev {
-            return_snapshot_buf(old);
-        }
+        Some(Snapshot {
+            base: min_off,
+            bytes: buf,
+        })
     }
 
     /// After the submission ran: compares each merged range in `ranges`
-    /// `(address, len)` against the pre-submission snapshot and copies back
+    /// `(address, len)` against its pre-submission `snapshot` and copies back
     /// only the exact byte runs that changed, preventing redundant kernel
     /// copies and preserving concurrent title CPU writes to untouched bytes.
     /// Returns the total changed bytes copied back.
-    pub(crate) fn copy_back_ranges(&self, ranges: &[(usize, usize)]) -> usize {
+    /// Ranges outside the snapshot (or with none) go back whole.
+    pub(crate) fn copy_back_ranges(
+        &self,
+        ranges: &[(usize, usize)],
+        snapshot: Option<&Snapshot>,
+    ) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let clamped: Vec<(usize, usize)> = ranges
             .iter()
@@ -235,7 +248,6 @@ impl Shadow {
             })
             .collect();
         let merged = merge_ranges(&clamped);
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner()).take();
         let mut changed_total = 0usize;
 
         for &(from, to) in &merged {
@@ -244,11 +256,11 @@ impl Shadow {
             // SAFETY: `[from_off, to_off)` lies inside this shadow's mapping.
             let after = unsafe { std::slice::from_raw_parts(self.data.add(from_off), to - from) };
             let mut range_changed = 0usize;
-            if let Some((base_off, ref before_buf)) = snapshot
-                && from_off >= base_off
-                && to_off <= base_off + before_buf.len()
+            if let Some(Snapshot { base, bytes }) = snapshot
+                && from_off >= *base
+                && to_off <= base + bytes.len()
             {
-                let before = &before_buf[from_off - base_off..to_off - base_off];
+                let before = &bytes[from_off - base..to_off - base];
                 for (run_start, run_end) in diff_runs(before, after) {
                     let run_addr = from + run_start;
                     let run_len = run_end - run_start;
@@ -272,9 +284,6 @@ impl Shadow {
             // A later refresh must still be allowed to copy those writes.
         }
 
-        if let Some((_, buf)) = snapshot {
-            return_snapshot_buf(buf);
-        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         for &(address, len) in ranges {
             if let Some(i) = pending.iter().position(|&r| r == (address, address + len)) {
@@ -620,8 +629,8 @@ mod tests {
         assert_eq!(shadow.pending.lock().unwrap().len(), 1);
 
         // Host::execute snapshots and copies back an exact-unique range once.
-        shadow.snapshot_ranges(&[range]);
-        assert_eq!(shadow.copy_back_ranges(&[range]), 0);
+        let snapshot = shadow.snapshot_ranges(&[range]);
+        assert_eq!(shadow.copy_back_ranges(&[range], snapshot.as_ref()), 0);
         assert!(shadow.pending.lock().unwrap().is_empty());
 
         title_mem[128..136].fill(0x99);
@@ -670,7 +679,7 @@ mod tests {
         assert_eq!(shadow.update(base, PAGE), PAGE);
         assert_eq!(shadow.watched.load(Ordering::Relaxed), 1);
         shadow.writing(base, PAGE);
-        shadow.snapshot_ranges(&[(base, PAGE)]);
+        let snapshot = shadow.snapshot_ranges(&[(base, PAGE)]);
 
         // The GPU writes [64, 72) of the copy while the title writes
         // [200, 208) of its memory, in the same 64 KiB page.
@@ -678,7 +687,10 @@ mod tests {
         unsafe { std::slice::from_raw_parts_mut(shadow.data.add(64), 8).fill(0x77) };
         title_mem[200..208].fill(0x99);
 
-        assert_eq!(shadow.copy_back_ranges(&[(base, PAGE)]), 8);
+        assert_eq!(
+            shadow.copy_back_ranges(&[(base, PAGE)], snapshot.as_ref()),
+            8
+        );
         assert_eq!(&title_mem[64..72], &[0x77u8; 8]);
         assert_eq!(&title_mem[200..208], &[0x99u8; 8]);
 
@@ -711,7 +723,7 @@ mod tests {
         // Seed shadow from title_mem (all 0x11).
         shadow.update(base as usize, 4096);
         shadow.writing(base as usize, 4096);
-        shadow.snapshot_ranges(&[(base as usize, 4096)]);
+        let snapshot = shadow.snapshot_ranges(&[(base as usize, 4096)]);
 
         // Simulate GPU writing ONLY bytes [64..72) in the shadow, while the
         // title CPU concurrently writes bytes [200..208) in title_mem.
@@ -721,7 +733,10 @@ mod tests {
         }
         title_mem[200..208].fill(0x99);
 
-        let changed = shadow.copy_back_ranges(&[(base as usize, 4096), (base as usize, 4096)]);
+        let changed = shadow.copy_back_ranges(
+            &[(base as usize, 4096), (base as usize, 4096)],
+            snapshot.as_ref(),
+        );
         assert_eq!(changed, 8);
         assert_eq!(&title_mem[64..72], &[0x77u8; 8], "GPU writes copied back");
         assert_eq!(
@@ -732,6 +747,44 @@ mod tests {
         assert_eq!(&title_mem[0..64], &[0x11u8; 64]);
 
         unregister(fake_id, base);
+        let _ = host_gpu;
+    }
+
+    /// Two submissions in flight on one shadow keep their own baselines:
+    /// the later snapshot neither replaces nor consumes the earlier one.
+    #[test]
+    fn overlapping_submissions_keep_their_own_snapshots() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mut title_mem = vec![0x11u8; 4096];
+        let base = title_mem.as_mut_ptr() as usize;
+        let fake_id = base ^ 0x0B5E_55ED;
+        register(fake_id, base as u64, 4096);
+        let shadow = find(base as u64, 4096).expect("shadow buffer");
+        shadow.update(base, 4096);
+        let (first, second) = ((base, 1024), (base + 2048, 1024));
+        shadow.writing(first.0, first.1);
+        shadow.writing(second.0, second.1);
+
+        let before_first = shadow.snapshot_ranges(&[first]).expect("first snapshot");
+        // SAFETY: inside the shadow's mapping.
+        let copy = unsafe { std::slice::from_raw_parts_mut(shadow.data, 4096) };
+        copy[16..24].fill(0x77); // the first submission's GPU write
+        let before_second = shadow.snapshot_ranges(&[second]).expect("second snapshot");
+        copy[2048 + 32..2048 + 40].fill(0x55); // the second's
+
+        // The title writes the first range meanwhile; only GPU-changed
+        // bytes may overwrite it, which needs the first baseline intact.
+        title_mem[512..520].fill(0x99);
+        assert_eq!(shadow.copy_back_ranges(&[first], Some(&before_first)), 8);
+        assert_eq!(shadow.copy_back_ranges(&[second], Some(&before_second)), 8);
+        assert_eq!(&title_mem[16..24], &[0x77u8; 8]);
+        assert_eq!(&title_mem[512..520], &[0x99u8; 8], "title write preserved");
+        assert_eq!(&title_mem[2048 + 32..2048 + 40], &[0x55u8; 8]);
+        assert!(shadow.pending.lock().unwrap().is_empty());
+
+        unregister(fake_id, base as u64);
         let _ = host_gpu;
     }
 }
