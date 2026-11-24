@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -778,4 +778,157 @@ fn a_heap_index_past_the_heap_reads_the_guard_slot() {
         let want = if i == 0 { 7 } else { 0 };
         assert_eq!(got, want, "{label}: index {:#x}", k[0]);
     });
+}
+
+/// SMEM `s_buffer_load_dwordx4 s[dst:dst+3], s[srsrc:srsrc+3], byte_off`
+/// (`soffset = null`).
+const fn s_buffer_load_dwordx4(dst: u8, srsrc: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x0A << 18 | (dst as u32) << 6 | (srsrc as u32 >> 1),
+        125 << 25 | (byte_off & 0x001F_FFFF),
+    ]
+}
+
+/// `s_buffer_load_dwordx4` on a single-element `StructuredBuffer` SRV must emit
+/// a `StructuredBuffer` handle with `(byte_off / stride, byte_off % stride)`
+/// rather than a `RawBuffer` handle. Otherwise NVIDIA D3D12 treats byte offsets
+/// 4, 8, 12 as out-of-bounds element indices and returns 0 for dwords 1..3.
+#[test]
+fn s_buffer_load_reads_all_dwords_from_structured_srv() {
+    let mut words = Vec::new();
+    // s0 = descriptor table base (heap index 0 = RawUav, heap index 1 = StructuredBuffer SRV).
+    words.push(s_mov_b32(1, 0x80)); // s1 = 0
+    // s[4:7] = RawUav descriptor at table offset 0.
+    words.extend_from_slice(&s_load_dwordx4(4, 0));
+    // s[8:11] = StructuredBuffer SRV descriptor at table offset 32 (heap slot 1).
+    words.extend_from_slice(&[s_load_dwordx4(8, 0)[0], 125 << 25 | 32]);
+    // s[12:15] = s_buffer_load_dwordx4 from the 1-element 16-byte StructuredBuffer SRV.
+    words.extend_from_slice(&s_buffer_load_dwordx4(12, 8, 0));
+    // Store all 4 loaded dwords to the RawUav at byte offsets 0, 4, 8, 12.
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i, sgpr(12 + i))); // v_mov_b32 v[i], s[12+i]
+        words.extend_from_slice(&buffer_store_dword(i, 4, u16::from(i) * 4));
+    }
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 16,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1, // 1 user SGPR: s0
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        options: super::TranslateOptions::default(),
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        wave_size: lowered.wave_size,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    let want = [1024u32, 512, 2560, 1440];
+    let views = [
+        View::RawUav(4),
+        View::Buffer {
+            data: &want,
+            stride: Stride::Structured(16),
+        },
+    ];
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Table, 0) => 0,
+            (root, _) => super::host::guard(root, views.len(), 0)
+                .unwrap_or_else(|| panic!("unexpected user data {:?}", (root, u.slot))),
+        };
+    }
+    let dispatch = Dispatch {
+        roots: vec![(0, Root::Constants(ud))],
+        views: &views,
+        samplers: &[],
+        groups: [1, 1, 1],
+    };
+
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let got = host
+            .dispatch(&root, &pso, &dispatch)
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(
+            got[0], want,
+            "{label}: s_buffer_load_dwordx4 on StructuredBuffer SRV"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 host ran");
 }
