@@ -24,11 +24,13 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+    [string]$RepoRoot = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# $PSScriptRoot is empty inside param() defaults on Windows PowerShell 5.1.
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = Join-Path $PSScriptRoot '..\..' }
 
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path.TrimEnd('\', '/')
 $failures = New-Object System.Collections.Generic.List[string]
@@ -80,6 +82,11 @@ if ($null -ne $harness) {
         'recent display-driver reset (Event 4101) check'      = 'Id\s*=\s*4101'
         'GPU recovery interval'                               = '\$RecoveryIntervalSeconds\s+-gt\s+0'
         'launch history outside the repository'               = 'hw-launch-history\.json'
+        'synthetic runs are hardware runs unless CPU-only'    = '\$hardwareRun\s*=\s*-not\s+\$isSynthetic\s+-or\s+-not\s+\$SyntheticCpuOnly'
+        'hardware preflight gate covers synthetic runs'       = 'if\s*\(\s*\$hardwareRun\s*\)\s*\{[\s\S]*?Get-VictoryPreflightProblems[\s\S]*?\{\s*throw'
+        'CPU-only runs forced onto the software adapter'      = "EnvironmentVariables\['VICTORY_D3D12_WARP'\]\s*=\s*'1'"
+        'timeout terminates the whole process tree'           = "'MaxDurationReached'\s*\r?\n[^\r\n]*\r?\n\s*\`$stop\s*=\s*Stop-VictoryProcessTree"
+        'guard stop terminates the whole process tree'        = "floor\.`"\s*-f[^\r\n]*\r?\n[^\r\n]*\r?\n\s*\`$stop\s*=\s*Stop-VictoryProcessTree"
     }
     foreach ($name in $required.Keys) {
         if ($code -notmatch $required[$name]) {
@@ -110,7 +117,10 @@ $scan = New-Object System.Collections.Generic.List[System.IO.FileInfo]
 foreach ($dir in @('.github/workflows', 'tools')) {
     $full = Join-Path $RepoRoot $dir
     if (Test-Path -LiteralPath $full) {
-        Get-ChildItem -LiteralPath $full -Recurse -File -Include '*.yml', '*.yaml', '*.ps1', '*.cmd', '*.sh' |
+        # Filter by extension explicitly: Windows PowerShell 5.1 ignores
+        # -Include together with -LiteralPath and would scan every file.
+        Get-ChildItem -LiteralPath $full -Recurse -File |
+            Where-Object { @('.yml', '.yaml', '.ps1', '.cmd', '.sh') -contains $_.Extension.ToLowerInvariant() } |
             ForEach-Object { $scan.Add($_) }
     }
 }

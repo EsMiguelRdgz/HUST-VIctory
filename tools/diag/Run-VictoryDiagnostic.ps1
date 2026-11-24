@@ -15,6 +15,20 @@
     classifies outcomes, writes timestamped reports under G:\VIctory-Results,
     and sends consolidated Discord notifications.
 
+    Synthetic runs (-SyntheticCommand) are hardware runs unless
+    -SyntheticCpuOnly is passed: they get the same preflight (NVIDIA health,
+    no Event 4101 in 3 min, single instance including cargo test binaries,
+    >= 10 GB headroom, recovery interval) and launch history as a title
+    launch. -SyntheticCpuOnly forces the software adapter (VICTORY_WARP=1,
+    VICTORY_D3D12_WARP=1) instead. On a timeout or guard stop the whole
+    process tree is terminated (cargo and every test binary it started),
+    and anything still running after the child exits is reported and ended.
+    Synthetic outcomes report cargo test counts, every skipped/unsupported
+    dependency line (CleanExitWithSkips instead of a silent CleanExit), and
+    the D3D12 debug-layer state per crate from the probe tests
+    (VICTORY_TEST_PROBE_FILE; DebugLayerNotVerified when requested but not
+    shown active).
+
     Never disables VICTORY_MEMORY_GUARD, never clears shader caches, never
     modifies pagefile/TDR settings, and never runs an automatic retry loop.
 #>
@@ -38,6 +52,13 @@ param(
 
     [Parameter(ParameterSetName = 'Synthetic')]
     [string[]]$SyntheticArgs = @(),
+
+    # A synthetic command that must not touch the GPU: the child gets
+    # VICTORY_WARP=1 and VICTORY_D3D12_WARP=1 (software adapter only) and the
+    # hardware preflight is skipped. Without it, a synthetic run is a
+    # hardware run and gets every preflight check a title launch gets.
+    [Parameter(ParameterSetName = 'Synthetic')]
+    [switch]$SyntheticCpuOnly,
 
     [string]$RepoRoot = 'G:\VIctory',
     [string]$ResultsRoot = 'G:\VIctory-Results',
@@ -195,16 +216,26 @@ function Save-LaunchHistory {
     ConvertTo-Json -InputObject @($Entries) -Depth 5 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
+. (Join-Path $PSScriptRoot 'VictoryDiagnosticLib.ps1')
+
 # Safety gates: never allow accidental or unapproved proprietary game launch.
 $isSynthetic = ($PSCmdlet.ParameterSetName -eq 'Synthetic')
+# A hardware run is a title launch or any synthetic run not declared CPU-only:
+# both get the same preflight, floors, recovery interval and launch history.
+$hardwareRun = -not $isSynthetic -or -not $SyntheticCpuOnly
 if ($MaxLaunchesPer24h -gt 4) {
     throw "Hard safety limit: MaxLaunchesPer24h cannot exceed 4."
 }
-if ($MinCommitHeadroomGB -lt 5.0 -and -not $isSynthetic) {
+if ($MinCommitHeadroomGB -lt 5.0 -and $hardwareRun) {
     throw "Hard safety limit: MinCommitHeadroomGB must be at least 5.0 GB for hardware launches."
 }
-if ($MinPreLaunchHeadroomGB -lt 10.0 -and -not $isSynthetic) {
+if ($MinPreLaunchHeadroomGB -lt 10.0 -and $hardwareRun) {
     throw "Hard safety limit: MinPreLaunchHeadroomGB must be at least 10.0 GB for hardware launches."
+}
+# Ignored tests include known-defect regressions (WARP only); they never run
+# on the hardware adapter through this harness.
+if ($isSynthetic -and $hardwareRun -and @($SyntheticArgs | Where-Object { $_ -in @('--ignored', '--include-ignored') }).Count -gt 0) {
+    throw "Refusing launch: --ignored/--include-ignored on the hardware adapter would run known-defect tests on the GPU; use -SyntheticCpuOnly."
 }
 
 $launchHistoryPath = Join-Path (Join-Path $env:LOCALAPPDATA 'HUST-VIctory') 'hw-launch-history.json'
@@ -212,36 +243,25 @@ $allHistory = @()
 $recentLaunches = @()
 $launchNumber24h = 0
 $launchNumberTotal = 0
+$preflightReport = 'skipped (CPU-only synthetic run: software adapter forced)'
 
-if (-not $isSynthetic) {
-    if (-not $AuthorizeGameLaunch) {
-        throw "Refusing to launch a title executable without explicit -AuthorizeGameLaunch authorization."
-    }
-    if (-not (Test-Path -LiteralPath $TitleExe)) {
-        throw "Title executable not found: $TitleExe"
-    }
-
-    # Single-instance exclusivity check (sequential execution only).
-    $existing = @(Get-Process -Name 'victory', 'game_scarlett_master' -ErrorAction SilentlyContinue)
-    if ($existing.Count -gt 0) {
-        $pids = ($existing | ForEach-Object { "$($_.ProcessName)($($_.Id))" }) -join ', '
-        throw "Refusing launch: existing VIctory/game process already running: $pids"
+if ($hardwareRun) {
+    if (-not $isSynthetic) {
+        if (-not $AuthorizeGameLaunch) {
+            throw "Refusing to launch a title executable without explicit -AuthorizeGameLaunch authorization."
+        }
+        if (-not (Test-Path -LiteralPath $TitleExe)) {
+            throw "Title executable not found: $TitleExe"
+        }
     }
 
-    # Verify NVIDIA GPU adapter is present, healthy, and has no recent OS TDR reset.
+    # Single-instance exclusivity check (sequential execution only): the
+    # launcher, the title, and this repository's cargo test binaries.
+    $existing = @(Get-Process -Name 'victory', 'game_scarlett_master' -ErrorAction SilentlyContinue) +
+        @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like 'victory_*-*' })
+    # NVIDIA adapter health and recent OS TDR resets.
     $gpuAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue)
-    $nv = $gpuAdapters | Where-Object { $_.Name -like '*NVIDIA*' } | Select-Object -First 1
-    if ($null -eq $nv) {
-        throw "Refusing launch: no NVIDIA display adapter found in Win32_VideoController."
-    }
-    if ($nv.Status -ne 'OK' -or ($null -ne $nv.ConfigManagerErrorCode -and $nv.ConfigManagerErrorCode -ne 0)) {
-        throw "Refusing launch: NVIDIA adapter '$($nv.Name)' unhealthy (Status='$($nv.Status)', ConfigManagerErrorCode=$($nv.ConfigManagerErrorCode))."
-    }
     $recentTdr = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Display'; Id = 4101; StartTime = (Get-Date).AddMinutes(-3) } -ErrorAction SilentlyContinue)
-    if ($recentTdr.Count -gt 0) {
-        $tdrTime = $recentTdr[0].TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        throw "Refusing launch: Windows recorded a display driver reset (Event 4101) at $tdrTime (< 3 min ago). Allow system recovery before resuming hardware tests."
-    }
 
     # Persistent launch history & recovery interval (no daily launch cap unless MaxLaunchesPer24h > 0).
     $nowUtc = [DateTime]::UtcNow
@@ -254,15 +274,29 @@ if (-not $isSynthetic) {
         throw ("Refusing launch: optional 24-hour hardware launch cap reached ({0}/{1})." -f $recentLaunches.Count, $MaxLaunchesPer24h)
     }
     $lastLaunch = $allHistory | Sort-Object { try { [DateTime]::Parse($_.EndUtc).ToUniversalTime() } catch { [DateTime]::MinValue } } | Select-Object -Last 1
-    if ($null -ne $lastLaunch -and $RecoveryIntervalSeconds -gt 0) {
-        $lastEnd = [DateTime]::Parse($lastLaunch.EndUtc).ToUniversalTime()
-        $sinceSec = ($nowUtc - $lastEnd).TotalSeconds
-        if ($sinceSec -lt $RecoveryIntervalSeconds) {
-            $waitSec = [Math]::Ceiling($RecoveryIntervalSeconds - $sinceSec)
-            Write-Host "Enforcing ${RecoveryIntervalSeconds}s GPU recovery interval: waiting ${waitSec}s..."
-            Start-Sleep -Seconds $waitSec
-        }
+    $lastEnd = $null
+    if ($null -ne $lastLaunch) {
+        try { $lastEnd = [DateTime]::Parse($lastLaunch.EndUtc).ToUniversalTime() } catch { $lastEnd = $null }
     }
+
+    $preflight = Get-VictoryPreflightProblems `
+        -Adapters $gpuAdapters `
+        -RecentTdrEvents $recentTdr `
+        -RunningProcessNames @($existing | ForEach-Object { $_.ProcessName }) `
+        -CommitHeadroomMB (Get-SystemMemorySnapshot).CommitHeadroomMB `
+        -MinPreLaunchHeadroomGB $MinPreLaunchHeadroomGB `
+        -LastLaunchEndUtc $lastEnd `
+        -NowUtc $nowUtc `
+        -RecoveryIntervalSeconds $RecoveryIntervalSeconds
+    if (@($preflight.Problems).Count -gt 0) {
+        throw ("Refusing launch: " + (@($preflight.Problems) -join '; ') + '.')
+    }
+    if ($RecoveryIntervalSeconds -gt 0 -and $preflight.WaitSeconds -gt 0) {
+        Write-Host "Enforcing ${RecoveryIntervalSeconds}s GPU recovery interval: waiting $($preflight.WaitSeconds)s..."
+        Start-Sleep -Seconds $preflight.WaitSeconds
+    }
+    $nvName = @($gpuAdapters | Where-Object { $_.Name -like '*NVIDIA*' } | ForEach-Object { "$($_.Name) (driver $($_.DriverVersion))" }) | Select-Object -First 1
+    $preflightReport = "passed: $nvName healthy; no Event 4101 in 3 min; no running VIctory/title/test process; commit headroom >= ${MinPreLaunchHeadroomGB} GB; recovery interval ${RecoveryIntervalSeconds}s"
     $launchNumber24h = $recentLaunches.Count + 1
     $launchNumberTotal = $allHistory.Count + 1
 }
@@ -275,7 +309,7 @@ $dirty = (& git -C $RepoRoot status --short)
 $isDirty = -not [string]::IsNullOrWhiteSpace(($dirty -join ''))
 
 $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
-$modeTag = if ($isSynthetic) { 'synthetic' } else { 'hw' }
+$modeTag = if (-not $isSynthetic) { 'hw' } elseif ($hardwareRun) { 'synthetic-hw' } else { 'synthetic-cpu' }
 $runDir = Join-Path $ResultsRoot ("diag-$modeTag-$stamp")
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
 
@@ -286,13 +320,14 @@ $reportPath = Join-Path $runDir 'report.md'
 $summaryPath = Join-Path $runDir 'summary.json'
 
 Write-Host "=== HUST-VIctory Diagnostic Harness ==="
-$launchBadge = if (-not $isSynthetic) {
+$launchBadge = if ($hardwareRun) {
     if ($MaxLaunchesPer24h -gt 0) { " (launch #$launchNumberTotal total, #$launchNumber24h/$MaxLaunchesPer24h in 24h)" }
     else { " (launch #$launchNumberTotal total, #$launchNumber24h in 24h, unlimited)" }
 } else { '' }
 Write-Host "Mode:      $modeTag$launchBadge"
 Write-Host "Branch:    $branch ($shortCommit)$(if ($isDirty) { ' [DIRTY]' } else { '' })"
 Write-Host "Output:    $runDir"
+Write-Host "Preflight: $preflightReport"
 Write-Host "Limits:    MaxDuration=${MaxDurationSeconds}s, PreLaunchHeadroom>=${MinPreLaunchHeadroomGB} GB, RuntimeHeadroom>=${MinCommitHeadroomGB} GB"
 
 # 2. Build diagnostics executable unless skipped.
@@ -330,7 +365,7 @@ Write-Host ("Baseline:  Commit {0}/{1} MB (headroom {2} MB), PhysAvail {3}/{4} M
     $baselineMem.CommitTotalMB, $baselineMem.CommitLimitMB, $baselineMem.CommitHeadroomMB, `
     $baselineMem.PhysicalAvailMB, $baselineMem.PhysicalTotalMB)
 
-$requiredStartMB = if ($isSynthetic) { $minHeadroomMB } else { $minPreLaunchMB }
+$requiredStartMB = if ($hardwareRun) { $minPreLaunchMB } else { $minHeadroomMB }
 if ($baselineMem.CommitHeadroomMB -lt $requiredStartMB) {
     throw ("Refusing launch: preexisting system commit headroom ({0} MB) is below the {1} MB pre-launch safety floor." -f `
         $baselineMem.CommitHeadroomMB, $requiredStartMB)
@@ -391,6 +426,18 @@ if (-not [string]::IsNullOrWhiteSpace($IsolatedCacheDir)) {
 } else {
     $psi.EnvironmentVariables.Remove('VICTORY_CACHE_DIR')
 }
+# Adapter choice is explicit: a CPU-only run gets the software adapter
+# (WARP) in every crate; a hardware run gets the hardware adapter.
+if ($hardwareRun) {
+    $psi.EnvironmentVariables.Remove('VICTORY_WARP')
+    $psi.EnvironmentVariables.Remove('VICTORY_D3D12_WARP')
+} else {
+    $psi.EnvironmentVariables['VICTORY_WARP'] = '1'
+    $psi.EnvironmentVariables['VICTORY_D3D12_WARP'] = '1'
+}
+# The D3D12 probe tests append what they observed (adapter, debug layer).
+$probePath = Join-Path $runDir 'test-probe.jsonl'
+$psi.EnvironmentVariables['VICTORY_TEST_PROBE_FILE'] = $probePath
 
 $discordScript = Join-Path $RepoRoot 'tools\discord\Send-DiscordNotification.ps1'
 $switchSummary = "Debug=$EnableDebugLayer, DRED=$EnableDred, Capture=$EnableCapture, Lazy=$(-not $DisableLazyTextures), SyncPipe=$SyncPipelines, PipeCache=$(-not $DisablePipelineCache)"
@@ -425,13 +472,26 @@ $minObservedHeadroomMB = $baselineMem.CommitHeadroomMB
 $peakGpuLocalMB = $null
 $peakGpuNonLocalMB = $null
 
+# Every process the child starts (cargo -> test binaries -> ...) is recorded
+# while it runs, so a timeout or guard stop ends the whole tree, and
+# nothing it started may outlive the run.
+$rootPid = $null
+$knownTree = @{}
+$treeTerminated = @()
+$treeRemaining = @()
+$stragglers = @()
+
 try {
     [void]$proc.Start()
+    $rootPid = $proc.Id
+    $rootCim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $rootPid" -ErrorAction SilentlyContinue
+    $rootCreated = if ($null -ne $rootCim) { $rootCim.CreationDate } else { (Get-Date).AddSeconds(-5) }
     $outTask = $proc.StandardOutput.ReadToEndAsync()
     $errTask = $proc.StandardError.ReadToEndAsync()
     $swRun = [System.Diagnostics.Stopwatch]::StartNew()
 
     while (-not $proc.HasExited) {
+        Update-VictoryKnownTree -RootId $rootPid -Known $knownTree -RootCreationDate $rootCreated
         $sysMem = Get-SystemMemorySnapshot
         $privMB = 0.0
         $wsMB = 0.0
@@ -474,14 +534,16 @@ try {
             $harnessStopReason = 'HarnessCommitHeadroomGuard'
             Write-Warning ("Stopping process: system commit headroom ({0} MB) fell below {1} GB floor." -f `
                 $sysMem.CommitHeadroomMB, $MinCommitHeadroomGB)
-            try { $proc.Kill() } catch {}
+            $stop = Stop-VictoryProcessTree -RootId $rootPid -Known $knownTree -RootCreationDate $rootCreated
+            $treeTerminated = @($stop.Terminated); $treeRemaining = @($stop.Remaining)
             break
         }
 
         if ($swRun.Elapsed.TotalSeconds -ge $MaxDurationSeconds) {
             $harnessStopReason = 'MaxDurationReached'
-            Write-Host "Stopping process: max duration (${MaxDurationSeconds}s) reached."
-            try { $proc.Kill() } catch {}
+            Write-Host "Stopping process: max duration (${MaxDurationSeconds}s) reached; terminating the process tree."
+            $stop = Stop-VictoryProcessTree -RootId $rootPid -Known $knownTree -RootCreationDate $rootCreated
+            $treeTerminated = @($stop.Terminated); $treeRemaining = @($stop.Remaining)
             break
         }
 
@@ -492,12 +554,24 @@ try {
     $swRun.Stop()
     $elapsedSec = [Math]::Round($swRun.Elapsed.TotalSeconds, 2)
     $exitCode = if ($proc.HasExited) { $proc.ExitCode } else { -1 }
+    $rootExitedAt = Get-Date
 
-    $stdoutText = $outTask.GetAwaiter().GetResult()
-    $stderrText = $errTask.GetAwaiter().GetResult()
+    # Anything the child started that outlived it is a straggler: report it
+    # and end it (never leave a GPU workload running after the harness).
+    $after = Stop-VictoryProcessTree -RootId $rootPid -Known $knownTree -RootCreationDate $rootCreated -RootExitedAt $rootExitedAt -WaitMilliseconds 5000
+    $stragglers = @($after.Terminated | Where-Object { $_ -ne $rootPid -and $treeTerminated -notcontains $_ })
+    $treeRemaining = @($after.Remaining)
+
+    # A surviving grandchild can hold the pipes open; never wait forever.
+    $stdoutText = if ($outTask.Wait(30000)) { $outTask.Result } else { '[harness: stdout still held open after 30 s; not captured]' }
+    $stderrText = if ($errTask.Wait(30000)) { $errTask.Result } else { '[harness: stderr still held open after 30 s; not captured]' }
     $stdoutWriter.Write($stdoutText)
     $stderrWriter.Write($stderrText)
 } finally {
+    if ($null -ne $rootPid) {
+        # Also on an exception or Ctrl+C in the harness itself.
+        try { [void](Stop-VictoryProcessTree -RootId $rootPid -Known $knownTree -RootCreationDate $rootCreated -RootExitedAt (Get-Date) -WaitMilliseconds 5000) } catch {}
+    }
     $stdoutWriter.Dispose()
     $stderrWriter.Dispose()
     if ($null -ne $proc) { $proc.Dispose() }
@@ -571,11 +645,46 @@ if ($harnessStopReason -eq 'HarnessCommitHeadroomGuard') {
     $notifyStatus = 'Failure'
 }
 
+# 7a. Test evidence for synthetic runs: counts, failures, and every skipped
+# or unavailable dependency (a test that returns early still "passes"), the
+# D3D12 probe records (adapter, debug layer), and leftover processes.
+$testSummary = Get-CargoTestSummary -Text $combinedText
+$probe = Read-VictoryTestProbe -Path $probePath
+$debugVerdict = Get-VictoryDebugLayerVerdict -Records $probe.Records -Requested ([bool]$EnableDebugLayer)
+$probeSkips = @(Get-VictoryProbeSkips -Records $probe.Records)
+$skipTotal = $testSummary.SkippedCount + $probeSkips.Count
+$probeAdapters = @($probe.Records | Where-Object { $_.PSObject.Properties['adapter'] } |
+        ForEach-Object { "$($_.crate): $($_.adapter)$(if ($_.PSObject.Properties['software'] -and $_.software) { ' (software)' } else { '' })" } | Sort-Object -Unique)
+$debugProblems = @()
+if ($EnableDebugLayer) {
+    foreach ($p in $debugVerdict.PSObject.Properties) {
+        if ($p.Value -in @('NotActive', 'NoProbe')) { $debugProblems += "$($p.Name)=$($p.Value)" }
+    }
+}
+
+if (@($treeRemaining).Count -gt 0) {
+    $classification = 'ProcessTreeNotTerminated'
+    $notifyStatus = 'Failure'
+} elseif ($testSummary.Failed -gt 0 -and $classification -in @('CleanExit', 'NonZeroExitOrCrash')) {
+    $classification = 'TestFailures'
+    $notifyStatus = 'Failure'
+} elseif ($classification -eq 'CleanExit' -and $isSynthetic -and $testSummary.ResultLines -eq 0 -and $SyntheticCommand -match '(?i)cargo') {
+    $classification = 'NoTestResults'
+    $notifyStatus = 'Failure'
+} elseif ($classification -eq 'CleanExit' -and $debugProblems.Count -gt 0) {
+    $classification = 'DebugLayerNotVerified'
+    $notifyStatus = 'Warning'
+} elseif ($classification -eq 'CleanExit' -and $skipTotal -gt 0) {
+    $classification = 'CleanExitWithSkips'
+    $notifyStatus = 'Warning'
+}
+
 # Persist complete hardware launch history outside repository (never prunes prior records).
-if (-not $isSynthetic) {
+if ($hardwareRun) {
     $entry = [ordered]@{
         StartUtc       = $runStartUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
         EndUtc         = $runEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Mode           = $modeTag
         Commit         = $shortCommit
         Label          = $TestLabel
         Classification = $classification
@@ -683,6 +792,25 @@ $summary = [ordered]@{
     PipelineCacheDisabled = [bool]$DisablePipelineCache
     IsolatedCacheDir      = $IsolatedCacheDir
     RunDirectory          = $runDir
+    HardwareRun           = [bool]$hardwareRun
+    Preflight             = $preflightReport
+    TestsPassed           = $testSummary.Passed
+    TestsFailed           = $testSummary.Failed
+    TestsIgnored          = $testSummary.Ignored
+    TestResultLines       = $testSummary.ResultLines
+    FailedTests           = @($testSummary.FailedTests)
+    IgnoredTests          = @($testSummary.IgnoredTests)
+    SkippedOrUnsupported  = @($testSummary.SkippedLines)
+    SkippedByProbe        = @($probeSkips)
+    DebugLayerRequested   = [bool]$EnableDebugLayer
+    DebugLayerByCrate     = $debugVerdict
+    ProbeAdapters         = @($probeAdapters)
+    ProbeRecords          = @($probe.Records).Count
+    ProbeUnparsable       = $probe.Unparsable
+    TreeProcessesSeen     = $knownTree.Count
+    TreeTerminated        = @($treeTerminated)
+    StragglersTerminated  = @($stragglers)
+    TreeRemaining         = @($treeRemaining)
 }
 
 $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
@@ -695,7 +823,7 @@ $mdLines = @(
     "",
     "- **Timestamp (UTC)**: $($summary.TimestampUtc)",
     "- **Branch / Commit**: ``$branch`` @ ``$shortCommit`` (full: ``$commit``)$(if ($isDirty) { ' [DIRTY]' } else { '' })",
-    "- **Launch Count**: $(if (-not $isSynthetic) { if ($MaxLaunchesPer24h -gt 0) { "#$launchNumberTotal total (#$launchNumber24h / $MaxLaunchesPer24h in 24h)" } else { "#$launchNumberTotal total (#$launchNumber24h in 24h; no daily quota)" } } else { 'N/A (synthetic)' })",
+    "- **Launch Count**: $(if ($hardwareRun) { if ($MaxLaunchesPer24h -gt 0) { "#$launchNumberTotal total (#$launchNumber24h / $MaxLaunchesPer24h in 24h)" } else { "#$launchNumberTotal total (#$launchNumber24h in 24h; no daily quota)" } } else { 'N/A (synthetic)' })",
     "- **Label**: $(if ($TestLabel) { $TestLabel } else { 'default' })",
     "- **Classification**: **$classification** (harness stop: ``$harnessStopReason``, exit code: ``$exitCode``)",
     "- **Duration**: ${elapsedSec}s (max ${MaxDurationSeconds}s; build ${buildDurationSec}s)",
@@ -714,6 +842,16 @@ $mdLines = @(
     "| Peak GPU local usage (process) | $gpuLocalStr |",
     "| Peak GPU non-local usage (process) | $gpuNonLocalStr |",
     "| Telemetry samples recorded | $($samples.Count) |",
+    "",
+    "## Preflight, Tests and Debug Layer",
+    "",
+    "- **Hardware run**: $hardwareRun; preflight: $preflightReport",
+    "- **Tests**: $($testSummary.Passed) passed, $($testSummary.Failed) failed, $($testSummary.Ignored) ignored ($($testSummary.ResultLines) result lines)",
+    "- **Skipped or unsupported (counted as passed by cargo)**: $(if ($testSummary.SkippedCount -gt 0) { ($testSummary.SkippedLines | ForEach-Object { '``' + $_ + '``' }) -join '; ' } else { 'none in output' })",
+    "- **Skipped tests reported through the probe file**: $(if ($probeSkips.Count -gt 0) { ($probeSkips | ForEach-Object { '``' + $_ + '``' }) -join '; ' } else { 'none' })",
+    "- **Debug layer** (requested: $([bool]$EnableDebugLayer)): $(($debugVerdict.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', ')",
+    "- **Adapters seen by probes**: $(if ($probeAdapters.Count -gt 0) { $probeAdapters -join '; ' } else { 'none recorded' })",
+    "- **Process tree**: $($knownTree.Count) seen; terminated at stop: $(@($treeTerminated).Count); stragglers after exit: $(@($stragglers).Count); still running: $(@($treeRemaining).Count)",
     "",
     "## Progression & Input Evidence",
     "",
@@ -739,6 +877,9 @@ $mdLines -join "`r`n" | Set-Content -LiteralPath $reportPath -Encoding UTF8
 
 Write-Host "=== Diagnostic Complete ==="
 Write-Host "Classification: $classification (exit=$exitCode, elapsed=${elapsedSec}s)"
+Write-Host "Tests:          $($testSummary.Passed) passed, $($testSummary.Failed) failed, $($testSummary.Ignored) ignored; skipped/unsupported: $($testSummary.SkippedCount) in output, $($probeSkips.Count) via probe"
+Write-Host "Debug layer:    requested=$([bool]$EnableDebugLayer); $(($debugVerdict.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', ')"
+Write-Host "Process tree:   seen $($knownTree.Count), terminated $(@($treeTerminated).Count), stragglers $(@($stragglers).Count), remaining $(@($treeRemaining).Count)"
 Write-Host "Peak Private:   $peakPrivateMB MB | Min Commit Headroom: $minObservedHeadroomMB MB"
 Write-Host "Report:         $reportPath"
 
@@ -746,7 +887,7 @@ Write-Host "Report:         $reportPath"
 if (-not $NoDiscord -and (Test-Path -LiteralPath $discordScript)) {
     $headroomGB = [Math]::Round($minObservedHeadroomMB / 1024.0, 2)
     $labelPart = if ($TestLabel) { " ($TestLabel)" } else { '' }
-    $header = if (-not $isSynthetic) { "GPU Test #$launchNumberTotal$labelPart" } else { "Synthetic Diagnostic" }
+    $header = if (-not $isSynthetic) { "GPU Test #$launchNumberTotal$labelPart" } elseif ($hardwareRun) { "Synthetic Hardware Diagnostic #$launchNumberTotal$labelPart" } else { "Synthetic CPU Diagnostic" }
     $desc = "$header — Stage: $progressionStage (frame=$maxFramePresented, pipes=$uniquePipelinesBound, inputs=$scriptedInputsInjected, frames=$capturedFrameCount/$uniqueFrameHashes uniq) | Duration: ${elapsedSec}s | Result: $classification (exit=$exitCode) | Peak private: ${peakPrivateMB} MB | GPU local: $gpuLocalStr | Min headroom: ${headroomGB} GB"
     $next = if ($classification -like 'D3D12*') {
         "Analyze D3D12 Debug/DRED/stderr logs in $runDir offline before retrying."
