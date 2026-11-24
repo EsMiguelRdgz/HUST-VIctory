@@ -412,27 +412,97 @@ pub fn space_summary() -> String {
     )
 }
 
+/// Commit headroom below which the run is in danger of taking the whole
+/// system down with it: the larger of 1 GiB and 2% of the limit.
+pub fn critical_floor(limit: u64) -> u64 {
+    (1u64 << 30).max(limit / 50)
+}
+
+/// What the commit guard decides after a check of the headroom.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Guard {
+    Fine,
+    /// Below the critical floor this many checks in a row.
+    Low(u32),
+    /// Still low after relief: end the run.
+    Stop,
+}
+
+/// One check of the guard: `low` checks in a row so far, whether this one is
+/// below the floor, and whether relief was already tried in this episode.
+/// Relief comes after 3 low checks in a row; the run stops only after 3
+/// more, still low, so relief has time to show in the commit.
+pub(crate) fn guard_step(low: u32, below: bool, relieved: bool) -> Guard {
+    let n = low + 1;
+    match below {
+        false => Guard::Fine,
+        true if relieved && n >= 6 => Guard::Stop,
+        true => Guard::Low(n),
+    }
+}
+
 /// Starts, once, the thread that logs [`summary`] every 5 s and
 /// [`space_summary`] every 30 s (and reports both): independent of frames,
 /// so a title that stops presenting under memory pressure is still seen.
-pub(crate) fn start_monitor(video: fn() -> Option<Video>) {
+/// It also guards the system: when commit headroom stays below
+/// [`critical_floor`] for 3 s it calls `relieve`, and if that does not lift
+/// it within 3 s more, `stop` with the memory report, ending the run with diagnostics
+/// instead of letting the machine run out of commit (Windows becomes
+/// unresponsive then). `VICTORY_MEMORY_GUARD=0` turns the guard off.
+pub(crate) fn start_monitor(
+    video: fn() -> Option<Video>,
+    relieve: fn(u64) -> u64,
+    stop: fn(&str) -> !,
+) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        let guarded = std::env::var_os("VICTORY_MEMORY_GUARD").is_none_or(|v| v != "0");
         let started = std::thread::Builder::new()
             .name("victory memory monitor".into())
             .spawn(move || {
-                let mut tick = 0u64;
+                let (mut second, mut low, mut relieved) = (0u64, 0u32, false);
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    let line = summary(video());
-                    tracing::info!("{line}");
-                    report(&line);
-                    if tick.is_multiple_of(6) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    second += 1;
+                    if guarded && let Some((total, limit)) = system_commit() {
+                        let headroom = limit.saturating_sub(total);
+                        match guard_step(low, headroom < critical_floor(limit), relieved) {
+                            Guard::Fine => (low, relieved) = (0, false),
+                            Guard::Low(n) => {
+                                low = n;
+                                if n >= 3 && !relieved {
+                                    let freed = relieve(0);
+                                    relieved = true;
+                                    tracing::error!(
+                                        headroom,
+                                        freed,
+                                        "system commit nearly exhausted; host copies and pools freed"
+                                    );
+                                }
+                            }
+                            Guard::Stop => {
+                                let text = format!(
+                                    "the system is out of commit ({} MB left of {} MB) and                                      freeing VIctory's idle copies did not help; stopping before                                      Windows becomes unresponsive. {} {}",
+                                    headroom >> 20,
+                                    limit >> 20,
+                                    summary(video()),
+                                    space_summary()
+                                );
+                                report(&text);
+                                stop(&text);
+                            }
+                        }
+                    }
+                    if second.is_multiple_of(5) {
+                        let line = summary(video());
+                        tracing::info!("{line}");
+                        report(&line);
+                    }
+                    if second.is_multiple_of(30) {
                         let line = space_summary();
                         tracing::info!("{line}");
                         report(&line);
                     }
-                    tick += 1;
                 }
             });
         if let Err(e) = started {
@@ -529,6 +599,34 @@ mod tests {
         let back = committed.private as i128 - released.private as i128;
         assert!(back > (SIZE as i128) * 3 / 4, "{back}");
         assert!(space_summary().contains("reserved"));
+    }
+
+    /// The guard relieves after 3 low checks in a row, stops only if still
+    /// low after relief, and any good check starts over.
+    #[test]
+    fn the_commit_guard_relieves_before_it_stops() {
+        assert_eq!(critical_floor(10 << 30), 1 << 30);
+        assert_eq!(critical_floor(100 << 30), 2 << 30);
+        assert_eq!(guard_step(0, false, false), Guard::Fine);
+        assert_eq!(guard_step(0, true, false), Guard::Low(1));
+        assert_eq!(guard_step(1, true, false), Guard::Low(2));
+        assert_eq!(
+            guard_step(2, true, false),
+            Guard::Low(3),
+            "relief comes first"
+        );
+        assert_eq!(
+            guard_step(3, true, true),
+            Guard::Low(4),
+            "time for relief to show"
+        );
+        assert_eq!(guard_step(5, true, true), Guard::Stop);
+        assert_eq!(guard_step(5, false, true), Guard::Fine);
+        assert_eq!(
+            guard_step(0, true, true),
+            Guard::Low(1),
+            "a short dip never stops"
+        );
     }
 
     #[test]

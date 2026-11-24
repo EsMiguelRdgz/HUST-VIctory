@@ -253,6 +253,11 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// The commit guard's end of the run: a host failure report.
+fn stop_for_memory(text: &str) -> ! {
+    fail(format_args!("{text}"))
+}
+
 /// The host GPU's memory use and budget, for the memory monitor.
 fn video_memory() -> Option<crate::memstat::Video> {
     host().and_then(Host::video_memory)
@@ -397,7 +402,11 @@ pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(made) => {
-            crate::memstat::start_monitor(video_memory);
+            crate::memstat::start_monitor(
+                video_memory,
+                crate::shadow::relieve_pressure,
+                stop_for_memory,
+            );
             Some(made)
         }
         Err(e) => {
