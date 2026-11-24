@@ -3961,6 +3961,307 @@ pub(crate) mod tests {
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 
+    /// Copies `texels` (one 32-bit texel each) into mip 0 of `image`'s host
+    /// texture through an upload buffer, as a host GPU write would leave it.
+    #[cfg(windows)]
+    fn write_host_r32(image: This, width: u32, height: u32, format: u32, texels: &[u32]) {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let host = crate::host::host().expect("host");
+        let pitch = (width * 4).next_multiple_of(256);
+        let len = u64::from(pitch * height);
+        let upload_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut upload: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of an upload buffer, then a mapped write of
+        // `height` rows of `width` texels inside its `len` bytes.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &upload_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut upload,
+                )
+                .unwrap();
+        }
+        let upload = upload.unwrap();
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: as above.
+        unsafe {
+            upload.Map(0, None, Some(&mut mapped)).unwrap();
+            let base = mapped.cast::<u8>();
+            for y in 0..height as usize {
+                let row = &texels[y * width as usize..][..width as usize];
+                std::ptr::copy_nonoverlapping(
+                    row.as_ptr().cast::<u8>(),
+                    base.add(y * pitch as usize),
+                    width as usize * 4,
+                );
+            }
+            upload.Unmap(0, None);
+        }
+        let host_image = host_resource(image).unwrap();
+        let list = host.new_list().unwrap();
+        let (_, before) = host_transition(image, 0x400).unwrap();
+        #[repr(C)]
+        struct Location {
+            resource: *const c_void,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint {
+            offset: 0,
+            format,
+            width,
+            height,
+            depth: 1,
+            row_pitch: pitch,
+        };
+        let to = Location {
+            resource: host_image.as_raw().cast_const(),
+            kind: 0,
+            footprint: rows,
+        };
+        let from = Location {
+            resource: upload.as_raw().cast_const(),
+            kind: 1,
+            footprint: rows,
+        };
+        // SAFETY: an open list, live resources, locations in the host layout.
+        unsafe {
+            if before != 0x400 {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &host_image,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+            list.list.CopyTextureRegion(
+                (&raw const to).cast(),
+                0,
+                0,
+                0,
+                (&raw const from).cast(),
+                None,
+            );
+        }
+        list.close();
+        host.execute(&[&list]);
+    }
+
+    /// Reads mip 0 of `image`'s host texture back as 32-bit texels.
+    #[cfg(windows)]
+    fn read_host_r32(image: This, width: u32, height: u32, format: u32) -> Vec<u32> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let host = crate::host::host().expect("host");
+        let pitch = (width * 4).next_multiple_of(256);
+        let len = u64::from(pitch * height);
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let host_image = host_resource(image).unwrap();
+        let list = host.new_list().unwrap();
+        let (_, before) = host_transition(image, 0x800).unwrap();
+        #[repr(C)]
+        struct Location {
+            resource: *const c_void,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint {
+            offset: 0,
+            format,
+            width,
+            height,
+            depth: 1,
+            row_pitch: pitch,
+        };
+        let to = Location {
+            resource: readback.as_raw().cast_const(),
+            kind: 1,
+            footprint: rows,
+        };
+        let from = Location {
+            resource: host_image.as_raw().cast_const(),
+            kind: 0,
+            footprint: rows,
+        };
+        // SAFETY: an open list, live resources, locations in the host layout.
+        unsafe {
+            if before != 0x800 {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &host_image,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+            list.list.CopyTextureRegion(
+                (&raw const to).cast(),
+                0,
+                0,
+                0,
+                (&raw const from).cast(),
+                None,
+            );
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy finished (execute waits); the buffer is `len` bytes.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), len as usize);
+            (0..height as usize)
+                .flat_map(|y| {
+                    bytes[y * pitch as usize..][..width as usize * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_le_bytes(*c))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+    }
+
+    /// Wave A 1B regression (behaviour identified by fxceless/victory-gta6;
+    /// independently written). Two placed textures over the same title memory
+    /// in different formats: the host GPU writes the one with unordered
+    /// access (`R32_UINT`, standing in for the title's compute pass), and a
+    /// shader then reads the other (`R32_FLOAT`) as a draw would make it ready
+    /// (`draw.rs` `readable`: `texture::upload` for a title-written texture).
+    /// The reader must see the bits the GPU wrote.
+    ///
+    /// Today each `(address, desc)` gets its own host texture and the reader
+    /// is refreshed from title memory, which the GPU write never reached, so
+    /// it reads the old memory (zeros) instead. WARP only
+    /// (`VICTORY_D3D12_WARP=1`). Ignored until the 1B fix lands; run it with
+    /// `VICTORY_D3D12_WARP=1 VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu
+    /// --features diagnostics -- --ignored --exact --test-threads=1
+    /// resource::tests::wave_a_1b_format_aliased_placed_texture_sees_gpu_writes`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Wave A 1B: known defect (format-aliased placed textures do not share GPU-written contents)"]
+    fn wave_a_1b_format_aliased_placed_texture_sees_gpu_writes() {
+        let _serial = TEXTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if std::env::var_os("VICTORY_D3D12_WARP").is_none() {
+            eprintln!("Wave A 1B regression runs on WARP only (VICTORY_D3D12_WARP=1); skipped");
+            return;
+        }
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        const R32_FLOAT: u32 = 41;
+        const R32_UINT: u32 = 42;
+        let (width, height) = (64u32, 64u32);
+        // Title memory for both views, 64 KiB aligned, never written by the title.
+        let backing = vec![0u8; 2 << 20];
+        let addr = (backing.as_ptr() as u64).next_multiple_of(64 << 10);
+        let words = |d: &ResourceDesc| -> [u32; 14] {
+            // SAFETY: `ResourceDesc` is 56 bytes = 14 u32 words.
+            unsafe { std::ptr::from_ref(d).cast::<[u32; 14]>().read_unaligned() }
+        };
+        let writer_desc = ResourceDesc {
+            flags: 4, // ALLOW_UNORDERED_ACCESS: written by the GPU
+            ..texture(u64::from(width), height, R32_UINT, 1)
+        };
+        let reader_desc = texture(u64::from(width), height, R32_FLOAT, 1);
+
+        let writer = texture_at(addr, &words(&writer_desc)).expect("writer view");
+        let writer_host = host_resource(writer.resource()).expect("writer host texture");
+        assert!(
+            !crate::texture::title_written(&writer_host),
+            "the UAV view is GPU-written"
+        );
+        let want: Vec<u32> = (0..width * height)
+            .map(|i| 0.5f32.to_bits().wrapping_add(i))
+            .collect();
+        write_host_r32(writer.resource(), width, height, R32_UINT, &want);
+        assert_eq!(
+            read_host_r32(writer.resource(), width, height, R32_UINT),
+            want,
+            "the GPU write landed in the writer's host texture"
+        );
+
+        let reader = texture_at(addr, &words(&reader_desc)).expect("reader view");
+        let reader_host = host_resource(reader.resource()).expect("reader host texture");
+        // As `draw.rs` `readable` makes a sampled view ready.
+        let list = host_gpu.new_list().unwrap();
+        if crate::texture::title_written(&reader_host) {
+            crate::texture::upload(&list, reader.resource(), &reader_host);
+        }
+        crate::list::ensure_state(&list, reader.resource(), 0x40 | 0x80);
+        list.close();
+        host_gpu.execute(&[&list]);
+        let got = read_host_r32(reader.resource(), width, height, R32_FLOAT);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+        let differing = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+        eprintln!(
+            "1B warp: reader texels differing from the GPU write: {differing}/{}; first got {:08x?}, want {:08x?}",
+            want.len(),
+            &got[..4],
+            &want[..4]
+        );
+        assert_eq!(
+            differing, 0,
+            "the R32_FLOAT view of the same memory does not see the R32_UINT view's GPU write"
+        );
+        drop(reader);
+        drop(writer);
+        crate::title_memory_remapped(addr as usize, 1 << 20);
+        drop(backing);
+    }
+
     /// Idle title-written host textures are evicted under commit pressure and
     /// re-materialize + re-upload identical pixels on next use, while RT/UAV
     /// textures and textures referenced by an open list are never evicted.
