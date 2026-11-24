@@ -140,13 +140,17 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// Xbox GDK `D3D12XBOX_PRESENT_PLANE_PARAMETERS` (72 bytes = 0x48): frame
+/// token, resource count, resource pointer array, followed by view rects,
+/// color space, scale filter, extended descriptors, and flags.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 72);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -285,52 +289,80 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
-        {
-            static LAST_LAYOUT: std::sync::Mutex<(u32, u32)> = std::sync::Mutex::new((0, 0));
-            let mut last = LAST_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
-            if *last != (planes, plane.count) {
-                *last = (planes, plane.count);
-                let mut extra_words = [0u64; 12];
-                if planes > 1 {
-                    crate::host::copy_mapped(
-                        extra_words.as_mut_ptr().cast::<u8>(),
-                        plane_parameters.cast::<u8>(),
-                        std::mem::size_of_val(&extra_words),
-                        false,
-                    );
+        let mut entries: Vec<(This, windows::Win32::Graphics::Direct3D12::ID3D12Resource)> =
+            Vec::with_capacity(planes.min(4) as usize);
+        for i in 0..planes.min(4) as usize {
+            // SAFETY: the title passes `planes` `Plane` structs (72 bytes each).
+            let plane = unsafe { &*plane_parameters.add(i) };
+            if plane.count > 0 && !plane.resources.is_null() {
+                // SAFETY: the plane lists `count` resources.
+                let res = unsafe { *plane.resources };
+                if let Some(tex) = crate::resource::host_resource(res) {
+                    entries.push((res, tex));
                 }
-                tracing::info!(
-                    frame,
-                    planes,
-                    plane0_count = plane.count,
-                    plane0_token = format_args!("{:#x}", plane.token),
-                    plane0_resources = ?plane.resources,
-                    extra_words = ?(if planes > 1 { &extra_words[..] } else { &[][..] }),
-                    "PresentX plane layout"
-                );
             }
         }
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(&texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
-        // Proactively relieve commit pressure between frames with no Host locks held.
-        if crate::memstat::under_pressure(0) {
-            crate::shadow::relieve_pressure(1);
+        if !entries.is_empty() {
+            {
+                static LAST_SIG: std::sync::Mutex<Vec<(u32, u32, i32)>> =
+                    std::sync::Mutex::new(Vec::new());
+                let sig: Vec<(u32, u32, i32)> = entries
+                    .iter()
+                    .map(|(_, t)| {
+                        // SAFETY: live host texture.
+                        let d = unsafe { t.GetDesc() };
+                        (d.Width as u32, d.Height, d.Format.0)
+                    })
+                    .collect();
+                let mut last = LAST_SIG.lock().unwrap_or_else(|e| e.into_inner());
+                if *last != sig {
+                    *last = sig.clone();
+                    tracing::info!(frame, planes, active = entries.len(), sizes = ?sig, "PresentX planes");
+                }
+            }
+            const COPY_SOURCE: u32 = 0x800;
+            const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+            let (resource0, shown, state0) = if entries.len() == 1 {
+                let (res, ref tex) = entries[0];
+                let state = crate::resource::host_transition(res, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before);
+                let shown = host.present(tex, state, frame);
+                crate::resource::host_transition(res, state);
+                (res, shown, state)
+            } else {
+                let mut saved: Vec<(This, u32)> = Vec::with_capacity(entries.len());
+                let mut plane_args: Vec<(
+                    &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+                    u32,
+                )> = Vec::with_capacity(entries.len());
+                for (res, tex) in &entries {
+                    let st = if let Some(&(_, prev)) = saved.iter().find(|&&(r, _)| r == *res) {
+                        prev
+                    } else {
+                        let prev = crate::resource::host_transition(*res, PIXEL_SHADER_RESOURCE)
+                            .map_or(PIXEL_SHADER_RESOURCE, |(_, before)| before);
+                        saved.push((*res, prev));
+                        prev
+                    };
+                    plane_args.push((tex, st));
+                }
+                let shown = host.present_planes(&plane_args, frame);
+                for (res, prev) in saved {
+                    crate::resource::host_transition(res, prev);
+                }
+                (entries[0].0, shown, plane_args[0].1)
+            };
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resource0, state0, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (resource0, shown, state0);
+            // Proactively relieve commit pressure between frames with no Host locks held.
+            if crate::memstat::under_pressure(0) {
+                crate::shadow::relieve_pressure(1);
+            }
         }
     }
     #[cfg(not(windows))]

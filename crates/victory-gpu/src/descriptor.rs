@@ -475,10 +475,11 @@ impl RtvRecord {
             ]
         };
         words[0] = crate::resource::pc_format(words[0]);
-        if crate::resource::is_packed_16bit_color(words[0])
-            && crate::resource::is_promoted_16bit(self.resource)
+        if (crate::resource::is_packed_16bit_color(words[0])
+            || crate::resource::is_shared_exp_color(words[0]))
+            && let Some(promoted) = crate::resource::promoted_format(self.resource)
         {
-            words[0] = 87;
+            words[0] = promoted;
         }
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })

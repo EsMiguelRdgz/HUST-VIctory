@@ -135,6 +135,7 @@ impl Shader {
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
+                        wave_size = ?t.host.wave_size,
                         "shader translated"
                     ),
                     Err(e) => tracing::warn!(

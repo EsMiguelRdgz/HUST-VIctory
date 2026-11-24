@@ -1076,13 +1076,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
-    let promoted_16bit = own == 87 && crate::resource::is_packed_16bit_color(view);
-    if family(view) != family(own) && !promoted_16bit {
+    let promoted = (own == 87 && crate::resource::is_packed_16bit_color(view))
+        || (own == 10 && crate::resource::is_shared_exp_color(view));
+    if family(view) != family(own) && !promoted {
         once!(view, own, "view format of another family");
         return false;
     }
     if let Some(format) = format
-        && (!typeless || promoted_16bit)
+        && (!typeless || promoted)
     {
         *format = d.Format;
     }

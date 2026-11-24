@@ -294,23 +294,26 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     (format != own).then_some(own)
 }
 
-/// Whether `this` is a texture whose 16-bit packed color format was promoted
-/// to `DXGI_FORMAT_B8G8R8A8_UNORM (87)` on the host device. Computed without
-/// forcing lazy host-texture allocation.
+/// If `this` is a texture whose unsupported console color format (16-bit packed
+/// color or `R9G9B9E5_SHAREDEXP` RT/UAV) was promoted to a host-supported DXGI
+/// format, returns that host format. Computed without forcing lazy host-texture
+/// allocation.
 #[cfg(windows)]
-pub(crate) fn is_promoted_16bit(this: This) -> bool {
+pub(crate) fn promoted_format(this: This) -> Option<u32> {
     if this.is_null() {
-        return false;
+        return None;
     }
     let r = resource(this);
     if r.desc.dimension == BUFFER {
-        return false;
+        return None;
     }
-    let Some(host) = crate::host::host() else {
-        return false;
-    };
+    let host = crate::host::host()?;
+    let title = pc_format(r.desc.format);
+    if !is_packed_16bit_color(title) && !is_shared_exp_color(title) {
+        return None;
+    }
     let d = host_texture_desc(host, &r.desc);
-    d.format == 87 && is_packed_16bit_color(pc_format(r.desc.format))
+    (d.format != title).then_some(d.format)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -1067,19 +1070,31 @@ pub(crate) fn is_packed_16bit_color(format: u32) -> bool {
     matches!(format, 85 | 86 | 115)
 }
 
+/// Shared-exponent RGB (`DXGI_FORMAT_R9G9B9E5_SHAREDEXP = 67`): consoles allow
+/// RT/UAV usage, while PC D3D12 only allows SRV sampling.
+#[cfg(windows)]
+pub(crate) fn is_shared_exp_color(format: u32) -> bool {
+    format == 67
+}
+
 /// Maps `format` to a host-supported DXGI format for `flags` using the host
 /// device's `D3D12_FEATURE_FORMAT_SUPPORT`. Unsupported GPU-written (`RT`/
 /// `UAV`) 16-bit packed color formats are promoted consistently to
-/// `DXGI_FORMAT_B8G8R8A8_UNORM (87)`; SRV-only textures stay native when
-/// supported.
+/// `DXGI_FORMAT_B8G8R8A8_UNORM (87)`, and unsupported `R9G9B9E5_SHAREDEXP (67)`
+/// RT/UAV textures are promoted to `DXGI_FORMAT_R16G16B16A16_FLOAT (10)`;
+/// SRV-only textures stay native when supported.
 #[cfg(windows)]
 pub(crate) fn host_format_for(host: &crate::host::Host, format: u32, flags: u32) -> u32 {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     let f = pc_format(format);
-    if !is_packed_16bit_color(f) {
+    let fallback = if is_packed_16bit_color(f) {
+        87 // DXGI_FORMAT_B8G8R8A8_UNORM
+    } else if is_shared_exp_color(f) {
+        10 // DXGI_FORMAT_R16G16B16A16_FLOAT
+    } else {
         return f;
-    }
+    };
     const RENDER_TARGET: u32 = 1;
     const UNORDERED: u32 = 4;
     let (s1, _) = host.format_support(DXGI_FORMAT(f as i32));
@@ -1093,7 +1108,7 @@ pub(crate) fn host_format_for(host: &crate::host::Host, format: u32, flags: u32)
     if s1.0 & required == required {
         f
     } else {
-        87 // DXGI_FORMAT_B8G8R8A8_UNORM
+        fallback
     }
 }
 
@@ -1158,14 +1173,16 @@ fn host_texture(
     let host = crate::host::host()?;
     let title_format = pc_format(desc.format);
     let d = host_texture_desc(host, desc);
-    if d.format != title_format && is_packed_16bit_color(title_format) {
+    if d.format != title_format
+        && (is_packed_16bit_color(title_format) || is_shared_exp_color(title_format))
+    {
         tracing::debug!(
             from = title_format,
             to = d.format,
             flags = d.flags,
             width = d.width,
             height = d.height,
-            "promoted unsupported 16-bit texture format on host"
+            "promoted unsupported texture format on host"
         );
     }
     // The clear value names the format too: format, then color or depth
@@ -3147,8 +3164,9 @@ pub(crate) mod tests {
         .expect("host heap");
 
         // Formats & flags observed failing CreateCommittedResource with 0x80070057:
-        // 86 (B5G5R5A1_UNORM, RT|UAV) and 115 (B4G4R4A4_UNORM, RT).
-        for (format, flags) in [(86u32, 5u32), (115u32, 1u32)] {
+        // 86 (B5G5R5A1_UNORM, RT|UAV), 115 (B4G4R4A4_UNORM, RT), and
+        // 67 (R9G9B9E5_SHAREDEXP, RT|UAV).
+        for (format, flags) in [(86u32, 5u32), (115u32, 1u32), (67u32, 5u32)] {
             let desc = ResourceDesc {
                 dimension: 3, // TEXTURE2D
                 alignment: 0,
