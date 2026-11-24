@@ -333,11 +333,11 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 ];
 
 /// After submissions: shader-written ranges compared and copied back into
-/// title memory (microseconds, changed bytes), since the last frame-rate line.
-static COPY_BACK: [std::sync::atomic::AtomicU64; 2] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
+/// title memory (microseconds, changed bytes), then of that the microseconds
+/// writing title memory, and before submissions the microseconds and bytes
+/// of pre-GPU snapshots, since the last frame-rate line.
+static COPY_BACK: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
@@ -702,10 +702,16 @@ impl Host {
         // Snapshots are this submission's own and taken under `submitted`,
         // after every earlier submission's GPU work and copy-back: an
         // overlapping submission can neither replace nor consume them.
+        let snapshotting = std::time::Instant::now();
         let snapshots: Vec<_> = gpu_writes
             .iter()
             .map(|(shadow, ranges)| shadow.snapshot_ranges(ranges))
             .collect();
+        if !gpu_writes.is_empty() {
+            let bytes: usize = snapshots.iter().flatten().map(|s| s.len()).sum();
+            COPY_BACK[3].fetch_add(snapshotting.elapsed().as_micros() as u64, Ordering::Relaxed);
+            COPY_BACK[4].fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         *submitted += 1;
         let prepared = std::time::Instant::now();
         // SAFETY: closed lists; the fence and event are ours.
@@ -755,10 +761,12 @@ impl Host {
             ));
         }
         let copying_back = std::time::Instant::now();
-        let mut changed_bytes = 0u64;
+        let (mut changed_bytes, mut write_us) = (0u64, 0u64);
         if completed {
             for ((shadow, ranges), snapshot) in gpu_writes.iter().zip(&snapshots) {
-                changed_bytes += shadow.copy_back_ranges(ranges, snapshot.as_ref()) as u64;
+                let (changed, us) = shadow.copy_back_timed(ranges, snapshot.as_ref());
+                changed_bytes += changed as u64;
+                write_us += us;
             }
         } else {
             // The GPU may still be writing the copies: reading them now
@@ -780,6 +788,7 @@ impl Host {
         if !gpu_writes.is_empty() {
             COPY_BACK[0].fetch_add(copying_back.elapsed().as_micros() as u64, Ordering::Relaxed);
             COPY_BACK[1].fetch_add(changed_bytes, Ordering::Relaxed);
+            COPY_BACK[2].fetch_add(write_us, Ordering::Relaxed);
         }
         for list in runs {
             let deferred = list.deferred();
@@ -1590,8 +1599,8 @@ impl Meter {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
-        let [cb_ms, cb_mb] = [0, 1].map(|i| {
-            let scale = if i == 0 { 1e3 } else { 1e6 };
+        let [cb_ms, cb_mb, cb_write_ms, snap_ms, snap_mb] = [0, 1, 2, 3, 4].map(|i| {
+            let scale = if i == 1 || i == 4 { 1e6 } else { 1e3 };
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
@@ -1602,7 +1611,8 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; copy-back {cb_ms:.1} ms {cb_mb:.1} MB), {draws:.0} draws/frame \
+                 GPU; copy-back {cb_ms:.1} ms {cb_mb:.1} MB, of it writes {cb_write_ms:.1} ms; \
+                 snapshots {snap_ms:.1} ms {snap_mb:.1} MB), {draws:.0} draws/frame \
                  [exec/req per frame: draw {:.0}/{:.0}, mesh {:.0}/{:.0}, dispatch {:.0}/{:.0}, \
                  dropped {:.0} (no_pipe={:.0}, bind={:.0}, other={:.0})]",
                 c.draws_ok as f64 / log_frames,

@@ -73,16 +73,31 @@ impl Drop for Shadow {
     }
 }
 
-/// One submission's pre-GPU copy of the bytes its shaders may write, from
-/// offset `base` of a shadow: copy-back writes only bytes the GPU changed.
-/// Owned by the submission (not the shadow), so overlapping submissions
-/// cannot replace or consume each other's baselines. Its buffer goes back
-/// to the pool when dropped.
+/// One submission's pre-GPU copy of the bytes its shaders may write: the
+/// merged ranges only (not the span between them), so copy-back writes only
+/// bytes the GPU changed. Owned by the submission (not the shadow), so
+/// overlapping submissions cannot replace or consume each other's
+/// baselines. Its buffer goes back to the pool when dropped.
 pub(crate) struct Snapshot {
-    base: usize,
+    /// `(offset in the shadow, length, position in bytes)`, by offset.
+    segments: Vec<(usize, usize, usize)>,
     bytes: Vec<u8>,
     /// The buffer's capacity as counted in [`memstat`].
     counted: u64,
+}
+
+impl Snapshot {
+    /// The snapshot of shadow offsets `[from, to)`, if one segment holds it.
+    fn get(&self, from: usize, to: usize) -> Option<&[u8]> {
+        let i = self.segments.partition_point(|&(off, _, _)| off <= from);
+        let &(off, len, at) = self.segments.get(i.checked_sub(1)?)?;
+        (to <= off + len).then(|| &self.bytes[at + from - off..at + to - off])
+    }
+
+    /// Bytes held.
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 impl Drop for Snapshot {
@@ -273,38 +288,47 @@ impl Shadow {
     /// the snapshot cannot be allocated (copy-back then writes whole ranges,
     /// as it did before snapshots).
     pub(crate) fn snapshot_ranges(&self, ranges: &[(usize, usize)]) -> Option<Snapshot> {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let mut min_off = usize::MAX;
-        let mut max_off = 0usize;
-        for &(address, len) in ranges {
-            let from = address.clamp(start, end);
-            let to = address.saturating_add(len).clamp(from, end);
-            if from < to {
-                min_off = min_off.min(from - start);
-                max_off = max_off.max(to - start);
-            }
-        }
-        if min_off >= max_off {
+        let merged = merge_ranges(&self.clamp(ranges));
+        let total: usize = merged.iter().map(|&(from, to)| to - from).sum();
+        if total == 0 {
             return None;
         }
-        let span = max_off - min_off;
-        let Some(mut buf) = take_snapshot_buf(span) else {
+        let Some(mut buf) = take_snapshot_buf(total) else {
             tracing::warn!(
-                span,
+                total,
                 "no memory for a copy-back snapshot; whole ranges go back"
             );
             return None;
         };
-        // SAFETY: `[min_off, max_off)` lies inside this shadow's persistent mapping.
-        let src = unsafe { std::slice::from_raw_parts(self.data.add(min_off), span) };
-        buf.extend_from_slice(src);
+        let start = self.start as usize;
+        let mut segments = Vec::with_capacity(merged.len());
+        for (from, to) in merged {
+            segments.push((from - start, to - from, buf.len()));
+            // SAFETY: `[from, to)` was clamped into this shadow's mapping.
+            let src = unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+            buf.extend_from_slice(src);
+        }
         let counted = buf.capacity() as u64;
         memstat::alloc(Kind::Snapshot, counted);
         Some(Snapshot {
-            base: min_off,
+            segments,
             bytes: buf,
             counted,
         })
+    }
+
+    /// `ranges` `(address, len)` cut to the buffer, as `(from, to)`
+    /// addresses, empty ones left out.
+    fn clamp(&self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        ranges
+            .iter()
+            .filter_map(|&(address, len)| {
+                let from = address.clamp(start, end);
+                let to = address.saturating_add(len).clamp(from, end);
+                (from < to).then_some((from, to))
+            })
+            .collect()
     }
 
     /// After the submission ran: compares each merged range in `ranges`
@@ -313,51 +337,51 @@ impl Shadow {
     /// copies and preserving concurrent title CPU writes to untouched bytes.
     /// Returns the total changed bytes copied back.
     /// Ranges outside the snapshot (or with none) go back whole.
+    #[cfg(test)]
     pub(crate) fn copy_back_ranges(
         &self,
         ranges: &[(usize, usize)],
         snapshot: Option<&Snapshot>,
     ) -> usize {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let clamped: Vec<(usize, usize)> = ranges
-            .iter()
-            .filter_map(|&(address, len)| {
-                let from = address.clamp(start, end);
-                let to = address.saturating_add(len).clamp(from, end);
-                (from < to).then_some((from, to))
-            })
-            .collect();
-        let merged = merge_ranges(&clamped);
+        self.copy_back_timed(ranges, snapshot).0
+    }
+
+    /// As [`Shadow::copy_back_ranges`], also returning the microseconds
+    /// spent writing title memory (the rest is comparing).
+    pub(crate) fn copy_back_timed(
+        &self,
+        ranges: &[(usize, usize)],
+        snapshot: Option<&Snapshot>,
+    ) -> (usize, u64) {
+        let start = self.start as usize;
+        let merged = merge_ranges(&self.clamp(ranges));
         let mut changed_total = 0usize;
+        let mut writing = std::time::Duration::ZERO;
+        let mut write = |at: usize, from: *const u8, len: usize| {
+            let started = std::time::Instant::now();
+            crate::watch::writing(at, len);
+            crate::host::write_mapped(at as *mut u8, from, len);
+            writing += started.elapsed();
+        };
 
         for &(from, to) in &merged {
             let from_off = from - start;
             let to_off = to - start;
             // SAFETY: `[from_off, to_off)` lies inside this shadow's mapping.
             let after = unsafe { std::slice::from_raw_parts(self.data.add(from_off), to - from) };
-            let mut range_changed = 0usize;
-            if let Some(Snapshot { base, bytes, .. }) = snapshot
-                && from_off >= *base
-                && to_off <= base + bytes.len()
-            {
-                let before = &bytes[from_off - base..to_off - base];
+            if let Some(before) = snapshot.and_then(|s| s.get(from_off, to_off)) {
                 for (run_start, run_end) in diff_runs(before, after) {
-                    let run_addr = from + run_start;
-                    let run_len = run_end - run_start;
-                    crate::watch::writing(run_addr, run_len);
-                    crate::host::write_mapped(
-                        run_addr as *mut u8,
+                    write(
+                        from + run_start,
                         after[run_start..].as_ptr(),
-                        run_len,
+                        run_end - run_start,
                     );
-                    range_changed += run_len;
+                    changed_total += run_end - run_start;
                 }
             } else {
-                crate::watch::writing(from, to - from);
-                crate::host::write_mapped(from as *mut u8, after.as_ptr(), to - from);
-                range_changed = to - from;
+                write(from, after.as_ptr(), to - from);
+                changed_total += to - from;
             }
-            changed_total += range_changed;
             // Do not advance `copied` for this page. Diff-only copy-back
             // preserves concurrent title writes at other offsets, so the
             // whole page is not known to be synchronized with the shadow.
@@ -365,7 +389,7 @@ impl Shadow {
         }
 
         self.release(ranges);
-        changed_total
+        (changed_total, writing.as_micros() as u64)
     }
 
     /// The shader writes of `ranges` `(address, len)` are over (copied back
@@ -1076,6 +1100,40 @@ mod tests {
         let wide = loose(at, at + WINDOW + 16).expect("two-window copy");
         let inside = loose(at + 64, at + 128).expect("copy");
         assert!(Arc::ptr_eq(&wide, &inside));
+        let _ = host_gpu;
+    }
+
+    /// Snapshots hold only the written ranges, not the gap between them,
+    /// and copy-back still finds each range's baseline.
+    #[test]
+    fn snapshots_hold_only_the_written_ranges() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mut title_mem = vec![0x11u8; 1 << 20];
+        let base = title_mem.as_mut_ptr() as usize;
+        let fake_id = base ^ 0x5E6_3E47;
+        register(fake_id, base as u64, 1 << 20);
+        let shadow = find(base as u64, 1 << 20).expect("shadow buffer");
+        shadow.update(base, 1 << 20);
+        let ranges = [(base, 256), (base + 900_000, 256), (base + 128, 256)];
+        for &(a, l) in &ranges {
+            shadow.writing(a, l);
+        }
+        let snapshot = shadow.snapshot_ranges(&ranges).expect("snapshot");
+        assert_eq!(snapshot.len(), 384 + 256, "merged ranges only, no gap");
+        // SAFETY: inside the shadow's mapping.
+        let copy = unsafe { std::slice::from_raw_parts_mut(shadow.data, 1 << 20) };
+        copy[300..304].fill(0x77);
+        copy[900_010..900_012].fill(0x55);
+        title_mem[200..204].fill(0x99); // concurrent title write
+        let (changed, _) = shadow.copy_back_timed(&ranges, Some(&snapshot));
+        assert_eq!(changed, 6);
+        assert_eq!(&title_mem[300..304], &[0x77u8; 4]);
+        assert_eq!(&title_mem[900_010..900_012], &[0x55u8; 2]);
+        assert_eq!(&title_mem[200..204], &[0x99u8; 4], "title write preserved");
+        assert!(snapshot.get(0, 385).is_none(), "past a segment");
+        unregister(fake_id, base as u64);
         let _ = host_gpu;
     }
 }
