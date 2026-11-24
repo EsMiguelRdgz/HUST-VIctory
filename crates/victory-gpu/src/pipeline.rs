@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -71,26 +71,47 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+/// Live containers by full content hash. The pipelines own the shaders;
+/// this cache only deduplicates them and must not extend their lifetime.
+#[derive(Default)]
+struct ShaderCache {
+    entries: HashMap<[u8; 32], Weak<Shader>>,
+    misses_since_prune: usize,
+}
+
+const PRUNE_INTERVAL: usize = 256;
+
+impl ShaderCache {
+    fn get_or_insert(&mut self, stage: &'static str, bytes: &[u8], full: [u8; 32]) -> Arc<Shader> {
+        if let Some(shader) = self.entries.get(&full).and_then(Weak::upgrade) {
+            return shader;
+        }
+        let shader = Arc::new(Shader {
+            stage,
+            hash: blake3::Hash::from(full).to_hex()[..16].to_owned(),
+            container: bytes.to_vec(),
+            #[cfg(windows)]
+            translated: OnceLock::new(),
+        });
+        self.entries.insert(full, Arc::downgrade(&shader));
+        self.misses_since_prune += 1;
+        if self.misses_since_prune == PRUNE_INTERVAL {
+            self.entries.retain(|_, shader| shader.strong_count() != 0);
+            self.misses_since_prune = 0;
+        }
+        shader
+    }
+}
+
+static SHADERS: Mutex<Option<ShaderCache>> = Mutex::new(None);
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
-    let full = blake3::hash(bytes);
+    let full = *blake3::hash(bytes).as_bytes();
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
-        .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| {
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-            })
-        })
-        .clone()
+        .get_or_insert_with(ShaderCache::default)
+        .get_or_insert(stage, bytes, full)
 }
 
 /// A translated shader and the console resources its code reads.
@@ -410,6 +431,32 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[test]
+    fn cache_deduplicates_live_shaders_without_keeping_them_alive() {
+        let mut cache = ShaderCache::default();
+        let bytes = b"a shader whose owners can all be released";
+        let full = *blake3::hash(bytes).as_bytes();
+        let first = cache.get_or_insert("vertex", bytes, full);
+        let second = cache.get_or_insert("vertex", bytes, full);
+        assert!(Arc::ptr_eq(&first, &second));
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_none(), "the cache retained the shader");
+
+        // The initial insertion already counted as a miss; start the pruning
+        // check at a known boundary instead.
+        cache.misses_since_prune = 0;
+        for n in 0..PRUNE_INTERVAL {
+            let bytes = (n as u64).to_le_bytes();
+            let full = *blake3::hash(&bytes).as_bytes();
+            let temporary = cache.get_or_insert("vertex", &bytes, full);
+            drop(temporary);
+        }
+        assert!(!cache.entries.contains_key(&full));
+        assert_eq!(cache.entries.len(), 1, "only the last weak entry remains");
     }
 
     #[test]
