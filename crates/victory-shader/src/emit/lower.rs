@@ -4049,20 +4049,37 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if let Some(u) = kind.filter(|u| u.kind == ResourceType::Srv) {
+            // StructuredBuffer SRVs (u.stride >= 4) expect (element_index, byte_offset)
+            // in dx.op.rawBufferLoad; emitting RawBuffer (kind 11) with (byte_offset, undef)
+            // causes NVIDIA D3D12 to treat byte offsets 4, 8, 12 as OOB element indices on
+            // single-element structured buffers, returning 0 and causing 1/0 infinite loops.
+            let structured = u.stride >= 4 && u.stride.is_multiple_of(4);
+            let h = if structured {
+                self.handle(site, src, false, (12, u.stride))?
+            } else {
+                self.handle(site, src, false, (11, 0))?
+            };
+            let stride_v = structured.then(|| self.s.m.i32(u.stride));
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let al = self.s.m.i32(4);
+                let (index, elem_off) = match stride_v {
+                    Some(st) => (
+                        self.s.m.bin(c, Bin::UDiv, a, st),
+                        self.s.m.bin(c, Bin::URem, a, st),
+                    ),
+                    None => (a, self.s.m.undef(self.s.t.i32)),
+                };
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, index, elem_off, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);

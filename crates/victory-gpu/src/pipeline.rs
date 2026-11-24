@@ -129,6 +129,8 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                #[cfg(feature = "diagnostics")]
+                maybe_trace_loops(&self.hash, self.stage, &self.container);
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -148,6 +150,81 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn maybe_trace_loops(hash: &str, stage: &str, container: &[u8]) {
+    let Ok(wanted) = std::env::var("VICTORY_TRACE_LOOPS") else {
+        return;
+    };
+    if !wanted
+        .split(',')
+        .any(|h| h.trim().eq_ignore_ascii_case(hash))
+    {
+        return;
+    }
+    let Ok(dxbc) = victory_shader::Container::parse(container) else {
+        return;
+    };
+    let Some(dxil) = dxbc.part(victory_shader::FourCC::DXIL) else {
+        return;
+    };
+    let Ok(programs) = victory_shader::native_programs(dxil.data) else {
+        return;
+    };
+    for nat in &programs {
+        let Ok(prog) = victory_shader::ir::build(&nat.patched_code(), nat.wave64, nat.vgprs) else {
+            continue;
+        };
+        let st = victory_shader::structure::structure(&prog).ok();
+        let mut back_edges = Vec::new();
+        for (b, blk) in prog.blocks.iter().enumerate() {
+            for succ in blk.exit.successors() {
+                if succ <= b {
+                    back_edges.push((b, succ));
+                }
+            }
+        }
+        tracing::info!(
+            hash,
+            stage,
+            hw_stage = ?nat.stage,
+            wave64 = nat.wave64,
+            blocks = prog.blocks.len(),
+            ?back_edges,
+            layout = ?nat.layout,
+            "VICTORY_TRACE_LOOPS summary"
+        );
+        for (b, blk) in prog.blocks.iter().enumerate() {
+            let in_loop = b <= 1
+                || back_edges
+                    .iter()
+                    .any(|&(latch, hdr)| b >= hdr && b <= latch);
+            if !in_loop {
+                continue;
+            }
+            let lane_exit = st.as_ref().map(|s| s.exits[b]);
+            let mut text = format!(
+                "  block b{b} (off={:#x}, preds={:?}, exit={:?}, lane_exit={:?}, phis={}):",
+                blk.offset,
+                blk.preds,
+                blk.exit,
+                lane_exit,
+                blk.phis.len()
+            );
+            for inst in &blk.insts {
+                use std::fmt::Write;
+                let _ = write!(
+                    text,
+                    "\n    {:#x}: {} {:?}",
+                    inst.machine.offset,
+                    inst.machine.name().unwrap_or("?"),
+                    inst.fields
+                );
+            }
+            tracing::info!("{text}");
+        }
     }
 }
 
