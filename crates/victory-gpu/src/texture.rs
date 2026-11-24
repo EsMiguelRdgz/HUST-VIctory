@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
+use crate::memstat::{self, Kind};
 use crate::object::This;
 
 macro_rules! once {
@@ -42,16 +43,65 @@ struct Staging {
     mips: u32,
     memory: *const u8,
     last: Mutex<Last>,
+    /// The staging buffer's size, as counted in [`memstat`].
+    bytes: u64,
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        memstat::free(Kind::TextureStaging, self.bytes);
+    }
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    read: Vec<u8>,
+}
+
+/// Buffers texture memory is read into before it is detiled, shared by all
+/// textures (each used to keep one of its own size for good: a second
+/// system-memory copy of every title-written texture). Kept initialized,
+/// so reuse costs no clearing: every read fills what it uses.
+static READS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// At most this many pooled read buffers ...
+const READ_BUFFERS: usize = 4;
+/// ... of at most this many bytes in all; past it the largest go first.
+const READ_BYTES: usize = 128 << 20;
+
+/// A read buffer of at least `size` bytes; `None` if none can be made.
+fn take_read(size: usize) -> Option<Vec<u8>> {
+    let mut pool = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let fit = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.len() >= size)
+        .min_by_key(|(_, v)| v.len())
+        .map(|(i, _)| i);
+    if let Some(i) = fit {
+        return Some(pool.swap_remove(i));
+    }
+    drop(pool);
+    let mut v = Vec::new();
+    v.try_reserve_exact(size).ok()?;
+    v.resize(size, 0);
+    memstat::alloc(Kind::TextureRead, size as u64);
+    Some(v)
+}
+
+/// Gives a read buffer back to the pool, which keeps within its bounds.
+fn give_read(v: Vec<u8>) {
+    let mut pool = READS.lock().unwrap_or_else(|e| e.into_inner());
+    pool.push(v);
+    pool.sort_by_key(Vec::len);
+    let mut total: usize = pool.iter().map(Vec::len).sum();
+    while pool.len() > READ_BUFFERS || total > READ_BYTES {
+        let Some(largest) = pool.pop() else { break };
+        total -= largest.len();
+        memstat::free(Kind::TextureRead, largest.len() as u64);
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -158,12 +208,16 @@ impl Staging {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
+            // Read through the copy, which stands unmapped pages (zeros):
+            // memory of big pools is too slow to ask page by page.
+            let Some(mut read) = take_read(size) else {
+                once!(size, "no memory to read a texture into; not detiled");
+                return 0;
+            };
             last.asked = now;
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            self.detile(&read[..size]);
+            give_read(read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -297,7 +351,29 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         memory,
         last: Mutex::default(),
+        bytes: total,
     });
+    memstat::alloc(Kind::TextureStaging, total);
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Read buffers are reused when big enough and the pool keeps within
+    /// its bounds; a buffer bigger than the whole budget is not kept.
+    #[test]
+    fn read_buffers_are_pooled_within_bounds() {
+        let small = take_read(4096).expect("read buffer");
+        assert!(small.len() >= 4096);
+        give_read(small);
+        memstat::alloc(Kind::TextureRead, READ_BYTES as u64 + 1);
+        give_read(vec![0; READ_BYTES + 1]);
+        let pool = READS.lock().unwrap();
+        assert!(pool.len() <= READ_BUFFERS);
+        assert!(pool.iter().map(Vec::len).sum::<usize>() <= READ_BYTES);
+        assert!(pool.iter().any(|v| v.len() >= 4096), "the small one kept");
+    }
 }

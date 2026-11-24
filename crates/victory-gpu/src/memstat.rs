@@ -19,10 +19,22 @@ pub(crate) enum Kind {
     Snapshot,
     /// Snapshot buffers kept for reuse.
     SnapshotPool,
+    /// Upload buffers title-written textures are detiled into.
+    TextureStaging,
+    /// Buffers texture memory is read into before detiling (pooled).
+    TextureRead,
 }
 
-const KINDS: usize = 5;
-const NAMES: [&str; KINDS] = ["buffers", "loose", "aligned", "snapshots", "snapshot pool"];
+const KINDS: usize = 7;
+const NAMES: [&str; KINDS] = [
+    "buffers",
+    "loose",
+    "aligned",
+    "snapshots",
+    "snapshot pool",
+    "texture staging",
+    "texture reads",
+];
 
 /// Live bytes, live allocations, peak live bytes.
 struct Counter([AtomicU64; 3]);
@@ -139,7 +151,7 @@ pub(crate) fn summary(video: Option<Video>) -> String {
             mb(shared_budget)
         ));
     }
-    text.push_str(" copies of title memory:");
+    text.push_str(" host copies:");
     for (i, name) in NAMES.iter().enumerate() {
         let (bytes, count, peak) = live(KINDS_ALL[i]);
         text.push_str(&format!(
@@ -158,6 +170,8 @@ const KINDS_ALL: [Kind; KINDS] = [
     Kind::Aligned,
     Kind::Snapshot,
     Kind::SnapshotPool,
+    Kind::TextureStaging,
+    Kind::TextureRead,
 ];
 
 #[cfg(test)]
