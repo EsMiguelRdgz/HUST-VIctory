@@ -229,6 +229,12 @@ impl Shadow {
         address - self.start
     }
 
+    /// Raw mapped pointer for regression tests inspecting host shadow bytes.
+    #[cfg(test)]
+    pub(crate) fn data_ptr(&self) -> *mut u8 {
+        self.data
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {

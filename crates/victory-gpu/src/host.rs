@@ -994,7 +994,6 @@ impl Host {
             uploads.extend(mine);
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
         // Deduplicate shader-written ranges per shadow across all lists in
         // this submission, and snapshot pre-GPU bytes before executing so
         // copy-back writes back only what the GPU actually changed.
@@ -1025,9 +1024,22 @@ impl Host {
             }
         }
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Flush all deferred buffer refreshes under `submitted` BEFORE marking
+        // this submission's `gpu_writes` as pending (upstream PR #1322): none
+        // of this submission's shaders have run yet (every prior submission
+        // finished and released its pending ranges before dropping `submitted`),
+        // so title constants written inside a 174 MB UAV heap reach the host
+        // copy and are captured in the pre-GPU snapshot taken right below.
+        batch.flush();
+        for (shadow, ranges) in &gpu_writes {
+            for &(address, len) in ranges {
+                shadow.writing(address, len);
+            }
+        }
         // Snapshots are this submission's own and taken under `submitted`,
-        // after every earlier submission's GPU work and copy-back: an
-        // overlapping submission can neither replace nor consume them.
+        // after every earlier submission's GPU work and copy-back and after
+        // `batch.flush()`, so freshly copied CPU constants are never mistaken
+        // for shader writes during copy-back.
         let snapshotting = std::time::Instant::now();
         let snapshots: Vec<_> = gpu_writes
             .iter()
@@ -2181,20 +2193,11 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
-                    continue;
-                }
-                Step::ExecutedGpuWrite(weak, address, len) => {
-                    batch.flush();
-                    if let Some(shadow) = weak
-                        .upgrade()
-                        .or_else(|| crate::shadow::find(*address as u64, (*len).max(1) as u64))
-                    {
-                        shadow.writing(*address, *len);
-                    }
+                Step::GpuWrite(..) | Step::ExecutedGpuWrite(..) => {
+                    // Pending GPU-write ranges are registered under `submitted`
+                    // right after `batch.flush()` so refreshes later in the
+                    // same submission still copy CPU writes into the shadow
+                    // before shaders run (upstream PR #1322).
                     continue;
                 }
                 Step::Texture {
@@ -4138,5 +4141,86 @@ mod tests {
             }
         }
         assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Regression for upstream PR #1322: when an earlier step in a submission
+    /// declares a whole heap as GPU-writable (`Step::GpuWrite`) and a later
+    /// step refreshes constants inside that same heap (`Step::Refresh`), the
+    /// title's CPU writes MUST still reach the host shadow before execution,
+    /// and copy-back must neither treat those CPU constants as GPU writes nor
+    /// overwrite later CPU writes.
+    #[test]
+    fn title_writes_under_pending_gpu_write_reach_host_and_preserve_later_cpu_writes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = 64 << 10;
+        let Some(host_gpu) = host() else {
+            return;
+        };
+        // SAFETY: fresh write-watched 2-page buffer (kept alive for global watch journal).
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        crate::shadow::register(base, base as u64, (2 * PAGE) as u64);
+        let shadow =
+            crate::shadow::find(base as u64, (2 * PAGE) as u64).expect("registered shadow");
+        // Initial sync so the shadow is baseline-clean.
+        shadow.update(base, 2 * PAGE);
+
+        // Record a list where the full 2-page heap is marked GPU-writable FIRST,
+        // then a constant inside page 1 is refreshed LATER in the same list.
+        let list = host_gpu.new_list().unwrap();
+        shadow.gpu_writes(&list, base as u64, (2 * PAGE) as u64);
+        shadow.refresh(&list, (base + PAGE + 16) as u64, 16);
+        list.close();
+
+        // Title writes constant `0x55` inside the GPU-writable range before submission.
+        // SAFETY: within our 2-page allocation.
+        unsafe { (base as *mut u8).add(PAGE + 20).write(0x55) };
+        assert!(host_gpu.execute(&[&list]));
+
+        // Verify the title's constant actually reached the host shadow copy!
+        // SAFETY: within shadow's 2-page mapped buffer.
+        let got = unsafe { shadow.data_ptr().add(PAGE + 20).read() };
+        assert_eq!(
+            got, 0x55,
+            "CPU constant written under a same-submission GpuWrite range must reach host shadow"
+        );
+
+        // Verify copy-back behavior: a GPU write at offset 10 goes back to title
+        // memory, while a concurrent title write (`0x66`) at `PAGE + 20` is NOT
+        // overwritten with the pre-GPU `0x55` constant.
+        let ranges = vec![(base, 2 * PAGE)];
+        shadow.writing(base, 2 * PAGE);
+        let snap = shadow.snapshot_ranges(&ranges);
+        // SAFETY: offsets inside our 2-page title and shadow buffers.
+        unsafe {
+            shadow.data_ptr().add(10).write(0xAA);
+            (base as *mut u8).add(PAGE + 20).write(0x66);
+        }
+        let (changed, _) = shadow.copy_back_timed(&ranges, snap.as_ref());
+        assert_eq!(changed, 1);
+        // SAFETY: offsets inside our 2-page title buffer.
+        unsafe {
+            assert_eq!(
+                (base as *mut u8).add(10).read(),
+                0xAA,
+                "GPU write must copy back"
+            );
+            assert_eq!(
+                (base as *mut u8).add(PAGE + 20).read(),
+                0x66,
+                "later CPU write must not be overwritten by pre-GPU constant"
+            );
+        }
+        crate::shadow::unregister(base, base as u64);
     }
 }
