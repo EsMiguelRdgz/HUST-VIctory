@@ -3,9 +3,10 @@
 # Manual only. GitHub-hosted runners have NO hardware GPU: every D3D12 test
 # here runs on WARP (Microsoft's software rasterizer), so passing tests prove
 # translation/correctness on WARP, not behaviour or performance on the
-# RTX 3070. The D3D12 debug layer (Graphics Tools) is not installed on these
-# images, so VICTORY_D3D12_DEBUG validation is not performed. No title is
-# ever launched. Hardware runs go through home-rtx3070-diagnostic.yml.
+# RTX 3070. VICTORY_D3D12_DEBUG is not set, so D3D12 debug-layer validation
+# does not run here (the image does ship d3d12SDKLayers.dll; the job records
+# it). No title is ever launched. Hardware runs go through
+# home-rtx3070-diagnostic.yml.
 name: Windows CI
 
 on:
@@ -241,7 +242,7 @@ jobs:
           $s.Add("")
           $s.Add("### Limitations")
           $s.Add("- GitHub-hosted ``windows-latest`` has **no hardware GPU**. D3D12 tests ran on **WARP** (software); results do not cover RTX 3070 driver behaviour, timing, VRAM or TDR.")
-          $s.Add("- D3D12 debug layer present on this image: **$env:DEBUG_LAYER**. When false, ``VICTORY_D3D12_DEBUG`` validation did not run.")
+          $s.Add("- D3D12 debug layer (d3d12SDKLayers.dll) present on this image: **$env:DEBUG_LAYER**. This workflow does not set ``VICTORY_D3D12_DEBUG``, so debug-layer validation did not run.")
           $s.Add("- Tests that need real title files or external reference data skip themselves (environment variables unset).")
           $s.Add("- No title or game executable was launched or downloaded.")
           $s -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
