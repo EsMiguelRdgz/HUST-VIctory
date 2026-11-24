@@ -267,10 +267,18 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
+    {
+        with_state(this, |host, state| {
+            host.reset();
+            state.reset(pipeline);
+        });
+        // Run outside `with_state` and outside any `Host::queue` lock (unlike
+        // `Host::present`'s internal `p.copy.reset()`), now that this list's
+        // `kept` refs and bindless pins are dropped.
+        if crate::memstat::under_pressure(0) {
+            crate::shadow::relieve_pressure(1);
+        }
+    }
     #[cfg(not(windows))]
     let _ = (this, pipeline);
     S_OK

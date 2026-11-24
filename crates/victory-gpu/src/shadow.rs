@@ -366,26 +366,56 @@ impl Shadow {
                 let runs = diff_runs(before, after);
                 if let (Some(&(first_start, _)), Some(&(_, last_end))) = (runs.first(), runs.last())
                 {
-                    let started = std::time::Instant::now();
+                    let run_count = runs.len();
+                    let t0 = std::time::Instant::now();
                     // Prepare the covering changed span once (demand-commit +
                     // open write-watch guards) instead of locking per diff run.
                     crate::kernel_will_write(from + first_start, last_end - first_start);
+                    let prep_elapsed = t0.elapsed();
+                    let t1 = std::time::Instant::now();
+                    let mut range_changed = 0usize;
                     for (run_start, run_end) in runs {
                         crate::host::write_mapped_prepared(
                             (from + run_start) as *mut u8,
                             after[run_start..].as_ptr(),
                             run_end - run_start,
                         );
-                        changed_total += run_end - run_start;
+                        range_changed += run_end - run_start;
                     }
-                    writing += started.elapsed();
+                    let write_elapsed = t1.elapsed();
+                    changed_total += range_changed;
+                    writing += prep_elapsed + write_elapsed;
+                    if (prep_elapsed + write_elapsed).as_millis() >= 50 {
+                        tracing::warn!(
+                            from = format_args!("{from:#x}"),
+                            span = last_end - first_start,
+                            range_len = to - from,
+                            run_count,
+                            changed = range_changed,
+                            prep_ms = prep_elapsed.as_millis() as u64,
+                            write_ms = write_elapsed.as_millis() as u64,
+                            "slow copy-back write"
+                        );
+                    }
                 }
             } else {
-                let started = std::time::Instant::now();
+                let t0 = std::time::Instant::now();
                 crate::kernel_will_write(from, to - from);
+                let prep_elapsed = t0.elapsed();
+                let t1 = std::time::Instant::now();
                 crate::host::write_mapped_prepared(from as *mut u8, after.as_ptr(), to - from);
-                writing += started.elapsed();
+                let write_elapsed = t1.elapsed();
+                writing += prep_elapsed + write_elapsed;
                 changed_total += to - from;
+                if (prep_elapsed + write_elapsed).as_millis() >= 50 {
+                    tracing::warn!(
+                        from = format_args!("{from:#x}"),
+                        range_len = to - from,
+                        prep_ms = prep_elapsed.as_millis() as u64,
+                        write_ms = write_elapsed.as_millis() as u64,
+                        "slow whole copy-back write (no snapshot)"
+                    );
+                }
             }
             // Do not advance `copied` for this page. Diff-only copy-back
             // preserves concurrent title writes at other offsets, so the

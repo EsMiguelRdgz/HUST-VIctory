@@ -1151,12 +1151,6 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        // Now that this list's `kept` refs and bindless pins are dropped,
-        // proactively relieve commit pressure between submissions (rate-limited
-        // to once per second inside `relieve_pressure`).
-        if crate::memstat::under_pressure(0) {
-            crate::shadow::relieve_pressure(1);
-        }
     }
 
     /// Keeps a host COM object referenced by this list alive until reset

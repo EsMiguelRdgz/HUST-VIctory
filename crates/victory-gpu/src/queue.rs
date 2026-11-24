@@ -295,6 +295,10 @@ extern "system" fn present(
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+        // Proactively relieve commit pressure between frames with no Host locks held.
+        if crate::memstat::under_pressure(0) {
+            crate::shadow::relieve_pressure(1);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
