@@ -837,13 +837,13 @@ mod tests {
     #[test]
     fn copy_back_does_not_mark_watched_pages_fresh() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         let Some(host_gpu) = crate::host::host() else {
             return;
         };
-        // SAFETY: a fresh write-watched allocation, freed at the end.
+        // SAFETY: a fresh write-watched allocation, kept (see the end).
         let base = unsafe {
             VirtualAlloc(
                 std::ptr::null(),
@@ -891,9 +891,9 @@ mod tests {
         assert_eq!(&copy[64..72], &[0x77u8; 8]);
 
         unregister(fake_id, base as u64);
-        drop(shadow);
-        // SAFETY: our allocation; the shadow no longer refers to it.
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        // The page is not freed: the write-watch journal is process-wide
+        // and keeps its pages' entries, so a later test given the same
+        // address back would see this test's writes.
         let _ = host_gpu;
     }
 
