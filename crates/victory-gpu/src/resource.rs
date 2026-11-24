@@ -824,6 +824,20 @@ struct Resource {
     /// Monotonic last-use tick for LRU eviction of idle title-written textures.
     #[cfg(windows)]
     last_used: std::sync::atomic::AtomicU64,
+    /// Active-list guard: cloned into `HostList.states` / `Step::Texture` while
+    /// a list references this resource. `Arc::strong_count == 1` proves no open
+    /// or in-flight command list references it (without altering COM refcount).
+    #[cfg(windows)]
+    list_guard: std::sync::Arc<()>,
+}
+
+/// Active-list guard for `this`, held by `HostList` until list reset/drop.
+#[cfg(windows)]
+pub(crate) fn list_guard(this: This) -> Option<std::sync::Arc<()>> {
+    if this.is_null() {
+        return None;
+    }
+    Some(resource(this).list_guard.clone())
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -1236,11 +1250,20 @@ fn hand_out_resource(
         host_state: initial_host_state.into(),
         #[cfg(windows)]
         last_used: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(windows)]
+        list_guard: std::sync::Arc::new(()),
     });
     #[cfg(windows)]
-    if desc.dimension == BUFFER {
+    {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        if desc.dimension == BUFFER {
+            crate::shadow::register(at, resource.data() as u64, desc.width);
+        } else if (desc.flags & 0x7) == 0 {
+            TITLE_WRITTEN_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(at);
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1248,19 +1271,23 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        let at = std::ptr::from_ref::<Resource>(self) as usize;
+        if self.desc.dimension != BUFFER {
+            TITLE_WRITTEN_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&at);
+        }
         let deferred = self
             .deferred_bytes
             .swap(0, std::sync::atomic::Ordering::Relaxed);
         if deferred > 0 {
             crate::memstat::free(crate::memstat::Kind::DeferredTexture, deferred);
         }
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
-        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        crate::texture::forget(at);
+        crate::descriptor::forget(at);
         if self.desc.dimension == BUFFER {
-            crate::shadow::unregister(
-                std::ptr::from_ref::<Resource>(self) as usize,
-                self.data() as u64,
-            );
+            crate::shadow::unregister(at, self.data() as u64);
         }
     }
 }
@@ -1417,30 +1444,266 @@ pub(crate) extern "system" fn create_at_address(
     )
 }
 
+/// Live title-written textures (no RT/DSV/UAV flags) eligible for safe idle
+/// host-texture eviction under commit pressure because title memory still
+/// holds their authoritative pixels.
+#[cfg(windows)]
+static TITLE_WRITTEN_TEXTURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Cached entry for a texture placed in title memory without a resource object.
+#[cfg(windows)]
+struct PlacedEntry {
+    resource: usize,
+    title_span: u64,
+    host_bytes: u64,
+    last_used: u64,
+}
+
+/// Budget for cached `PLACED_TEXTURES` host textures before LRU idle eviction.
+#[cfg(windows)]
+const PLACED_TEXTURE_BUDGET: u64 = 512 << 20;
+
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description: a resource at that
-/// address, made the first time a draw reads one.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
+/// address, made on first use, invalidated on title memory remapping, and
+/// bounded by [`PLACED_TEXTURE_BUDGET`] / commit pressure.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::Mutex<
+    std::collections::BTreeMap<(u64, [u32; 14]), PlacedEntry>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Placed textures evicted from `PLACED_TEXTURES` while an open command list
+/// still referenced them; released as soon as their list resets.
+#[cfg(windows)]
+static RETIRED_PLACED: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Releases a placed-texture `Resource` if no open command list holds it, else
+/// defers release into `RETIRED_PLACED`. Returns host bytes freed now.
+#[cfg(windows)]
+fn release_placed_entry(res: usize, host_bytes: u64) -> u64 {
+    let r = resource(res as This);
+    if std::sync::Arc::strong_count(&r.list_guard) == 1 {
+        crate::descriptor::evict_texture_slots(res, false);
+        resource_release(res as This);
+        if host_bytes > 0 {
+            crate::memstat::count(crate::memstat::Event::TexturesEvicted, 1);
+            crate::memstat::count(crate::memstat::Event::TexturesEvictedBytes, host_bytes);
+        }
+        host_bytes
+    } else {
+        RETIRED_PLACED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((res, host_bytes));
+        0
+    }
+}
+
+/// Drains any previously retired placed textures whose command lists have now
+/// reset. Returns host bytes freed.
+#[cfg(windows)]
+fn drain_retired_placed() -> u64 {
+    let mut retired = RETIRED_PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ready = Vec::new();
+    let mut i = 0;
+    while i < retired.len() {
+        let (res, _bytes) = retired[i];
+        let r = resource(res as This);
+        if std::sync::Arc::strong_count(&r.list_guard) == 1 {
+            ready.push(retired.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    drop(retired);
+    let mut freed = 0u64;
+    for (res, bytes) in ready {
+        crate::descriptor::evict_texture_slots(res, false);
+        resource_release(res as This);
+        if bytes > 0 {
+            crate::memstat::count(crate::memstat::Event::TexturesEvicted, 1);
+            crate::memstat::count(crate::memstat::Event::TexturesEvictedBytes, bytes);
+            freed += bytes;
+        }
+    }
+    freed
+}
+
+/// Evicts LRU idle entries from `PLACED_TEXTURES` until live bytes fit within
+/// `budget`. Returns host bytes freed.
+#[cfg(windows)]
+fn reclaim_placed_textures(budget: u64) -> u64 {
+    let mut freed = drain_retired_placed();
+    let evicted: Vec<(usize, u64)> = {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let total: u64 = map.values().map(|e| e.host_bytes).sum();
+        if total <= budget {
+            return freed;
+        }
+        let mut candidates: Vec<(u64, (u64, [u32; 14]), u64)> = map
+            .iter()
+            .filter(|(_, e)| {
+                std::sync::Arc::strong_count(&resource(e.resource as This).list_guard) == 1
+            })
+            .map(|(k, e)| (e.last_used, *k, e.host_bytes))
+            .collect();
+        candidates.sort_unstable_by_key(|c| c.0);
+        let mut over = total - budget;
+        let mut out = Vec::new();
+        for (_, key, bytes) in candidates {
+            if over == 0 {
+                break;
+            }
+            if let Some(entry) = map.remove(&key) {
+                out.push((entry.resource, entry.host_bytes));
+                over = over.saturating_sub(bytes);
+            }
+        }
+        out
+    };
+    for (res, bytes) in evicted {
+        freed += release_placed_entry(res, bytes);
+    }
+    freed
+}
+
+/// Called when title memory in `[at, at + len)` is unmapped or remapped:
+/// evicts any cached `PLACED_TEXTURES` overlapping that address range so
+/// streamed/reused memory never leaks stale host textures.
+#[cfg(windows)]
+pub(crate) fn on_title_memory_remapped(at: u64, len: u64) {
+    let Some(end) = at.checked_add(len).filter(|&e| e > at) else {
+        return;
+    };
+    let evicted: Vec<(usize, u64)> = {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, [u32; 14])> = map
+            .iter()
+            .filter(|&(&(addr, _), entry)| {
+                let tex_end = addr.saturating_add(entry.title_span.max(1));
+                addr < end && tex_end > at
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        keys.into_iter()
+            .filter_map(|k| map.remove(&k).map(|e| (e.resource, e.host_bytes)))
+            .collect()
+    };
+    for (res, bytes) in evicted {
+        release_placed_entry(res, bytes);
+    }
+    drain_retired_placed();
+}
+
+/// Evicts idle placed textures and idle materialized title-written host
+/// textures (whose authoritative pixels still live in title memory) to
+/// relieve system-commit pressure. Never evicts GPU-written textures (RT,
+/// DSV, UAV, or copy/resolve targets) or any texture referenced by an open
+/// or in-flight command list. Returns host bytes freed.
+#[cfg(windows)]
+pub(crate) fn evict_idle_textures(incoming: u64) -> u64 {
+    let mut freed = reclaim_placed_textures(0);
+    if incoming > 0 && freed >= incoming {
+        return freed;
+    }
+    // Snapshot live title-written texture candidates (drop registry lock
+    // before touching descriptors or individual Resource locks).
+    let mut candidates: Vec<(u64, usize)> = {
+        let set = TITLE_WRITTEN_TEXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.iter()
+            .filter_map(|&res| {
+                let r = resource(res as This);
+                if !r.host_live.load(std::sync::atomic::Ordering::Acquire) {
+                    return None;
+                }
+                if std::sync::Arc::strong_count(&r.list_guard) != 1 {
+                    return None;
+                }
+                if crate::texture::is_host_written(res as This) {
+                    return None;
+                }
+                Some((r.last_used.load(std::sync::atomic::Ordering::Relaxed), res))
+            })
+            .collect()
+    };
+    candidates.sort_unstable_by_key(|c| c.0);
+    for (_, res) in candidates {
+        if incoming > 0 && freed >= incoming {
+            break;
+        }
+        // Hold `TITLE_WRITTEN_TEXTURES` across this single candidate's eviction
+        // so `Resource::drop` (which removes from this set first) cannot free
+        // `Box<Resource>` concurrently (no callee locks `TITLE_WRITTEN_TEXTURES`).
+        let dropped = {
+            let set = TITLE_WRITTEN_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !set.contains(&res) {
+                continue;
+            }
+            let r = resource(res as This);
+            if std::sync::Arc::strong_count(&r.list_guard) != 1
+                || crate::texture::is_host_written(res as This)
+            {
+                continue;
+            }
+            // Re-null & re-defer any shader-visible descriptor slots first (drops
+            // HostHeap's COM ref to the ID3D12Resource), then clear last-uploaded
+            // state so the next GPU use re-uploads cleanly from title memory.
+            crate::descriptor::evict_texture_slots(res, true);
+            crate::texture::reset_uploaded(res);
+            let mut slot = r.host.lock().unwrap_or_else(|e| e.into_inner());
+            if std::sync::Arc::strong_count(&r.list_guard) != 1 {
+                None
+            } else if let Some(tex) = slot.resource.take() {
+                let bytes = slot.bytes;
+                slot.bytes = 0;
+                r.host_live
+                    .store(false, std::sync::atomic::Ordering::Release);
+                let est = footprint(&r.desc).map_or(KIB_64, |i| i.size);
+                let prev = r
+                    .deferred_bytes
+                    .swap(est, std::sync::atomic::Ordering::Relaxed);
+                if prev == 0 {
+                    crate::memstat::alloc(crate::memstat::Kind::DeferredTexture, est);
+                }
+                Some((tex, bytes))
+            } else {
+                None
+            }
+        };
+        if let Some((tex, bytes)) = dropped {
+            drop(tex);
+            freed += bytes;
+            crate::memstat::count(crate::memstat::Event::TexturesEvicted, 1);
+            crate::memstat::count(crate::memstat::Event::TexturesEvictedBytes, bytes);
+        }
+    }
+    freed
+}
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
+    {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get_mut(&(address, *desc)) {
+            entry.last_used = TEXTURE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(entry.resource as This);
+        }
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
     }
+    let title_span = footprint(&d).map_or(KIB_64, |i| i.size);
     let mut out = std::ptr::null();
     let made = create_at_address(
         std::ptr::null(),
@@ -1454,8 +1717,47 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
-    host_resource(out).is_some().then_some(out)
+    // Placed cache entries are managed by `PLACED_TEXTURES` rather than
+    // `TITLE_WRITTEN_TEXTURES` so they are never double-evicted.
+    TITLE_WRITTEN_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(out as usize));
+    if host_resource(out).is_none() {
+        resource_release(out);
+        return None;
+    }
+    let host_bytes = resource(out)
+        .host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bytes;
+    let tick = TEXTURE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut duplicate = None;
+    {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get_mut(&(address, *desc)) {
+            existing.last_used = tick;
+            duplicate = Some(out);
+            out = existing.resource as This;
+        } else {
+            map.insert(
+                (address, *desc),
+                PlacedEntry {
+                    resource: out as usize,
+                    title_span,
+                    host_bytes,
+                    last_used: tick,
+                },
+            );
+        }
+    }
+    if let Some(dup) = duplicate {
+        resource_release(dup);
+    } else {
+        reclaim_placed_textures(PLACED_TEXTURE_BUDGET);
+    }
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1631,7 +1933,7 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::slot;
 
@@ -1964,12 +2266,20 @@ mod tests {
             .collect()
     }
 
+    /// Serializes tests that check process-wide `texture::RECORDED` or invoke
+    /// global `evict_idle_textures(0)` / `relieve_pressure(0)`.
+    #[cfg(windows)]
+    pub(crate) static TEXTURE_GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A title texture's memory reaches its host copy at the submission that
     /// samples it, again only when the memory changed, through an upload
     /// buffer lent for that submission (none is kept per texture).
     #[test]
     fn title_texture_contents_are_uploaded_when_they_change() {
         use std::sync::atomic::Ordering::Relaxed;
+        let _serial = TEXTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -2811,6 +3121,159 @@ mod tests {
         assert_eq!(slot::<Release>(srv_tex, 0x10)(srv_tex), 0);
         assert_eq!(slot::<Release>(uav_tex, 0x10)(uav_tex), 0);
         assert_eq!(slot::<Release>(sheap, 0x10)(sheap), 0);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// `PLACED_TEXTURES` entries are evicted and freed when the title remaps
+    /// their backing address range.
+    #[cfg(windows)]
+    #[test]
+    fn placed_textures_evict_on_title_memory_remap() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let backing = vec![0u8; 256 << 10];
+        let addr = backing.as_ptr() as u64;
+        let d = texture(64, 64, 28, 1);
+        // SAFETY: `ResourceDesc` is 56 bytes = 14 u32 words.
+        let words: [u32; 14] =
+            unsafe { std::ptr::from_ref(&d).cast::<[u32; 14]>().read_unaligned() };
+        let evicted_before = crate::memstat::events(crate::memstat::Event::TexturesEvicted);
+
+        let res = texture_at(addr, &words).expect("placed texture");
+        assert!(has_host_resource(res));
+        assert!(
+            PLACED_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(addr, words))
+        );
+
+        crate::title_memory_remapped(addr as usize, backing.len());
+        assert!(
+            !PLACED_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(addr, words)),
+            "remapping must remove overlapping placed textures"
+        );
+        assert!(crate::memstat::events(crate::memstat::Event::TexturesEvicted) > evicted_before);
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Idle title-written host textures are evicted under commit pressure and
+    /// re-materialize + re-upload identical pixels on next use, while RT/UAV
+    /// textures and textures referenced by an open list are never evicted.
+    #[cfg(windows)]
+    #[test]
+    fn idle_title_written_textures_evict_and_reupload_cleanly() {
+        let _serial = TEXTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let (width, height) = (64u32, 32u32);
+        let mut title_tex = null;
+        let desc = texture(u64::from(width), height, 28, 1);
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                null.cast(),
+                iid,
+                &mut title_tex
+            ),
+            S_OK
+        );
+        let mut rt_tex = null;
+        let rt_desc = ResourceDesc {
+            flags: 1, // ALLOW_RENDER_TARGET
+            ..desc
+        };
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &rt_desc,
+                0,
+                null.cast(),
+                iid,
+                &mut rt_tex
+            ),
+            S_OK
+        );
+        let _ = host_resource(rt_tex).expect("rt materialized");
+
+        // Fill tiled title memory and upload once.
+        let (memory, d) = texture_memory(title_tex).unwrap();
+        let layout = texture_layout(&d).unwrap().planes[0].layout.clone();
+        let expected: Vec<u8> = (0..width * height * 4)
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(5))
+            .collect();
+        // SAFETY: `memory` holds `layout.size` bytes.
+        let tiled =
+            unsafe { std::slice::from_raw_parts_mut(memory.cast_mut(), layout.size as usize) };
+        let pitch = width as usize * 4;
+        layout
+            .tile(tiled, 0, 0, &expected, pitch, pitch * height as usize)
+            .unwrap();
+
+        let upload_once = |image: This| {
+            let list = host_gpu.new_list().unwrap();
+            let ht = host_resource(image).unwrap();
+            crate::texture::upload(&list, image, &ht);
+            crate::list::ensure_state(&list, image, 0x40 | 0x80);
+            list.close();
+            host_gpu.execute(&[&list]);
+        };
+        upload_once(title_tex);
+        assert_eq!(read_rgba8(title_tex, width, height), expected);
+
+        // Hold an open list referencing `title_tex` -> must NOT be evicted.
+        let open_list = host_gpu.new_list().unwrap();
+        crate::list::ensure_state(&open_list, title_tex, 0x40 | 0x80);
+        let _ = evict_idle_textures(0);
+        assert!(
+            has_host_resource(title_tex),
+            "texture held by an open command list must not be evicted"
+        );
+        assert!(
+            has_host_resource(rt_tex),
+            "render target texture must never be evicted"
+        );
+        open_list.close();
+        open_list.reset();
+        drop(open_list);
+
+        // Now idle -> eviction drops the host texture, freeing commit.
+        let freed = evict_idle_textures(0);
+        assert!(freed > 0);
+        assert!(
+            !has_host_resource(title_tex),
+            "idle title-written texture must be evicted under pressure"
+        );
+        assert!(
+            has_host_resource(rt_tex),
+            "render target texture still protected"
+        );
+
+        // Next use re-materializes and re-uploads exact pixels cleanly.
+        upload_once(title_tex);
+        assert!(has_host_resource(title_tex));
+        assert_eq!(
+            read_rgba8(title_tex, width, height),
+            expected,
+            "re-uploaded pixels after eviction must match"
+        );
+
+        assert_eq!(slot::<Release>(title_tex, 0x10)(title_tex), 0);
+        assert_eq!(slot::<Release>(rt_tex, 0x10)(rt_tex), 0);
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 }

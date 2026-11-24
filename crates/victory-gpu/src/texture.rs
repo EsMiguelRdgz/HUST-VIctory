@@ -255,6 +255,31 @@ pub(crate) fn host_written(resource: This) {
         .insert(resource as usize);
 }
 
+/// Whether the host GPU has written `resource` (via copy or resolve), so its
+/// authoritative contents live on the host rather than in title memory.
+pub(crate) fn is_host_written(resource: This) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)))
+}
+
+/// Clears the last-uploaded state for `resource` so that if an evicted
+/// title-written host texture is later re-materialized, its next use re-uploads
+/// from title memory.
+pub(crate) fn reset_uploaded(resource: usize) {
+    let staging = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref().and_then(|m| m.get(&resource).cloned())
+    };
+    if let Some(s) = staging {
+        let mut last = s.last.lock().unwrap_or_else(|e| e.into_inner());
+        last.hash = None;
+        last.asked = 0;
+    }
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -292,7 +317,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(staging) = staging(resource, texture) else {
         return;
     };
-    list.defer_texture(staging, resource as usize, texture.clone());
+    list.defer_texture(
+        staging,
+        resource as usize,
+        texture.clone(),
+        crate::resource::list_guard(resource),
+    );
 }
 
 impl Staging {

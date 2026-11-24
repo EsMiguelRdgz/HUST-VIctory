@@ -535,6 +535,47 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Evicts every shader-visible `HostHeap` descriptor slot pointing to
+/// `resource`: writes a NULL descriptor, clears its cached key, drops the
+/// heap's COM reference to the host texture, and (when `re_defer` is true)
+/// re-registers mirrored slots in `DEFERRED_TEX_SLOTS` so a later
+/// re-materialization backfills them automatically.
+#[cfg(windows)]
+pub(crate) fn evict_texture_slots(resource: usize, re_defer: bool) {
+    let heaps: Vec<(usize, u64, u32)> = {
+        let list = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        list.iter()
+            .filter_map(|&(start, _, at)| {
+                // SAFETY: registered heaps are live while SHADER_HEAPS holds them.
+                let h = unsafe { &*(at as *const Heap) };
+                let step = increment(h.desc.kind)?;
+                Some((at, start, step))
+            })
+            .collect()
+    };
+    for (heap_ptr, start, step) in heaps {
+        let evicted = {
+            let list = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            if list.iter().any(|&(_, _, h)| h == heap_ptr) {
+                // SAFETY: still present in SHADER_HEAPS.
+                unsafe { &*(heap_ptr as *const Heap) }
+                    .host
+                    .get()
+                    .and_then(|h| h.as_ref())
+                    .map(|h| h.evict_texture(resource))
+            } else {
+                None
+            }
+        };
+        if re_defer && let Some(slots) = evicted {
+            for (slot, unordered) in slots {
+                let handle = start + u64::from(slot) * u64::from(step);
+                register_deferred_slot(resource, heap_ptr, slot, handle, unordered);
+            }
+        }
+    }
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
@@ -543,6 +584,7 @@ pub(crate) fn forget(resource: usize) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&resource);
+        evict_texture_slots(resource, false);
     }
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {

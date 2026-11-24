@@ -55,4 +55,13 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::writing as kernel_will_write;
+
+/// Called by the runtime (`xmem`) when title physical/virtual mappings in
+/// `[at, at + len)` change: updates write-watch guard protections and evicts
+/// any cached placed host textures covering the remapped range.
+#[cfg(windows)]
+pub fn title_memory_remapped(at: usize, len: usize) {
+    watch::title_memory_remapped(at, len);
+    resource::on_title_memory_remapped(at as u64, len as u64);
+}

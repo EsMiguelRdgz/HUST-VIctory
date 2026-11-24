@@ -666,6 +666,7 @@ pub(crate) fn relieve_pressure(incoming: u64) -> u64 {
     }
     freed += drain_snapshot_pool();
     freed += crate::texture::drain_pools();
+    freed += crate::resource::evict_idle_textures(incoming);
     let headroom = memstat::system_commit().map(|(total, limit)| limit.saturating_sub(total));
     tracing::warn!(
         incoming,
@@ -1227,6 +1228,9 @@ mod tests {
     /// copies in use stay, and relief runs at most once a second.
     #[test]
     fn pressure_relief_frees_idle_copies_and_pools() {
+        let _serial = crate::resource::tests::TEXTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(host_gpu) = crate::host::host() else {
             return;
         };

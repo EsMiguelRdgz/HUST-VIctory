@@ -515,6 +515,9 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// Texture states tracked per command list: `(first_state, last_state, active_list_guard)`.
+type ListTextureStates = std::collections::HashMap<usize, (u32, u32, Option<std::sync::Arc<()>>)>;
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -525,10 +528,11 @@ pub(crate) struct HostList {
     /// reused after a reset.
     scratch: Mutex<Scratch>,
     /// Host texture states the list assumes, by title resource: at its
-    /// start and at its end. Lists are recorded on many threads and run in
-    /// submission order, so the transitions from a texture's real state are
-    /// made at submission, in `prelude`.
-    states: Mutex<std::collections::HashMap<usize, (u32, u32)>>,
+    /// start, at its end, and an active-list guard preventing idle eviction
+    /// while the list is open/in-flight. Lists are recorded on many threads
+    /// and run in submission order, so the transitions from a texture's real
+    /// state are made at submission, in `prelude`.
+    states: Mutex<ListTextureStates>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// Incremented whenever a deferred title-memory copy or write is recorded,
@@ -595,12 +599,14 @@ enum Step {
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a title texture's host copy (title resource, host texture) up
-    /// to date if its memory changed: in the submission's prelude.
-    Texture(
-        std::sync::Arc<crate::texture::Staging>,
-        usize,
-        ID3D12Resource,
-    ),
+    /// to date if its memory changed: in the submission's prelude. Holds the
+    /// resource's active-list guard until list reset.
+    Texture {
+        staging: std::sync::Arc<crate::texture::Staging>,
+        resource: usize,
+        texture: ID3D12Resource,
+        _guard: Option<std::sync::Arc<()>>,
+    },
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1103,7 +1109,7 @@ impl HostList {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(resource as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted));
+                v.insert((wanted, wanted, crate::resource::list_guard(resource)));
                 drop(states);
                 self.keep(&texture);
                 None
@@ -1133,7 +1139,7 @@ impl HostList {
         let (mut before, mut after) = (Vec::new(), Vec::new());
         // Keep owned COM handles alive until `list.ResourceBarrier` finishes.
         let mut live_textures: Vec<ID3D12Resource> = Vec::with_capacity(states.len());
-        for (&resource, &(first, last)) in states.iter() {
+        for (&resource, &(first, last, _)) in states.iter() {
             let this = resource as crate::object::This;
             let Some(texture) = crate::resource::existing_host_resource(this) else {
                 continue;
@@ -1363,10 +1369,14 @@ impl HostList {
         staging: std::sync::Arc<crate::texture::Staging>,
         resource: usize,
         texture: ID3D12Resource,
+        guard: Option<std::sync::Arc<()>>,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::Texture(staging, resource, texture));
+        self.deferred().copies.push(Step::Texture {
+            staging,
+            resource,
+            texture,
+            _guard: guard,
+        });
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -1435,7 +1445,12 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
-                Step::Texture(staging, resource, texture) => {
+                Step::Texture {
+                    staging,
+                    resource,
+                    texture,
+                    ..
+                } => {
                     uploads.extend(staging.refresh(*resource, texture));
                     continue;
                 }
