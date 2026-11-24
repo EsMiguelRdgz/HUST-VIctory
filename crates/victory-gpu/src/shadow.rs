@@ -284,13 +284,19 @@ impl Shadow {
             // A later refresh must still be allowed to copy those writes.
         }
 
+        self.release(ranges);
+        changed_total
+    }
+
+    /// The shader writes of `ranges` `(address, len)` are over (copied back
+    /// or abandoned): refreshes may copy title memory there again.
+    pub(crate) fn release(&self, ranges: &[(usize, usize)]) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         for &(address, len) in ranges {
             if let Some(i) = pending.iter().position(|&r| r == (address, address + len)) {
                 pending.swap_remove(i);
             }
         }
-        changed_total
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -747,6 +753,32 @@ mod tests {
         assert_eq!(&title_mem[0..64], &[0x11u8; 64]);
 
         unregister(fake_id, base);
+        let _ = host_gpu;
+    }
+
+    /// Shader writes abandoned without copy-back (an unconfirmed fence wait)
+    /// stop blocking refreshes, and title memory is left as the title wrote it.
+    #[test]
+    fn released_gpu_writes_allow_refreshes_again() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mut title_mem = vec![0x11u8; 4096];
+        let base = title_mem.as_mut_ptr() as usize;
+        let fake_id = base ^ 0xAB4D_0123;
+        register(fake_id, base as u64, 4096);
+        let shadow = find(base as u64, 4096).expect("shadow buffer");
+        shadow.update(base, 4096);
+        shadow.writing(base, 4096);
+        title_mem[8..16].fill(0x99);
+        assert_eq!(shadow.update(base, 4096), 0, "blocked while pending");
+        shadow.release(&[(base, 4096)]);
+        assert!(shadow.pending.lock().unwrap().is_empty());
+        assert_eq!(shadow.update(base, 4096), 4096);
+        // SAFETY: inside the shadow's mapping.
+        let copy = unsafe { std::slice::from_raw_parts(shadow.data.add(8), 8) };
+        assert_eq!(copy, &[0x99u8; 8]);
+        unregister(fake_id, base as u64);
         let _ = host_gpu;
     }
 

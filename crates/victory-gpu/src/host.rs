@@ -253,6 +253,68 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// How long a failed fence-event wait falls back to polling the fence.
+const UNCONFIRMED_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Submissions whose completion could not be confirmed.
+static UNCONFIRMED_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// Waits until `fence` reaches `value` and returns whether that was
+/// confirmed. `signalled`: the queue accepted the signal (if not, the value
+/// is never reached and only an already completed fence counts). The wait
+/// goes through `event` for up to `timeout_ms`; if arming or waiting fails,
+/// or the (auto-reset, shared) event woke early, the fence is polled for up
+/// to `poll`. A completed value of `u64::MAX` is a removed device, not
+/// completion.
+fn wait_fence(
+    fence: &ID3D12Fence,
+    event: HANDLE,
+    value: u64,
+    signalled: bool,
+    timeout_ms: u32,
+    poll: std::time::Duration,
+) -> bool {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    // SAFETY: a plain query of a live fence.
+    let done = || match unsafe { fence.GetCompletedValue() } {
+        u64::MAX => Some(false),
+        v if v >= value => Some(true),
+        _ => None,
+    };
+    if let Some(done) = done() {
+        return done;
+    }
+    if !signalled {
+        return false;
+    }
+    // SAFETY: our fence and event.
+    match unsafe { fence.SetEventOnCompletion(value, event) } {
+        Ok(()) => {
+            // SAFETY: our event handle.
+            let waited = unsafe { WaitForSingleObject(event, timeout_ms) };
+            if waited == WAIT_OBJECT_0
+                && let Some(done) = done()
+            {
+                return done;
+            }
+            tracing::warn!(?waited, value, "host fence wait failed; polling the fence");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, value, "host fence event not armed; polling the fence")
+        }
+    }
+    let deadline = std::time::Instant::now() + poll;
+    loop {
+        if let Some(done) = done() {
+            return done;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -647,19 +709,21 @@ impl Host {
         *submitted += 1;
         let prepared = std::time::Instant::now();
         // SAFETY: closed lists; the fence and event are ours.
-        unsafe {
+        let signalled = unsafe {
             self.queue.ExecuteCommandLists(&lists);
-            let waited = self
-                .queue
-                .Signal(&self.fence, *submitted)
-                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-            match waited {
-                Ok(()) => {
-                    WaitForSingleObject(self.event, INFINITE);
-                }
-                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-            }
+            self.queue.Signal(&self.fence, *submitted)
+        };
+        if let Err(e) = &signalled {
+            tracing::warn!(error = %e, "host submission not signalled");
         }
+        let completed = wait_fence(
+            &self.fence,
+            self.event,
+            *submitted,
+            signalled.is_ok(),
+            INFINITE,
+            UNCONFIRMED_POLL,
+        );
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -692,8 +756,25 @@ impl Host {
         }
         let copying_back = std::time::Instant::now();
         let mut changed_bytes = 0u64;
-        for ((shadow, ranges), snapshot) in gpu_writes.iter().zip(&snapshots) {
-            changed_bytes += shadow.copy_back_ranges(ranges, snapshot.as_ref()) as u64;
+        if completed {
+            for ((shadow, ranges), snapshot) in gpu_writes.iter().zip(&snapshots) {
+                changed_bytes += shadow.copy_back_ranges(ranges, snapshot.as_ref()) as u64;
+            }
+        } else {
+            // The GPU may still be writing the copies: reading them now
+            // would publish partial results into title memory. Drop this
+            // submission's shader writes instead, and let later refreshes
+            // copy title memory again rather than block on them forever.
+            let n = UNCONFIRMED_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::error!(
+                value = *submitted,
+                unconfirmed = n,
+                shadows = gpu_writes.len(),
+                "host submission completion not confirmed; shader writes not copied back"
+            );
+            for (shadow, ranges) in &gpu_writes {
+                shadow.release(ranges);
+            }
         }
         drop(snapshots);
         if !gpu_writes.is_empty() {
@@ -2069,6 +2150,52 @@ pub(crate) fn assert_no_debug_errors(device: &ID3D12Device) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Completion is confirmed only when the fence really reached the
+    /// value: not on a timed-out or never-signalled wait, nor on a removed
+    /// device's `u64::MAX`.
+    #[test]
+    fn fence_waits_confirm_only_real_completion() {
+        let Some(host) = host() else {
+            return;
+        };
+        let short = std::time::Duration::from_millis(20);
+        // SAFETY: a fresh fence and event of ours.
+        let (fence, event): (ID3D12Fence, HANDLE) = unsafe {
+            (
+                host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap(),
+                CreateEventW(None, false, false, None).unwrap(),
+            )
+        };
+        assert!(
+            !wait_fence(&fence, event, 1, true, 10, short),
+            "not reached"
+        );
+        assert!(
+            !wait_fence(&fence, event, 1, false, 10, short),
+            "never signalled"
+        );
+        // SAFETY: a CPU-side signal of our fence.
+        unsafe { fence.Signal(1).unwrap() };
+        assert!(wait_fence(&fence, event, 1, true, 10, short));
+        assert!(
+            wait_fence(&fence, event, 1, false, 10, short),
+            "already done"
+        );
+        // Arming for the reached value 1 leaves the shared event set; that
+        // stale wake must not count as completion of a later value.
+        // SAFETY: our fence.
+        unsafe { fence.SetEventOnCompletion(1, event).unwrap() };
+        assert!(!wait_fence(&fence, event, 2, true, 10, short), "stale wake");
+        // SAFETY: as above; `u64::MAX` is what a removed device reports.
+        unsafe { fence.Signal(u64::MAX).unwrap() };
+        assert!(
+            !wait_fence(&fence, event, 3, true, 10, short),
+            "device removed"
+        );
+        // SAFETY: our event.
+        unsafe { windows::Win32::Foundation::CloseHandle(event).unwrap() };
+    }
 
     fn synthetic_caps(
         sm: D3D_SHADER_MODEL,
