@@ -260,6 +260,10 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Pipelines observed in `>250ms` submissions; lists binding any of them
+    /// run solo (1 list/submit) for WDDM TDR safety while fast lists batch up
+    /// to 16 per submit. Solo lists completing in `<50ms` self-prune.
+    slow_pipelines: Mutex<std::collections::HashSet<String>>,
     /// Direct queue GPU timestamp frequency in ticks/second (for `VICTORY_GPU_TIMESTAMPS`).
     #[cfg(feature = "diagnostics")]
     ts_freq: u64,
@@ -565,6 +569,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            slow_pipelines: Mutex::default(),
             #[cfg(feature = "diagnostics")]
             ts_freq,
         })
@@ -904,17 +909,50 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them. Large multi-list submissions are
-    /// executed in sequential chunks so GPU execution stays well below Windows'
-    /// 2-second WDDM TDR watchdog and copy-back completes between chunks.
+    /// Runs closed lists and waits for them. Fast lists batch up to
+    /// `MAX_LISTS_PER_SUBMIT` (16) to minimize synchronous fence waits,
+    /// redundant shadow refreshes, and pre-GPU snapshots; any list binding a
+    /// pipeline previously seen in a `>250ms` submission is isolated into its
+    /// own solo 1-list submission so it stays well below Windows' 2-second
+    /// WDDM TDR watchdog.
     /// Returns `true` if the GPU fence confirmed completion for all chunks.
     pub(crate) fn execute(&self, runs: &[&HostList]) -> bool {
-        const MAX_LISTS_PER_SUBMIT: usize = 2;
-        if runs.len() <= MAX_LISTS_PER_SUBMIT {
+        const MAX_LISTS_PER_SUBMIT: usize = 16;
+        if runs.len() <= 1 {
             return self.execute_batch(runs);
         }
-        for chunk in runs.chunks(MAX_LISTS_PER_SUBMIT) {
-            if !self.execute_batch(chunk) {
+        let slow = self
+            .slow_pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let is_slow: Vec<bool> = if slow.is_empty() {
+            vec![false; runs.len()]
+        } else {
+            runs.iter()
+                .map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .any(|p| slow.contains(p))
+                })
+                .collect()
+        };
+        drop(slow);
+        let mut i = 0;
+        while i < runs.len() {
+            if is_slow[i] {
+                if !self.execute_batch(&runs[i..=i]) {
+                    return false;
+                }
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < runs.len() && !is_slow[i] && (i - start) < MAX_LISTS_PER_SUBMIT {
+                i += 1;
+            }
+            if !self.execute_batch(&runs[start..i]) {
                 return false;
             }
         }
@@ -1033,12 +1071,32 @@ impl Host {
                         .clone()
                 })
                 .collect();
+            {
+                let mut slow = self
+                    .slow_pipelines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for p in &pipelines {
+                    slow.insert(p.clone());
+                }
+            }
             tracing::warn!(
                 ms = gpu.as_millis(),
                 lists = runs.len(),
                 ?pipelines,
                 "slow host submission"
             );
+        } else if runs.len() == 1 && gpu < std::time::Duration::from_millis(50) {
+            let pipes = runs[0].pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            if !pipes.is_empty() {
+                let mut slow = self
+                    .slow_pipelines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for p in pipes.iter() {
+                    slow.remove(p);
+                }
+            }
         }
         #[cfg(feature = "diagnostics")]
         if completed && self.ts_freq > 0 && gpu_timestamps_on() {
