@@ -943,6 +943,7 @@ pub(crate) fn has_populated_title_data(this: This) -> bool {
     let end = ptr.saturating_add(span);
     let mut cur = ptr;
     while cur < end {
+        // SAFETY: `MEMORY_BASIC_INFORMATION` is a plain Win32 C struct.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: plain VirtualQuery on a title address.
         let queried = unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) };
@@ -3257,6 +3258,7 @@ pub(crate) mod tests {
             "all-zero SRV-only texture remains deferred"
         );
 
+        // SAFETY: closing our open test command list before reset.
         let _ = unsafe { list.list.Close() };
         list.reset();
         assert_eq!(slot::<Release>(srv_tex, 0x10)(srv_tex), 0);
