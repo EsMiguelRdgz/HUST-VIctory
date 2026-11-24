@@ -270,6 +270,13 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// After submissions: shader-written ranges compared and copied back into
+/// title memory (microseconds, changed bytes), since the last frame-rate line.
+static COPY_BACK: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -498,6 +505,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Host COM objects referenced by recorded commands (pipelines, root
+    /// signatures, descriptor heaps, textures), held alive until list reset.
+    kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -605,6 +615,30 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Deduplicate shader-written ranges per shadow across all lists in
+        // this submission, and snapshot pre-GPU bytes before executing so
+        // copy-back writes back only what the GPU actually changed.
+        let mut gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+            Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    if let Some((_, ranges)) = gpu_writes
+                        .iter_mut()
+                        .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+                    {
+                        if !ranges.contains(&(*address, *len)) {
+                            ranges.push((*address, *len));
+                        }
+                    } else {
+                        gpu_writes.push((shadow.clone(), vec![(*address, *len)]));
+                    }
+                }
+            }
+        }
+        for (shadow, ranges) in &gpu_writes {
+            shadow.snapshot_ranges(ranges);
+        }
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         *submitted += 1;
         let prepared = std::time::Instant::now();
@@ -652,15 +686,19 @@ impl Host {
                 last_notes(runs)
             ));
         }
+        let copying_back = std::time::Instant::now();
+        let mut changed_bytes = 0u64;
+        for (shadow, ranges) in &gpu_writes {
+            changed_bytes += shadow.copy_back_ranges(ranges) as u64;
+        }
+        if !gpu_writes.is_empty() {
+            COPY_BACK[0].fetch_add(copying_back.elapsed().as_micros() as u64, Ordering::Relaxed);
+            COPY_BACK[1].fetch_add(changed_bytes, Ordering::Relaxed);
+        }
         for list in runs {
             let deferred = list.deferred();
-            // Before the bottom-of-pipe writes, which tell the title the
-            // GPU is done.
-            for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
-                    shadow.copy_back(*address, *len);
-                }
-            }
+            // After GPU copy-backs, write bottom-of-pipe markers so the title
+            // sees completed GPU writes before observing completion.
             for &(at, what, bytes) in &deferred.writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -899,6 +937,13 @@ impl HostList {
         }
     }
 
+    /// Keeps a host COM object referenced by this list alive until reset.
+    pub(crate) fn keep(&self, object: &impl Interface) {
+        if let Ok(unk) = object.cast::<windows::core::IUnknown>() {
+            self.deferred().kept.push(unk);
+        }
+    }
+
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
@@ -914,6 +959,8 @@ impl HostList {
         match states.entry(resource as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted));
+                drop(states);
+                self.keep(texture);
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -1457,6 +1504,10 @@ impl Meter {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
+        let [cb_ms, cb_mb] = [0, 1].map(|i| {
+            let scale = if i == 0 { 1e3 } else { 1e6 };
+            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+        });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             #[cfg(feature = "diagnostics")]
             let log_frames = f64::from(self.logged_frames.max(1));
@@ -1465,7 +1516,7 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU), {draws:.0} draws/frame"
+                 GPU; copy-back {cb_ms:.1} ms {cb_mb:.1} MB), {draws:.0} draws/frame"
             );
             #[cfg(feature = "diagnostics")]
             crate::copystat::log(log_frames);

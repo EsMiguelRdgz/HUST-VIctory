@@ -413,7 +413,10 @@ impl State {
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .map(|h| {
+                    list.keep(&h.heap);
+                    Some(h.heap.clone())
+                })
                 .collect();
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
@@ -430,11 +433,13 @@ impl State {
                     l.SetGraphicsRootSignature(&p.root);
                 }
             }
+            list.keep(&p.root);
             self.host_roots[usize::from(compute)] = root;
         }
         if self.host_pipeline != self.pipeline {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
+            list.keep(&p.pso);
             self.host_pipeline = self.pipeline;
             list.used_pipeline(&p.name);
         }
