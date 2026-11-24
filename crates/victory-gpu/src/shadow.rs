@@ -166,25 +166,24 @@ impl Shadow {
     }
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
-    /// (unordered access): after the list's submission has run, the range
-    /// is copied back into title memory, where the title reads it; until
-    /// then no refresh copies title memory over it. Call after the
+    /// (unordered access): after the list's submission has run, changed byte
+    /// ranges are copied back into title memory, where the title reads them;
+    /// until then no refresh copies title memory over it. Call after the
     /// [`Shadow::refresh`] that gives the shaders the title's data.
-    ///
-    /// shortcut: the whole range goes back after every submission that
-    /// declares it; copy back only what shaders wrote (a GPU-side dirty
-    /// mask) if big unordered-access buffers make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
-    /// At submission: a submitted list's shaders write this range.
+    /// At submission: a submitted list's shaders write this range. Exact
+    /// duplicates share one copy-back and therefore need only one pending
+    /// entry to suppress refreshes until that copy-back completes.
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
+        let range = (address, address + len);
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if !pending.contains(&range) {
+            pending.push(range);
+        }
     }
 
     /// Before GPU execution: snapshots the union of `ranges` `(address, len)`
@@ -267,17 +266,10 @@ impl Shadow {
                 range_changed = to - from;
             }
             changed_total += range_changed;
-            if range_changed > 0 {
-                let (first, last) = (from.div_ceil(PAGE), to / PAGE);
-                if first < last
-                    && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                    && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-                {
-                    let base = start / PAGE;
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    copied[first - base..last - base].fill(now);
-                }
-            }
+            // Do not advance `copied` for this page. Diff-only copy-back
+            // preserves concurrent title writes at other offsets, so the
+            // whole page is not known to be synchronized with the shadow.
+            // A later refresh must still be allowed to copy those writes.
         }
 
         if let Some((_, buf)) = snapshot {
@@ -608,6 +600,101 @@ mod tests {
             merge_ranges(&[(100, 200), (50, 80), (80, 120), (300, 300), (250, 260)]),
             vec![(50, 200), (250, 260)]
         );
+    }
+
+    #[test]
+    fn duplicate_gpu_writes_do_not_block_later_refreshes() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mut title_mem = vec![0x11u8; 4096];
+        let base = title_mem.as_mut_ptr() as u64;
+        let fake_id = (base as usize) ^ 0xD0D0_5A5A;
+        register(fake_id, base, title_mem.len() as u64);
+
+        let shadow = find(base, 4096).expect("shadow buffer");
+        shadow.update(base as usize, 4096);
+        let range = (base as usize, 4096);
+        shadow.writing(range.0, range.1);
+        shadow.writing(range.0, range.1);
+        assert_eq!(shadow.pending.lock().unwrap().len(), 1);
+
+        // Host::execute snapshots and copies back an exact-unique range once.
+        shadow.snapshot_ranges(&[range]);
+        assert_eq!(shadow.copy_back_ranges(&[range]), 0);
+        assert!(shadow.pending.lock().unwrap().is_empty());
+
+        title_mem[128..136].fill(0x99);
+        shadow.update(range.0, range.1);
+        // SAFETY: inside shadow's live mapping; update must not skip this range.
+        let refreshed = unsafe { std::slice::from_raw_parts(shadow.data.add(128), 8) };
+        assert_eq!(refreshed, &[0x99u8; 8]);
+
+        unregister(fake_id, base);
+        let _ = host_gpu;
+    }
+
+    /// A diff-only copy-back into a write-watched page preserves a concurrent
+    /// title write elsewhere in that page; the page must not then count as
+    /// synchronized, or the next refresh would skip the preserved bytes.
+    #[test]
+    fn copy_back_does_not_mark_watched_pages_fresh() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        assert!(
+            base.is_multiple_of(PAGE),
+            "allocation granularity is 64 KiB"
+        );
+        // SAFETY: the committed page just allocated, used only by this test.
+        let title_mem = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, PAGE) };
+        title_mem.fill(0x11);
+        let fake_id = base ^ 0x5EED_F00D;
+        register(fake_id, base as u64, PAGE as u64);
+
+        let shadow = find(base as u64, PAGE as u64).expect("shadow buffer");
+        assert_eq!(shadow.update(base, PAGE), PAGE);
+        assert_eq!(shadow.watched.load(Ordering::Relaxed), 1);
+        shadow.writing(base, PAGE);
+        shadow.snapshot_ranges(&[(base, PAGE)]);
+
+        // The GPU writes [64, 72) of the copy while the title writes
+        // [200, 208) of its memory, in the same 64 KiB page.
+        // SAFETY: inside the shadow's mapping.
+        unsafe { std::slice::from_raw_parts_mut(shadow.data.add(64), 8).fill(0x77) };
+        title_mem[200..208].fill(0x99);
+
+        assert_eq!(shadow.copy_back_ranges(&[(base, PAGE)]), 8);
+        assert_eq!(&title_mem[64..72], &[0x77u8; 8]);
+        assert_eq!(&title_mem[200..208], &[0x99u8; 8]);
+
+        // The next refresh brings the preserved title bytes into the copy.
+        assert!(shadow.update(base, PAGE) > 0);
+        assert_eq!(shadow.watched.load(Ordering::Relaxed), 1);
+        // SAFETY: inside the shadow's mapping.
+        let copy = unsafe { std::slice::from_raw_parts(shadow.data, PAGE) };
+        assert_eq!(&copy[200..208], &[0x99u8; 8], "title write refreshed");
+        assert_eq!(&copy[64..72], &[0x77u8; 8]);
+
+        unregister(fake_id, base as u64);
+        drop(shadow);
+        // SAFETY: our allocation; the shadow no longer refers to it.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        let _ = host_gpu;
     }
 
     #[test]
