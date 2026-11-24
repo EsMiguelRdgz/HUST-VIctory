@@ -1,26 +1,25 @@
 # Current Project Status
 
 - Current milestone: Phase 10 — memory architecture, copy-back performance, bounded parallelism, GPU acceleration, resource budgeting, and robustness
-- Current subphase: Phase 10 priorities 1-3 and 5 (reclamation) VERIFIED and committed; next: copy-back performance/timing split (priority 6), then bounded CPU parallelism (7) and GPU evaluation (8)
+- Current subphase: Phase 10 priorities 1-7 implemented and verified by tests (no hardware measurements); next: priority 8 GPU-acceleration evaluation, then remaining allocation audit and the final verification matrix
 - Current branch: `hust/nvidia-rtx3070`
-- Latest verified commit: `ba4cb15` (descriptor ownership + reclamation). Phase 10 commits: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`, `13c97ad`, `ec38425`, `7036da9`, `ba4cb15`
+- Latest verified commit: `341fbd6`. Phase 10 commits: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`, `13c97ad`, `ec38425`, `7036da9`, `ba4cb15`, `2798f11`, `6e0728c`, `e9d3629`, `ac7525f`, `341fbd6`
 - Current working-tree status: clean except this progress.md checkpoint (committed with the next change)
 - Active agent: Claude Code
 - Model: Claude Opus 5.5
 - Last checkpoint timestamp: 2026-11-23 (Claude recovery checkpoint)
 - Current build status: PASS (`cargo test --workspace --no-run`)
-- Current test status: `cargo test -p victory-gpu` 63/63, 40 parallel stress runs 0 failures at `ba4cb15`; workspace run in progress
+- Current test status: `cargo test -p victory-gpu` 67/67; 250 parallel stress runs 0 failures (after `e9d3629`); last workspace run 250/0/3 at `ba4cb15`
 
 ## Active Task
 
-- Objective: Priority 6 — copy-back correctness/performance: separate timing of snapshot memcpy, diff scan, title writes (WriteProcessMemory), and reduce snapshot envelope amplification (snapshot covers min..max of all ranges incl. gaps).
-- Current implementation: NOT_STARTED.
-- Plan: (a) per-segment snapshots — `Snapshot` stores the merged ranges' bytes only (Vec of (offset,len) segments into one buffer) instead of the min..max envelope; (b) `COPY_BACK` split into snapshot/diff/write microseconds and snapshot bytes, reported on the frame-rate line; (c) only then consider parallel diff for large ranges (priority 7).
-- Known risks: none yet.
+- Objective: Priority 8 — evaluate GPU-accelerated resource processing (texture detiling/upload, GPU-side copy-back dirty detection) and implement only where justified.
+- Current implementation: NOT_STARTED (evaluation).
+- Known risks: no hardware measurements exist; any GPU path must keep the CPU path as fallback and be measured on an authorized run before being made default.
 
 ## Immediate Resume Instructions
 
-- First action: confirm the workspace test result for `ba4cb15` is recorded in Completed Tasks (rerun `cargo test --workspace` if not), then start the Priority 6 plan in Active Task (`shadow.rs` `snapshot_ranges`/`copy_back_ranges`, `host.rs` `COPY_BACK` and the `Meter::frame` log line).
+- First action: read `crates/victory-gpu/src/texture.rs` upload/detile path and record a priority-8 evaluation (what is CPU-bound, data sizes, D3D12 mechanism, risk) in Completed/Incomplete Tasks.
 - Then: Priority 6 copy-back timing split (snapshot memcpy vs diff vs WriteProcessMemory), Priority 7 bounded CPU parallelism, Priority 8 GPU-side evaluation.
 - Pending tests: focused tests for each change, `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets`, `cargo build --profile diag -p victory --features diagnostics`.
 - Known blockers: none. Verified local commits are pre-authorized (AGENTS.md); pushes/destructive Git still need the user.
@@ -74,11 +73,16 @@
 
 - VERIFIED — Priority 4/5 investigation + reclamation (`ba4cb15`). Findings: (1) descriptor slots (`descriptor/host.rs` `make_on`) were created on shadow host buffers without holding an `Arc`, which is why loose/aligned copies could never be freed safely; every other GPU-address use (root views, VB/IB, table refreshes) holds the `Arc` via the list. (2) `loose()` looked up windows by exact `(start,len)`, so a request spanning a window boundary created an overlapping duplicate copy of the same title memory (memory amplification + divergent copies). (3) Every title buffer object gets a full-size host copy in a CUSTOM write-back L0 heap (system-memory commit ≈ total size of title buffers used by draws) — architectural, unchanged, a prime suspect for high commit; measure with the new `host memory` line. Changes: `HostHeap.owners: HashMap<u32, Arc<Shadow>>` keeps loose/aligned copies a slot shows (`make_owned`, set in `mirror`/`make_at`, cleared in `make_null`/`make_null_for`/`release`); buffer-object copies keep free-at-unregister lifetime. `reclaim()` frees idle copies (strong_count==1, no pending writes) LRU-first past `LOOSE_BUDGET` 512 MiB / `ALIGNED_BUDGET` 256 MiB (unmeasured defaults); loose lookup now uses containment. Tests: `reclaim_frees_only_idle_copies_oldest_first`, `loose_requests_inside_a_window_share_it`, `slots_keep_the_copies_they_need_alive`. `cargo test -p victory-gpu` 63/63; 40 stress runs 0 failures; clippy both feature sets only the old warning.
 
+- VERIFIED — Workspace at `ba4cb15`: `cargo test --workspace` 250 passed / 0 failed / 3 ignored.
+- VERIFIED — Priority 6 copy-back (`6e0728c`): snapshots hold merged written ranges only (segments), not the min..max envelope; `copy_back_timed` returns write microseconds; frame-rate line now prints `copy-back X ms Y MB, of it writes Z ms; snapshots A ms B MB`. Test `snapshots_hold_only_the_written_ranges`. 64/64.
+- VERIFIED — Priority 7 bounded CPU parallelism (`ac7525f`): new `crates/victory-gpu/src/par.rs` (`workers()` = hw threads-1 capped at 4, env `VICTORY_COPY_WORKERS`; `for_each` runs on caller below threshold, else scoped threads + atomic index, nothing retained). `Batch::flush` uses it for batches >= 8 MiB (`PARALLEL_REFRESH`, unmeasured). Copy-back intentionally left serial (nested shadows may write the same title bytes). Tests in `par::tests`. 67/67.
+- FAILED → FIXED — Stress after `ac7525f` showed `watch::tests::written_pages_are_reported_to_every_asker` failing 2/200 (`before.is_empty()` at watch.rs:315). Cause: my Phase 10 test `copy_back_does_not_mark_watched_pages_fresh` freed its write-watched page; the process-wide watch journal keeps entries for freed pages, so the reused address looked written. Fixed in test only (`e9d3629`: keep the page). 0/250 afterwards. Production impact of stale journal entries: only extra copies, never skipped ones (new shadows start with copied=0).
+
 ## Incomplete Tasks
 
 - IN_PROGRESS — Remaining Priority A: shadow lifetime audit DONE (see Completed); snapshot pool bounded DONE; remaining: staging/scratch/upload allocations in `host.rs` (`list.scratch`, texture uploads) audit and allocation-failure handling.
-- NOT_STARTED — Priority B measurement: separate scanning, snapshot memcpy, comparison, title writes, page protection, fence API/event waits, synchronization, and temporary allocation costs.
-- NOT_STARTED — Priority C: evaluate justified bounded CPU parallelism with duplicate-job and memory-growth controls.
+- IN_PROGRESS — Priority B measurement: snapshot memcpy, compare vs title-write split DONE (`6e0728c`); page protection/watch query time already in diagnostics copystat; remaining: authorized hardware run to read the numbers.
+- IMPLEMENTED_UNVERIFIED (hardware) — Priority C bounded CPU parallelism for refresh batches (`ac7525f`); unit-verified, speedup unmeasured.
 - NOT_STARTED — Priority D: evaluate documented D3D12 compute/copy-queue acceleration and GPU-local intermediates where measurements justify them.
 - NOT_STARTED — Priority E: process/system/DXGI memory reporting, bounded caches, temporary reuse, and safe reclamation.
 - NOT_STARTED — Priority F: evidence-based allocation/null/partial-initialization robustness audit.
