@@ -1,15 +1,14 @@
 # Current Project Status
 
-- Current milestone: Phase 11 — P0 RAM / system-commit exhaustion investigation (supersedes Phase 10 performance tuning)
-- Current subphase: Phase 11 offline investigation COMPLETE (A-F); awaiting one controlled, instrumented hardware diagnostic run (see Phase 11 GO/NO-GO)
-- Current branch: `hust/nvidia-rtx3070`
-- Latest verified commit: `57676e4` (Phase 11 commits: `c7564ce`, `5f2044c`, `83e9969`, `de0870e`, `a773911`, `d197be5`, `df5ac87`, `57676e4`, plus this progress commit)
+- Current milestone: Phase 12 — NVIDIA RTX 3070 Memory Compatibility (lazy host textures, placed/idle texture eviction, buffer shadow reclamation, non-double-counted commit accounting)
+- Current subphase: Phase 12 offline engineering COMPLETE (A–H); READY for one controlled, instrumented hardware diagnostic run (NO-GO for gameplay/stress testing)
+- Current branch: `hust/phase12-memory` (branched from clean `5237d80` on `hust/nvidia-rtx3070`)
+- Latest verified commit: `c94fb30` (Phase 12 commits: `628059e`, `0ffbeb1`, `802a903`, `d6ba227`, `d08a472`, `c94fb30`, plus this progress checkpoint; preserves all Phase 1–11 commits through `5237d80`)
 - Current working-tree status: clean except this checkpoint
-- Active agent: Claude Code
-- Model: Claude Opus 5.5
-- Last checkpoint timestamp: 2026-11-23 (Phase 11 start)
+- Active agent: Antigravity
+- Last checkpoint timestamp: 2026-11-23 (Phase 12 complete offline)
 - Current build status: diag build OK (`target/diag/victory.exe`, not launched)
-- Current test status: full matrix PASSED at `57676e4` (workspace 267 passed / 0 failed / 7 ignored: 3 external-data + 4 Phase 11 benchmarks; policy 152 ok; clippy both configs only the pre-existing `list.rs:1430` warning; diag build OK)
+- Current test status: full matrix PASSED at `c94fb30` (workspace `278 passed / 0 failed / 8 ignored`: 3 external-data + 5 benchmarks; WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` `90 passed / 0 failed / 4 ignored`, 0 debug layer errors; `cargo xtask policy` 152 files ok; clippy both configs 0 new warnings, only pre-existing `list.rs:1441`; diag build OK)
 
 ## Phase 11 trigger (user report, RTX 3070 test 1)
 
@@ -51,20 +50,24 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 
 ## Active Task
 
-- Objective: none in progress; Phase 11 offline work complete.
+- Objective: none in progress; Phase 12 offline work complete (all commits verified at `c94fb30`, full report written to `G:\VIctory-Results\memory-investigation\phase12-progress.md`).
 
 ## Immediate Resume Instructions
 
-- First action: when the user provides the controlled-run memory report, record per-category numbers here and rank them.
-- Next implementation step (evidence-dependent): if `host textures` dominate, create host textures lazily on first GPU use (`resource.rs` texture creation; all `host_resource()` callers must tolerate creation on demand); if `buffer copies` dominate, evaluate `ID3D12Device3::OpenExistingHeapFromAddress` to let the GPU read title memory directly instead of full host copies (architectural; decision 0007 revision); if `title heaps` dominate, consider routing CreateHeap memory through the title allocator/xmem like committed resources.
-- Pending tests: hardware diagnostic run (manual). Benchmarks: `cargo test -p victory-gpu --lib bench_ -- --ignored --test-threads=1 --nocapture`, `cargo test -p victory-hle --lib bench_ -- --ignored --test-threads=1 --nocapture` (set `VICTORY_MEMORY_REPORT_DIR` to also write the report).
-- Known blockers: none offline.
-- Remaining risks: commit guard ends the run (by design) when the whole system is near its commit limit, including pressure caused by other processes; `XMemGetWorkingSetStatistics.title_used` reports process private bytes (includes host copies, excludes section pages) — may mislead the title's budgeting; host textures for every title texture are created eagerly.
+- First action: wait for the user's controlled RTX 3070 hardware run (`target\diag\victory.exe` with `VICTORY_MEMORY_REPORT_DIR=G:\VIctory-Results\memory-investigation`, debug layer / DRED / capture OFF, commit guard ON, unnecessary background apps closed) and inspect the resulting `memory-<unix>.log` (`commit breakdown`, `host textures`, `deferred textures`, `lazy materializations`, `textures evicted`, `buffer copies`, `guest physical`, `GPU local/non-local`).
+- Next implementation step (evidence-dependent):
+  - If `host textures` drops substantially and GTA VI progresses further, verify rendering correctness and check whether `buffer copies` or `untracked private` becomes the next bottleneck.
+  - If visual artifacts appear with lazy textures, A/B test with `VICTORY_LAZY_TEXTURES=0` to isolate lazy deferral vs eviction.
+  - If `buffer copies` grows large in later gameplay, evaluate Phase 13 `ID3D12Device3::OpenExistingHeapFromAddress` (probe confirmed RTX 3070 support with `ALLOW_CROSS_ADAPTER`, pending safe `VirtualFree`/`MEM_DECOMMIT` and sparse-hole handling).
+- Pending tests: manual controlled hardware diagnostic run (not launched by agent). Synthetic benchmarks: `cargo test -p victory-gpu --lib bench_ -- --ignored --test-threads=1 --nocapture` and `cargo test -p victory-hle --lib bench_ -- --ignored --test-threads=1 --nocapture`.
+- Known blockers: none offline. Note: other host processes held ~27 GB of the 46.5 GB system commit limit in Phase 11 logs; close heavy non-essential apps before hardware validation.
+- Remaining risks: actual ratio of unused vs live textures during GTA VI boot/world load is unverified until measured on hardware; NVIDIA WDDM retains a bounded driver reuse pool after `DEFAULT` texture release; bindless `ResourceDescriptorHeap[]` SRV reads on never-written deferred textures see typed NULL descriptors until first materialization; `DXGI_ERROR_DEVICE_HUNG` post-memory changes remains unverified on hardware.
 - Commands required:
   - `cargo xtask policy`
   - `cargo test --workspace`
+  - `VICTORY_D3D12_WARP=1 VICTORY_D3D12_DEBUG=1 cargo test -p victory-gpu --features diagnostics`
   - `cargo clippy --workspace --all-targets`
-  - `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets`
+  - `cargo clippy --workspace --all-targets --features diagnostics`
   - `cargo build --profile diag -p victory --features diagnostics`
 
 ## Completed Tasks
@@ -175,3 +178,18 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 - Starting commit: `05d6207`; tree clean; AGENTS.md/CLAUDE.md/progress.md present.
 - In progress: see Phase 11 sections above.
 - Phase 11 outcome: offline investigation complete; commits `c7564ce`..`57676e4`; GO for one controlled instrumented diagnostic run, NO-GO for gameplay testing; RAM problem NOT claimed fixed.
+
+### 2026-11-23 — Antigravity — Phase 12 NVIDIA RTX 3070 memory compatibility (complete offline)
+
+- Starting commit: `5237d80` (clean tree on `hust/nvidia-rtx3070`; all Phase 1–11 commits present).
+- Working branch: `hust/phase12-memory` (commits `628059e`, `0ffbeb1`, `802a903`, `d6ba227`, `d08a472`, `c94fb30`, plus this progress checkpoint).
+- Root cause confirmed from Phase 11 logs (`memory-1795488971/8996/9019.log`): VIctory non-double-counted commit reached ~18.55 GB (`private 11.46 GB + guest physical 7.09 GB`), pushing total system commit to 45.5–45.8/46.5 GB (<1 GB headroom) with ~13 GB RAM and ~2.8 GB VRAM budget still free. The dominant avoidable spike was `host textures` jumping from 68 (403.9 MB) to 1,209–1,210 (4,326.9 MB, WDDM-backed 1:1 in private/system commit) in 5 s during boot while `texture staging pool hits/misses = 0/1..0/103`.
+- Implemented fixes:
+  - `628059e`: Non-double-counted `commit_breakdown()`, `Kind::DeferredTexture`, `LazyMaterializations`/`TexturesEvicted` events, split `title_private`/`title_mapped`/`mapped_aliased`, `HostCaps::existing_heaps`.
+  - `0ffbeb1`: Lazy `host_texture` materialization on first GPU use (`VICTORY_LAZY_TEXTURES=0` rollback switch), deferred shader-visible texture descriptors with automatic backfill on materialization + bindless UAV flush (`HostPipeline::uses_resource_heap`), non-materializing barrier/diagnostics/view-format paths.
+  - `802a903`: `HostHeap::tex_owners` COM lifetime & slot invalidation, lock-free `Resource::list_guard`, `title_memory_remapped` -> `PLACED_TEXTURES` remap eviction + 512 MiB LRU budget, and idle title-written host texture eviction under `relieve_pressure()` (with upload-state reset for lossless re-upload).
+  - `d6ba227`: `Kind::Buffer` slot ownership + idle `BUFFERS` shadow reclamation under `relieve_pressure()`, `HostList::keep()` COM-pointer dedup, `HostList::scratch` trimming on reset.
+  - `d08a472` & `c94fb30`: Phase F synthetic tests (1,250 deferred aliased textures, 20-cycle alloc/evict/release stability, before/after commit benchmark, isolated `OpenExistingHeapFromAddress` probe).
+- Synthetic measurements (RTX 3070): 256 × 4 MiB textures BEFORE (eager) `+1,017 MiB` commit / `+1,028 MiB` private / `+1,024 MiB` GPU local vs AFTER (lazy 0/256 used + 256 SRVs) `0 MiB` commit / `0 MiB` private / `0 MiB` GPU local, and 16/256 used `+66 MiB` commit (-93.5%); 64 × 4 MiB idle eviction freed `256 MiB -> 0 MiB` live `HostTexture`. `OpenExistingHeapFromAddress` probe confirmed `existing_heaps=true` with `ALLOW_CROSS_ADAPTER` required on RTX 3070 (buffers only; deferred to Phase 13 due to guest unmap/sparse-hole safety requirements).
+- Full Phase G verification at `c94fb30`: `cargo xtask policy` (`152 files ok`); `rustfmt --edition 2024 --check` + `git diff --check` clean; `cargo test --workspace` (`278 passed, 0 failed, 8 ignored`); WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` (`90 passed, 0 failed, 4 ignored`, 0 debug errors); `cargo clippy --workspace --all-targets` & `--features diagnostics` (0 new warnings; only pre-existing `list.rs:1441`); `cargo build --profile diag -p victory --features diagnostics` OK (`target/diag/victory.exe`, not launched).
+- Status: READY for one controlled hardware diagnostic run (see `G:\VIctory-Results\memory-investigation\phase12-progress.md`). Real GTA VI memory reduction remains UNVERIFIED until measured on hardware.
