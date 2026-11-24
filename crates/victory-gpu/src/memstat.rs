@@ -368,11 +368,41 @@ pub fn pressure_floor(limit: u64) -> u64 {
     (2u64 << 30).max(limit / 20)
 }
 
+/// Effective runtime pressure floor in bytes: defaults to at least `6 GiB`
+/// (capped at 25% of total commit limit so small systems stay proportional)
+/// and at least [`pressure_floor`], or `VICTORY_PRESSURE_FLOOR_MB` when set.
+/// Starting proactive reclamation around 6 GiB headroom reclaims idle host
+/// copies/textures before Windows paging pressure or a 5 GiB safety guard hits.
+pub fn effective_pressure_floor(limit: u64) -> u64 {
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let custom = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_PRESSURE_FLOOR_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|mb| mb << 20)
+    });
+    if let Some(bytes) = custom {
+        return bytes.min(limit / 2);
+    }
+    pressure_floor(limit).max((6u64 << 30).min(limit / 4))
+}
+
 /// Whether committing `incoming` more bytes would leave the system less
-/// than [`pressure_floor`] of commit headroom (false if it cannot tell).
+/// than [`effective_pressure_floor`] of commit headroom (false if it cannot tell).
 pub fn under_pressure(incoming: u64) -> bool {
     system_commit().is_some_and(|(total, limit)| {
-        limit.saturating_sub(total).saturating_sub(incoming) < pressure_floor(limit)
+        limit.saturating_sub(total).saturating_sub(incoming) < effective_pressure_floor(limit)
+    })
+}
+
+/// How many bytes pressure reclamation should target freeing to restore
+/// `effective_pressure_floor(limit) + 512 MiB` of headroom after `incoming`.
+pub fn pressure_deficit(incoming: u64) -> u64 {
+    const HYSTERESIS: u64 = 512 << 20;
+    system_commit().map_or(incoming, |(total, limit)| {
+        let target_headroom = effective_pressure_floor(limit).saturating_add(HYSTERESIS);
+        let after = limit.saturating_sub(total).saturating_sub(incoming);
+        target_headroom.saturating_sub(after).max(incoming)
     })
 }
 
@@ -765,10 +795,16 @@ mod tests {
     fn pressure_needs_less_headroom_than_the_floor() {
         assert_eq!(pressure_floor(10 << 30), 2 << 30);
         assert_eq!(pressure_floor(100 << 30), 5 << 30);
+        if std::env::var_os("VICTORY_PRESSURE_FLOOR_MB").is_none() {
+            assert_eq!(effective_pressure_floor(10 << 30), (10u64 << 30) / 4);
+            assert_eq!(effective_pressure_floor(40 << 30), 6 << 30);
+            assert_eq!(effective_pressure_floor(160 << 30), 8 << 30);
+        }
         assert!(
             under_pressure(u64::MAX / 2),
             "an impossible size is pressure"
         );
+        assert!(pressure_deficit(u64::MAX / 2) >= u64::MAX / 2);
     }
 
     /// A tracked object's bytes are counted until the object is destroyed.

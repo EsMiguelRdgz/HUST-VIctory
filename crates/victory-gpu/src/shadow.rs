@@ -357,29 +357,34 @@ impl Shadow {
         let merged = merge_ranges(&self.clamp(ranges));
         let mut changed_total = 0usize;
         let mut writing = std::time::Duration::ZERO;
-        let mut write = |at: usize, from: *const u8, len: usize| {
-            let started = std::time::Instant::now();
-            crate::kernel_will_write(at, len);
-            crate::host::write_mapped(at as *mut u8, from, len);
-            writing += started.elapsed();
-        };
-
         for &(from, to) in &merged {
             let from_off = from - start;
             let to_off = to - start;
             // SAFETY: `[from_off, to_off)` lies inside this shadow's mapping.
             let after = unsafe { std::slice::from_raw_parts(self.data.add(from_off), to - from) };
             if let Some(before) = snapshot.and_then(|s| s.get(from_off, to_off)) {
-                for (run_start, run_end) in diff_runs(before, after) {
-                    write(
-                        from + run_start,
-                        after[run_start..].as_ptr(),
-                        run_end - run_start,
-                    );
-                    changed_total += run_end - run_start;
+                let runs = diff_runs(before, after);
+                if let (Some(&(first_start, _)), Some(&(_, last_end))) = (runs.first(), runs.last())
+                {
+                    let started = std::time::Instant::now();
+                    // Prepare the covering changed span once (demand-commit +
+                    // open write-watch guards) instead of locking per diff run.
+                    crate::kernel_will_write(from + first_start, last_end - first_start);
+                    for (run_start, run_end) in runs {
+                        crate::host::write_mapped_prepared(
+                            (from + run_start) as *mut u8,
+                            after[run_start..].as_ptr(),
+                            run_end - run_start,
+                        );
+                        changed_total += run_end - run_start;
+                    }
+                    writing += started.elapsed();
                 }
             } else {
-                write(from, after.as_ptr(), to - from);
+                let started = std::time::Instant::now();
+                crate::kernel_will_write(from, to - from);
+                crate::host::write_mapped_prepared(from as *mut u8, after.as_ptr(), to - from);
+                writing += started.elapsed();
                 changed_total += to - from;
             }
             // Do not advance `copied` for this page. Diff-only copy-back
@@ -706,15 +711,19 @@ pub(crate) fn relieve_pressure(incoming: u64) -> u64 {
         *last = Some(std::time::Instant::now());
     }
     memstat::count(memstat::Event::PressureReclaims, 1);
+    let target = memstat::pressure_deficit(incoming);
     let mut freed = 0;
     for map in [&LOOSE, &ALIGNED] {
         let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
         freed += reclaim(&mut map, u64::MAX / 2, 0, 0);
     }
-    freed += reclaim_buffers(incoming);
+    freed += reclaim_buffers(target.saturating_sub(freed));
     freed += drain_snapshot_pool();
     freed += crate::texture::drain_pools();
-    freed += crate::resource::evict_idle_textures(incoming);
+    let remaining = target.saturating_sub(freed);
+    if remaining > 0 || incoming == 0 {
+        freed += crate::resource::evict_idle_textures(if incoming == 0 { 0 } else { remaining });
+    }
     let headroom = memstat::system_commit().map(|(total, limit)| limit.saturating_sub(total));
     tracing::warn!(
         incoming,

@@ -1151,6 +1151,12 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        // Now that this list's `kept` refs and bindless pins are dropped,
+        // proactively relieve commit pressure between submissions (rate-limited
+        // to once per second inside `relieve_pressure`).
+        if crate::memstat::under_pressure(0) {
+            crate::shadow::relieve_pressure(1);
+        }
     }
 
     /// Keeps a host COM object referenced by this list alive until reset
@@ -1723,8 +1729,10 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 }
 
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+/// wrote), leaving pages that are not mapped alone. Callers must first ensure
+/// the covering range is committed and write-watch guards are open via
+/// `kernel_will_write`.
+pub(crate) fn write_mapped_prepared(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let write = |at: usize, n: usize| {
@@ -1737,7 +1745,6 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 {
         return;
     }
-    crate::ensure_title_committed(dst as usize, len);
     if write(dst as usize, len) {
         return;
     }

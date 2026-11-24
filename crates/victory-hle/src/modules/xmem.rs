@@ -269,6 +269,33 @@ pub(crate) fn on_virtual_free(address: *mut c_void, size: usize, free_type: u32)
     }
 }
 
+/// Lock-free fast check: returns `true` if every OS page in `[at, end)` is
+/// already `MEM_COMMIT` (walking at most 16 contiguous regions so huge sparse
+/// ranges fall back to the tracked maps). Avoids contending on `PHYSICAL` and
+/// `DEMAND_PRIVATE` locks during hot `ReadFile` / `WriteFile` / GPU copy-back
+/// calls targeting already-committed title memory.
+fn already_all_committed(at: usize, end: usize) -> bool {
+    let mut cur = at & !(OS_PAGE - 1);
+    for _ in 0..16 {
+        if cur >= end {
+            return true;
+        }
+        // SAFETY: plain `VirtualQuery` output struct.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid output pointer of the right size.
+        let n = unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 || info.State != MEM_COMMIT {
+            return false;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= cur {
+            return false;
+        }
+        cur = next;
+    }
+    cur >= end
+}
+
 /// Commits any untouched `MEM_RESERVE | MEM_PRIVATE` pages inside tracked
 /// demand-private ranges overlapping `[at, at + len)`.
 pub(crate) fn ensure_private_committed(at: usize, len: usize) {
@@ -276,6 +303,9 @@ pub(crate) fn ensure_private_committed(at: usize, len: usize) {
         return;
     }
     let end = at.saturating_add(len);
+    if already_all_committed(at, end) {
+        return;
+    }
     let dp = demand_private();
     let overlaps = dp.overlaps(at, end);
     if overlaps.is_empty() {
@@ -1064,6 +1094,9 @@ pub fn ensure_committed(at: usize, len: usize) {
         return;
     }
     let end = at.saturating_add(len);
+    if already_all_committed(at, end) {
+        return;
+    }
     let mut remapped = Vec::new();
     {
         let physical = physical();
