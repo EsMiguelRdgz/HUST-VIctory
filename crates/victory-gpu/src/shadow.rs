@@ -359,7 +359,7 @@ impl Shadow {
         let mut writing = std::time::Duration::ZERO;
         let mut write = |at: usize, from: *const u8, len: usize| {
             let started = std::time::Instant::now();
-            crate::watch::writing(at, len);
+            crate::kernel_will_write(at, len);
             crate::host::write_mapped(at as *mut u8, from, len);
             writing += started.elapsed();
         };

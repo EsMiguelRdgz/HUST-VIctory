@@ -111,8 +111,58 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Extra gamepad buttons injected by scripted diagnostics (`VICTORY_KEYS`),
+    /// merged into the active gamepad (connected physical XInput pad or fallback).
+    fn scripted_pad_buttons(&mut self) -> u32 {
+        0
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+}
+
+/// Parses one scripted token from `VICTORY_KEYS=<seconds>:<token>,...` into
+/// `(optional_virtual_key, gamepad_button_mask)`.
+///
+/// Explicit controller button tokens (`PadA`, `PadB`, `PadX`, `PadY`, `PadMenu`,
+/// `Start`, `PadView`, `PadUp`, `PadDown`, `PadLeft`, `PadRight`, `PadLB`,
+/// `PadRB`) map directly to Xbox controller buttons, while keyboard tokens
+/// (`Enter`, `Esc`, `Tab`, `Back`, arrows, single alphanumerics) also carry
+/// their stand-in gamepad button mapping so scripted progression works whether
+/// or not a physical XInput controller is plugged in.
+#[cfg(any(test, feature = "diagnostics"))]
+fn parse_scripted_token(token: &str) -> Option<(Option<u8>, u32)> {
+    let t = token.trim();
+    match t {
+        "PadA" | "GamepadA" => Some((None, A)),
+        "PadB" | "GamepadB" => Some((None, B)),
+        "PadX" | "GamepadX" => Some((None, X)),
+        "PadY" | "GamepadY" => Some((None, Y)),
+        "PadMenu" | "Start" | "Menu" => Some((None, MENU)),
+        "PadView" | "View" => Some((None, VIEW)),
+        "PadUp" => Some((None, UP)),
+        "PadDown" => Some((None, DOWN)),
+        "PadLeft" => Some((None, LEFT)),
+        "PadRight" => Some((None, RIGHT)),
+        "PadLB" | "LB" => Some((None, LEFT_SHOULDER)),
+        "PadRB" | "RB" => Some((None, RIGHT_SHOULDER)),
+        "Enter" => Some((Some(0x0D), A)),
+        "Esc" => Some((Some(0x1B), MENU)),
+        "Tab" => Some((Some(0x09), VIEW)),
+        "Back" => Some((Some(0x08), B)),
+        "Up" => Some((Some(0x26), UP)),
+        "Down" => Some((Some(0x28), DOWN)),
+        "Left" => Some((Some(0x25), LEFT)),
+        "Right" => Some((Some(0x27), RIGHT)),
+        k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+            let vk = k.as_bytes()[0].to_ascii_uppercase();
+            let btn = FALLBACK_BUTTONS
+                .iter()
+                .find_map(|&(fvk, bit)| (fvk == vk).then_some(bit))
+                .unwrap_or(0);
+            Some((Some(vk), btn))
+        }
+        _ => None,
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -401,12 +451,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, scripted_buttons) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.scripted_pad_buttons())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self
+            .state()
+            .poll(&self.devices, pads, keys, scripted_buttons);
         self.deliver(events);
     }
 
@@ -449,16 +501,27 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted_buttons: u32,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let any_pad = pads.iter().any(Option::is_some);
+        let first_pad = pads.iter().position(Option::is_some);
+        if scripted_buttons != 0
+            && let Some(slot) = first_pad
+            && let Some(ref mut pad) = pads[slot]
+        {
+            pad.buttons |= scripted_buttons;
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = first_pad.is_none().then(|| {
+            let mut pad = fallback(&keys);
+            pad.buttons |= scripted_buttons;
+            Value::Pad(pad)
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -818,7 +881,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -1149,7 +1215,7 @@ mod host {
 
         fn keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
+            let mut down = scripted_active().0;
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
             if focused() {
@@ -1174,6 +1240,17 @@ mod host {
                 .collect()
         }
 
+        fn scripted_pad_buttons(&mut self) -> u32 {
+            #[cfg(feature = "diagnostics")]
+            {
+                scripted_active().1
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            {
+                0
+            }
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1184,43 +1261,74 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+    struct ScriptEntry {
+        at: Duration,
+        token: String,
+        vk: Option<u8>,
+        buttons: u32,
+        logged: std::sync::atomic::AtomicBool,
+    }
+
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<token>,...` holds each input for
+    /// 0.3 s that long after input starts, with or without focus. Supports
+    /// explicit Xbox gamepad buttons (`PadA`, `PadB`, `PadX`, `PadY`, `Start`,
+    /// `PadMenu`, `PadView`, `PadUp`, `PadDown`, `PadLeft`, `PadRight`, `PadLB`,
+    /// `PadRB`) and keyboard tokens (`Enter`, `Esc`, `Tab`, `Back`, arrows,
+    /// alphanumerics), injecting gamepad buttons into whichever pad is active
+    /// (physical XInput pad if connected, or the stand-in fallback pad).
+    #[cfg(feature = "diagnostics")]
+    fn scripted_active() -> (Vec<u8>, u32) {
+        static SCRIPT: LazyLock<(Instant, Vec<ScriptEntry>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+            let entries: Vec<ScriptEntry> = list
+                .split(',')
+                .filter_map(|entry| {
+                    let (at, token) = entry.split_once(':')?;
+                    let (vk, buttons) = parse_scripted_token(token)?;
+                    Some(ScriptEntry {
+                        at: Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                        token: token.trim().to_owned(),
+                        vk,
+                        buttons,
+                        logged: std::sync::atomic::AtomicBool::new(false),
+                    })
+                })
+                .collect();
+            if !entries.is_empty() {
+                tracing::info!(
+                    count = entries.len(),
+                    schedule = %list,
+                    "scripted input schedule loaded"
+                );
+            }
+            (Instant::now(), entries)
         });
-        let (start, keys) = &*SCRIPT;
+        let (start, entries) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        let mut keys = Vec::new();
+        let mut buttons = 0u32;
+        for entry in entries {
+            if (entry.at..entry.at + Duration::from_millis(300)).contains(&now) {
+                if !entry
+                    .logged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::info!(
+                        at_sec = format_args!("{:.2}", entry.at.as_secs_f64()),
+                        token = %entry.token,
+                        pad_buttons = format_args!("{:#x}", entry.buttons),
+                        vk = ?entry.vk,
+                        "scripted input injected"
+                    );
+                }
+                if let Some(vk) = entry.vk {
+                    keys.push(vk);
+                }
+                buttons |= entry.buttons;
+            }
+        }
+        (keys, buttons)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1270,6 +1378,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted_buttons: u32,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1281,6 +1390,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn scripted_pad_buttons(&mut self) -> u32 {
+            self.0.lock().unwrap().scripted_buttons
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1510,6 +1622,42 @@ mod tests {
     }
 
     #[test]
+    fn scripted_xbox_a_injects_into_connected_physical_pad_and_fallback() {
+        assert_eq!(parse_scripted_token("PadA"), Some((None, A)));
+        assert_eq!(parse_scripted_token("Enter"), Some((Some(0x0D), A)));
+        assert_eq!(parse_scripted_token("PadB"), Some((None, B)));
+        assert_eq!(parse_scripted_token("Start"), Some((None, MENU)));
+
+        // Case 1: No physical pad connected -> injects A into fallback pad.
+        let (hub, host) = fake();
+        host.lock().unwrap().scripted_buttons = A;
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r).buttons, A);
+        release(r);
+
+        // Case 2: Physical XInput pad connected in slot 1 (matching RTX 3070
+        // test machine) -> injects A directly into slot 1 while preserving
+        // any physical button state, and disconnects fallback pad.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: UP,
+            ..Default::default()
+        });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(r).buttons, UP | A);
+        release(r);
+        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(READING_NOT_FOUND));
+
+        // Releasing scripted buttons returns slot 1 to physical state only.
+        host.lock().unwrap().scripted_buttons = 0;
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(r).buttons, UP);
+        release(r);
+    }
+
+    #[test]
     fn async_enumeration_waits_for_the_poll_and_unregistering_stops_callbacks() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1564,7 +1712,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1573,7 +1730,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);

@@ -18,9 +18,9 @@ use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_MAPPED,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READWRITE,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
-    VirtualQueryEx,
+    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc,
+    VirtualAlloc2, VirtualFree, VirtualQuery, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -448,6 +448,9 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Reverse index from `section.handle as usize` to `(view_base, view_len, slice_index)`
+    /// for O(1) active-view lookup during `write_physical` (avoids O(views) scan).
+    section_views: HashMap<usize, Vec<(usize, usize, usize)>>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -574,25 +577,26 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
                 .copy_from_nonoverlapping(data[done..].as_ptr(), n);
             UnmapViewOfFile(view);
         }
-        if newly_committed {
-            let mut remapped = Vec::new();
-            {
-                let physical = physical();
-                for (&view_base, &(view_len, ref vslice)) in &physical.views {
-                    if Arc::ptr_eq(&vslice.section, &slice.section) {
-                        let pages_in_view = view_len / PAGE;
-                        if slice.index >= vslice.index && slice.index < vslice.index + pages_in_view
-                        {
-                            let addr = view_base + (slice.index - vslice.index) * PAGE;
+        let mut remapped = Vec::new();
+        {
+            let physical = physical();
+            if let Some(views) = physical.section_views.get(&(slice.section.handle as usize)) {
+                for &(view_base, view_len, view_slice_index) in views {
+                    let pages_in_view = view_len / PAGE;
+                    if slice.index >= view_slice_index
+                        && slice.index < view_slice_index + pages_in_view
+                    {
+                        let addr = view_base + (slice.index - view_slice_index) * PAGE;
+                        if newly_committed {
                             let _ = commit(addr, PAGE);
-                            remapped.push(addr);
                         }
+                        remapped.push(addr);
                     }
                 }
             }
-            for addr in remapped {
-                victory_gpu::title_memory_remapped(addr, PAGE);
-            }
+        }
+        for addr in remapped {
+            victory_gpu::title_memory_remapped(addr, PAGE);
         }
         done += n;
     }
@@ -837,11 +841,18 @@ fn install_demand_commit() {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             if mbi.State == MEM_COMMIT {
-                // If another thread just demand-committed this page to RW while
-                // we waited for `PHYSICAL`, retry the faulting instruction.
-                // If it is `PAGE_READONLY`, let `victory_gpu::watch`'s VEH
-                // handle the write-watch guard fault.
-                if (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0 {
+                // Another thread may have demand-committed this page while we
+                // waited for `PHYSICAL` (and `watch::guard()` may even have
+                // immediately transitioned it to `PAGE_READONLY`).
+                // - For a READ fault, any readable protection means the read
+                //   can now succeed (`watch::on_write` only handles writes, so
+                //   returning CONTINUE_SEARCH on a read of PAGE_READONLY would
+                //   erroneously crash).
+                // - For a WRITE fault, only writable protections retry directly;
+                //   `PAGE_READONLY` falls through to `watch::on_write`.
+                let writable = (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
+                let readable = writable || (mbi.Protect & (PAGE_READONLY | PAGE_EXECUTE_READ)) != 0;
+                if (r.ExceptionInformation[0] == READ && readable) || writable {
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
                 return EXCEPTION_CONTINUE_SEARCH;
@@ -927,6 +938,11 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    physical
+        .section_views
+        .entry(slice.section.handle as usize)
+        .or_default()
+        .push((base, len, slice.index));
     physical.views.insert(base, (len, slice));
     true
 }
@@ -967,6 +983,13 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        let sec_key = slice.section.handle as usize;
+        if let Some(entries) = physical.section_views.get_mut(&sec_key) {
+            entries.retain(|&(b, _, _)| b != at);
+            if entries.is_empty() {
+                physical.section_views.remove(&sec_key);
+            }
+        }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1388,10 +1411,14 @@ mod tests {
         assert_eq!(unsafe { p2.cast::<u8>().read() }, 0xA5);
 
         // Page 3: `write_physical` into an untouched already-mapped view commits
-        // the view so reads see the written byte immediately.
+        // the view so reads see the written byte immediately; a subsequent
+        // overwrite of the ALREADY-committed page also propagates immediately.
         assert!(write_physical(&pages[3..4], 4, &[0x77]));
         // SAFETY: mapped physical view.
         assert_eq!(unsafe { base.cast::<u8>().add(3 * PAGE + 4).read() }, 0x77);
+        assert!(write_physical(&pages[3..4], 4, &[0x88]));
+        // SAFETY: mapped physical view.
+        assert_eq!(unsafe { base.cast::<u8>().add(3 * PAGE + 4).read() }, 0x88);
 
         // Pages 4..6: concurrent multi-threaded reads and writes on untouched pages.
         let p4 = base.wrapping_byte_add(4 * PAGE) as usize;
@@ -1414,6 +1441,71 @@ mod tests {
 
         assert_eq!(XMemMapPhysicalPages(base, n, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+        // SAFETY: our own placeholder reservation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn concurrent_demand_commit_reads_and_readonly_protection_never_fault_out() {
+        use windows_sys::Win32::System::Memory::VirtualProtect;
+        const N: usize = 8;
+        let mut pages = [0usize; N];
+        let mut n = N;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            N * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        assert_eq!(XMemMapPhysicalPages(base, N, pages.as_ptr()), base);
+
+        let base_addr = base as usize;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            // Protector thread repeatedly simulates `watch::guard()` marking
+            // committed pages `PAGE_READONLY` and `title_memory_remapped()`
+            // restoring `PAGE_READWRITE`.
+            s.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    for i in 0..N {
+                        let page = base_addr + i * PAGE;
+                        let mut old = 0u32;
+                        // SAFETY: inside our mapped view; toggling RO/RW only.
+                        let ok = unsafe {
+                            VirtualProtect(page as *const _, PAGE, PAGE_READONLY, &mut old)
+                        };
+                        if ok != 0 {
+                            // SAFETY: restoring RW on our own view.
+                            unsafe {
+                                VirtualProtect(page as *const _, PAGE, PAGE_READWRITE, &mut old)
+                            };
+                        }
+                    }
+                }
+            });
+            // Reader threads concurrently fault on untouched pages while the
+            // protector races to apply `PAGE_READONLY`.
+            for t in 0..4usize {
+                s.spawn(move || {
+                    for iter in 0..32usize {
+                        for i in 0..N {
+                            let p = (base_addr + i * PAGE + t * 8 + (iter % 8)) as *const u8;
+                            // SAFETY: inside our demand-mapped view.
+                            let _ = unsafe { p.read_volatile() };
+                        }
+                    }
+                });
+            }
+            // Wait for readers to finish before stopping the protector thread.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert_eq!(XMemMapPhysicalPages(base, N, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
         // SAFETY: our own placeholder reservation.
         unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }

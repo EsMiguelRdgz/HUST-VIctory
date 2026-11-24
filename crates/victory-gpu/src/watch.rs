@@ -199,6 +199,9 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if start >= end {
+        return false;
+    }
     let range = start / BLOCK..end.div_ceil(BLOCK);
     let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     let unmapped: Vec<usize> = g.unmapped.range(range).copied().collect();
@@ -516,6 +519,77 @@ mod tests {
             done.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         title_memory_remapped(view, len);
+        // SAFETY: our mapped view and section handle.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn title_memory_remapped_preserves_dirty_detection_for_changed_pages() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        let len = 2 * BLOCK;
+        // SAFETY: plain anonymous pagefile-backed section freed below.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: mapping our own section.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize };
+        assert_ne!(view, 0);
+
+        let p0 = view / PAGE;
+        let p1 = p0 + 1;
+
+        // First watch guards both blocks and reports both dirty.
+        let (t1, w1) = writes(view, view + len, true).expect("guarded view");
+        assert!(w1.iter().any(|&(p, w)| p == p0 && w == t1));
+        assert!(w1.iter().any(|&(p, w)| p == p1 && w == t1));
+
+        // Second watch sees no changes (`w <= t1`).
+        let (t2, w2) = writes(view, view + len, true).expect("guarded view");
+        assert!(t2 > t1);
+        assert!(w2.iter().all(|&(_, w)| w <= t1));
+
+        // Remap/demand-commit notification on block 0 only (restores RW on p0),
+        // then mutate block 0 without hitting a guard fault.
+        title_memory_remapped(view, BLOCK);
+        // SAFETY: block 0 is writable after `title_memory_remapped`.
+        unsafe { (view as *mut u8).write(0xDE) };
+
+        // Next watch MUST report p0 dirty (`w == t3 > t2`) while p1 stays clean (`w <= t1`).
+        let (t3, w3) = writes(view, view + len, true).expect("guarded view");
+        assert!(
+            w3.iter().any(|&(p, w)| p == p0 && w == t3),
+            "remapped & mutated block 0 must be reported dirty"
+        );
+        assert!(
+            w3.iter().any(|&(p, w)| p == p1 && w <= t1),
+            "untouched block 1 must remain clean"
+        );
+
+        title_memory_remapped(view, len);
+        // Clear this test's pages from the global journal before unmapping so
+        // parallel tests that receive the same VA from `VirtualAlloc` start clean.
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            j.written.remove(&p0);
+            j.written.remove(&p1);
+        }
         // SAFETY: our mapped view and section handle.
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

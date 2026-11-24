@@ -590,24 +590,79 @@ if (-not $isSynthetic) {
     Save-LaunchHistory -Path $launchHistoryPath -Entries $updatedHistory
 }
 
+# 7b. Extract observable rendering & progression evidence from stderr.log and captured frames.
+$stderrRaw = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { '' }
+if ($null -eq $stderrRaw) { $stderrRaw = '' }
+
+$maxFramePresented = 0
+foreach ($m in [regex]::Matches($stderrRaw, 'frame presented[^\r\n]*?\bframe=(\d+)')) {
+    $f = [int]$m.Groups[1].Value
+    if ($f -gt $maxFramePresented) { $maxFramePresented = $f }
+}
+$uniquePipelines = New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($m in [regex]::Matches($stderrRaw, 'first bind[^\r\n]*?\bpipeline=(0x[0-9a-fA-F]+)')) {
+    [void]$uniquePipelines.Add($m.Groups[1].Value)
+}
+$uniquePipelinesBound = $uniquePipelines.Count
+$scriptedInputsInjected = [regex]::Matches($stderrRaw, 'scripted input injected').Count
+$maxDrawsPerFrame = 0
+foreach ($m in [regex]::Matches($stderrRaw, '(\d+)\s+draws/frame')) {
+    $d = [int]$m.Groups[1].Value
+    if ($d -gt $maxDrawsPerFrame) { $maxDrawsPerFrame = $d }
+}
+
+$capturedFrameCount = 0
+$uniqueFrameHashes = 0
+$framesSubdir = Join-Path $runDir 'frames'
+if (Test-Path -LiteralPath $framesSubdir) {
+    $pngs = @(Get-ChildItem -Path $framesSubdir -Filter 'frame-*.png' -ErrorAction SilentlyContinue)
+    $capturedFrameCount = $pngs.Count
+    $hashSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($png in $pngs) {
+        $h = (Get-FileHash -LiteralPath $png.FullName -Algorithm SHA256).Hash
+        [void]$hashSet.Add($h)
+    }
+    $uniqueFrameHashes = $hashSet.Count
+}
+
+$progressionStage = 'Boot'
+if ($maxFramePresented -gt 0) {
+    if ($uniquePipelinesBound -ge 25 -or $maxDrawsPerFrame -ge 80) {
+        $progressionStage = 'HeavySceneOrWorldLoading'
+    } elseif ($uniquePipelinesBound -ge 7 -or $uniqueFrameHashes -ge 3) {
+        $progressionStage = 'UIOrLoadingTransition'
+    } elseif ($uniquePipelinesBound -ge 4 -or $uniqueFrameHashes -ge 2) {
+        $progressionStage = 'AccountPickerOrStaticUI'
+    } else {
+        $progressionStage = 'EarlyFramePresentation'
+    }
+}
+
 # 8. Write JSON summary and Markdown report.
 $summary = [ordered]@{
-    TimestampUtc          = $runEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    Mode                  = $modeTag
-    LaunchNumberTotal     = $launchNumberTotal
-    LaunchNumber24h       = $launchNumber24h
-    MaxLaunchesPer24h     = $MaxLaunchesPer24h
-    TestLabel             = $TestLabel
-    Branch                = $branch
-    Commit                = $commit
-    ShortCommit           = $shortCommit
-    DirtyWorkingTree      = $isDirty
-    BuildDurationSec      = $buildDurationSec
-    ElapsedSec            = $elapsedSec
-    ExitCode              = $exitCode
-    HarnessStopReason     = $harnessStopReason
-    Classification        = $classification
-    BaselineCommitMB      = $baselineMem.CommitTotalMB
+    TimestampUtc              = $runEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    Mode                      = $modeTag
+    LaunchNumberTotal         = $launchNumberTotal
+    LaunchNumber24h           = $launchNumber24h
+    MaxLaunchesPer24h         = $MaxLaunchesPer24h
+    TestLabel                 = $TestLabel
+    Branch                    = $branch
+    Commit                    = $commit
+    ShortCommit               = $shortCommit
+    DirtyWorkingTree          = $isDirty
+    BuildDurationSec          = $buildDurationSec
+    ElapsedSec                = $elapsedSec
+    ExitCode                  = $exitCode
+    HarnessStopReason         = $harnessStopReason
+    Classification            = $classification
+    ProgressionStage          = $progressionStage
+    MaxFramePresented         = $maxFramePresented
+    UniquePipelinesBound      = $uniquePipelinesBound
+    MaxDrawsPerFrame          = $maxDrawsPerFrame
+    ScriptedInputsInjected    = $scriptedInputsInjected
+    CapturedFrameCount        = $capturedFrameCount
+    UniqueCapturedFrameHashes = $uniqueFrameHashes
+    BaselineCommitMB          = $baselineMem.CommitTotalMB
     BaselineCommitLimitMB = $baselineMem.CommitLimitMB
     BaselineHeadroomMB    = $baselineMem.CommitHeadroomMB
     PeakPrivateMB         = $peakPrivateMB
@@ -659,6 +714,17 @@ $mdLines = @(
     "| Peak GPU non-local usage (process) | $gpuNonLocalStr |",
     "| Telemetry samples recorded | $($samples.Count) |",
     "",
+    "## Progression & Input Evidence",
+    "",
+    "| Metric | Value |",
+    "|---|---:|",
+    "| Observable progression stage | $progressionStage |",
+    "| Max frame presented | $maxFramePresented |",
+    "| Unique pipelines bound (``first bind``) | $uniquePipelinesBound |",
+    "| Peak draws/frame logged | $maxDrawsPerFrame |",
+    "| Scripted inputs injected | $scriptedInputsInjected |",
+    "| Captured PNG frames (unique SHA-256) | $capturedFrameCount ($uniqueFrameHashes unique) |",
+    "",
     "## Artifacts",
     "",
     "- Stdout: ``$stdoutPath``",
@@ -680,7 +746,7 @@ if (-not $NoDiscord -and (Test-Path -LiteralPath $discordScript)) {
     $headroomGB = [Math]::Round($minObservedHeadroomMB / 1024.0, 2)
     $labelPart = if ($TestLabel) { " ($TestLabel)" } else { '' }
     $header = if (-not $isSynthetic) { "GPU Test #$launchNumberTotal$labelPart" } else { "Synthetic Diagnostic" }
-    $desc = "$header — Duration: ${elapsedSec}s | Result: $classification (exit=$exitCode) | Peak private: ${peakPrivateMB} MB | GPU local: $gpuLocalStr | Min commit headroom: ${headroomGB} GB | Report: $reportPath"
+    $desc = "$header — Stage: $progressionStage (frame=$maxFramePresented, pipes=$uniquePipelinesBound, inputs=$scriptedInputsInjected, frames=$capturedFrameCount/$uniqueFrameHashes uniq) | Duration: ${elapsedSec}s | Result: $classification (exit=$exitCode) | Peak private: ${peakPrivateMB} MB | GPU local: $gpuLocalStr | Min headroom: ${headroomGB} GB"
     $next = if ($classification -like 'D3D12*') {
         "Analyze D3D12 Debug/DRED/stderr logs in $runDir offline before retrying."
     } elseif ($classification -like '*Commit*') {
