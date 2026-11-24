@@ -30,6 +30,7 @@ pub mod frame;
 #[cfg(windows)]
 mod host;
 pub mod list;
+mod memstat;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

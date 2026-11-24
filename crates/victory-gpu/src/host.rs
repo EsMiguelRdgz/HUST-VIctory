@@ -1616,6 +1616,10 @@ impl Meter {
                 c.drop_bind as f64 / log_frames,
                 c.drop_other as f64 / log_frames,
             );
+            tracing::info!(
+                "{}",
+                crate::memstat::summary(host().and_then(Host::video_memory))
+            );
             #[cfg(feature = "diagnostics")]
             crate::copystat::log(log_frames);
         }
@@ -1840,6 +1844,40 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// The host GPU's memory use and budget (local, then non-local), from
+    /// DXGI; `None` if the adapter cannot say.
+    pub(crate) fn video_memory(&self) -> Option<crate::memstat::Video> {
+        struct Adapter(IDXGIAdapter3);
+        // SAFETY: DXGI adapters are free-threaded.
+        unsafe impl Send for Adapter {}
+        // SAFETY: as above.
+        unsafe impl Sync for Adapter {}
+        static ADAPTER: OnceLock<Option<Adapter>> = OnceLock::new();
+        let adapter = ADAPTER.get_or_init(|| {
+            // SAFETY: plain queries of a live device and DXGI.
+            unsafe {
+                let luid = self.device.GetAdapterLuid();
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                factory
+                    .EnumAdapterByLuid::<IDXGIAdapter3>(luid)
+                    .ok()
+                    .map(Adapter)
+            }
+        });
+        let adapter = &adapter.as_ref()?.0;
+        let query = |group| {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            // SAFETY: node 0 of a live adapter and an output structure.
+            unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
+            Some((info.CurrentUsage, info.Budget))
+        };
+        Some([
+            query(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?,
+            query(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?,
+        ])
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
@@ -2150,6 +2188,15 @@ pub(crate) fn assert_no_debug_errors(device: &ID3D12Device) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_memory_reports_a_local_budget() {
+        let Some(host) = host() else {
+            return;
+        };
+        let [(_, local_budget), _] = host.video_memory().expect("DXGI 1.4 adapter");
+        assert!(local_budget > 0);
+    }
 
     /// Completion is confirmed only when the fence really reached the
     /// value: not on a timed-out or never-signalled wait, nor on a removed

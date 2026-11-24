@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
+use crate::memstat::{self, Kind};
 use crate::watch::PAGE;
 
 /// A title buffer's host copy.
@@ -40,6 +41,15 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// What the host buffer is for and its size, as counted in [`memstat`].
+    kind: Kind,
+    bytes: u64,
+}
+
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        memstat::free(self.kind, self.bytes);
+    }
 }
 
 /// One submission's pre-GPU copy of the bytes its shaders may write, from
@@ -50,10 +60,13 @@ pub(crate) struct Shadow {
 pub(crate) struct Snapshot {
     base: usize,
     bytes: Vec<u8>,
+    /// The buffer's capacity as counted in [`memstat`].
+    counted: u64,
 }
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
+        memstat::free(Kind::Snapshot, self.counted);
         return_snapshot_buf(std::mem::take(&mut self.bytes));
     }
 }
@@ -61,7 +74,15 @@ impl Drop for Snapshot {
 /// Reusable snapshot buffers (kept warm to avoid repeated page faults).
 static SNAPSHOT_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-fn take_snapshot_buf(cap: usize) -> Vec<u8> {
+/// At most this many pooled snapshot buffers ...
+const POOL_BUFFERS: usize = 8;
+/// ... of at most this many bytes in all; past it the largest go first, so
+/// one huge unordered-access buffer cannot pin its snapshot's memory.
+const POOL_BYTES: usize = 64 << 20;
+
+/// A snapshot buffer of at least `cap` bytes: the smallest pooled one that
+/// fits, else a new one. `None` if a new one cannot be allocated.
+fn take_snapshot_buf(cap: usize) -> Option<Vec<u8>> {
     let mut pool = SNAPSHOT_POOL.lock().unwrap_or_else(|e| e.into_inner());
     let fit = pool
         .iter()
@@ -70,20 +91,36 @@ fn take_snapshot_buf(cap: usize) -> Vec<u8> {
         .min_by_key(|(_, v)| v.capacity())
         .map(|(i, _)| i);
     let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(cap),
+        Some(i) => {
+            let v = pool.swap_remove(i);
+            memstat::free(Kind::SnapshotPool, v.capacity() as u64);
+            v
+        }
+        None => {
+            drop(pool);
+            let mut v = Vec::new();
+            v.try_reserve_exact(cap).ok()?;
+            v
+        }
     };
     v.clear();
-    v
+    Some(v)
 }
 
 fn return_snapshot_buf(mut v: Vec<u8>) {
+    if v.capacity() == 0 {
+        return;
+    }
     v.clear();
     let mut pool = SNAPSHOT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    memstat::alloc(Kind::SnapshotPool, v.capacity() as u64);
     pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|b| std::cmp::Reverse(b.capacity()));
-        pool.truncate(8);
+    pool.sort_by_key(|b| b.capacity());
+    let mut total: usize = pool.iter().map(Vec::capacity).sum();
+    while pool.len() > POOL_BUFFERS || total > POOL_BYTES {
+        let Some(largest) = pool.pop() else { break };
+        total -= largest.capacity();
+        memstat::free(Kind::SnapshotPool, largest.capacity() as u64);
     }
 }
 
@@ -163,8 +200,16 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+    /// A copy of `[start, start + len)` in `buffer` (`bytes` long, mapped
+    /// at `data`, at host GPU address `gpu`), counted as `kind`.
+    fn new(
+        (buffer, data, gpu, bytes): (ID3D12Resource, *mut u8, u64, u64),
+        kind: Kind,
+        start: u64,
+        len: u64,
+    ) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        memstat::alloc(kind, bytes);
         Shadow {
             buffer,
             data,
@@ -174,6 +219,8 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            kind,
+            bytes,
         }
     }
 
@@ -200,7 +247,9 @@ impl Shadow {
 
     /// Before GPU execution: snapshots the union of `ranges` `(address, len)`
     /// inside this shadow so [`Shadow::copy_back_ranges`] writes back only
-    /// bytes the GPU actually modified. `None` if no range is inside.
+    /// bytes the GPU actually modified. `None` if no range is inside, or if
+    /// the snapshot cannot be allocated (copy-back then writes whole ranges,
+    /// as it did before snapshots).
     pub(crate) fn snapshot_ranges(&self, ranges: &[(usize, usize)]) -> Option<Snapshot> {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut min_off = usize::MAX;
@@ -217,13 +266,22 @@ impl Shadow {
             return None;
         }
         let span = max_off - min_off;
-        let mut buf = take_snapshot_buf(span);
+        let Some(mut buf) = take_snapshot_buf(span) else {
+            tracing::warn!(
+                span,
+                "no memory for a copy-back snapshot; whole ranges go back"
+            );
+            return None;
+        };
         // SAFETY: `[min_off, max_off)` lies inside this shadow's persistent mapping.
         let src = unsafe { std::slice::from_raw_parts(self.data.add(min_off), span) };
         buf.extend_from_slice(src);
+        let counted = buf.capacity() as u64;
+        memstat::alloc(Kind::Snapshot, counted);
         Some(Snapshot {
             base: min_off,
             bytes: buf,
+            counted,
         })
     }
 
@@ -256,7 +314,7 @@ impl Shadow {
             // SAFETY: `[from_off, to_off)` lies inside this shadow's mapping.
             let after = unsafe { std::slice::from_raw_parts(self.data.add(from_off), to - from) };
             let mut range_changed = 0usize;
-            if let Some(Snapshot { base, bytes }) = snapshot
+            if let Some(Snapshot { base, bytes, .. }) = snapshot
                 && from_off >= *base
                 && to_off <= base + bytes.len()
             {
@@ -450,7 +508,8 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let bytes = len.next_multiple_of(1 << 16);
+        let (buffer, data) = host()?.shared_buffer(bytes)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -467,7 +526,12 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
+        entry.shadow = Some(Arc::new(Shadow::new(
+            (buffer, data, gpu, bytes),
+            Kind::Buffer,
+            key.0,
+            len,
+        )));
     }
     entry.shadow.clone()
 }
@@ -524,7 +588,12 @@ pub(crate) fn find_aligned(address: u64, len: u64, align: u64) -> Option<Arc<Sha
         align,
         "aligned sub-buffer shadow created"
     );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, bytes));
+    let shadow = Arc::new(Shadow::new(
+        (buffer, data, gpu, bytes),
+        Kind::Aligned,
+        address,
+        bytes,
+    ));
     map.insert((address, bytes), shadow.clone());
     Some(shadow)
 }
@@ -545,7 +614,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         len,
         "loose memory copied to the host"
     );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    let shadow = Arc::new(Shadow::new(
+        (buffer, data, gpu, len),
+        Kind::Loose,
+        start,
+        len,
+    ));
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }
@@ -817,6 +891,44 @@ mod tests {
         assert!(shadow.pending.lock().unwrap().is_empty());
 
         unregister(fake_id, base as u64);
+        let _ = host_gpu;
+    }
+
+    /// The pool never keeps more than its byte budget: a buffer bigger than
+    /// the whole budget is freed instead of kept.
+    #[test]
+    fn snapshot_pool_keeps_within_its_byte_budget() {
+        return_snapshot_buf(Vec::with_capacity(POOL_BYTES + 1));
+        let pool = SNAPSHOT_POOL.lock().unwrap();
+        assert!(pool.len() <= POOL_BUFFERS);
+        assert!(pool.iter().map(Vec::capacity).sum::<usize>() <= POOL_BYTES);
+        assert!(pool.iter().all(|b| b.capacity() <= POOL_BYTES));
+    }
+
+    /// An aligned copy is counted with its kind and size, and released (so
+    /// uncounted by its `Drop`) once unregistering its buffer prunes it and
+    /// the last holder lets it go. Other tests make aligned copies too, so
+    /// the global counters are not compared exactly.
+    #[test]
+    fn aligned_shadows_are_counted_until_released() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let title_mem = vec![0u8; 4096];
+        let base = title_mem.as_ptr() as u64;
+        let fake_id = (base as usize) ^ 0xA11C_0DE5;
+        register(fake_id, base, 4096);
+        let shadow = find_aligned(base + 4, 256, 16).expect("aligned shadow");
+        assert_eq!(shadow.kind, Kind::Aligned);
+        assert_eq!(shadow.bytes, 1 << 16);
+        assert!(memstat::live(Kind::Aligned).0 >= shadow.bytes);
+        unregister(fake_id, base);
+        let weak = Arc::downgrade(&shadow);
+        drop(shadow);
+        assert!(
+            weak.upgrade().is_none(),
+            "unregister pruned the aligned copy"
+        );
         let _ = host_gpu;
     }
 }
