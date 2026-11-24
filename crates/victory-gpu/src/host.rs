@@ -260,6 +260,9 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Direct queue GPU timestamp frequency in ticks/second (for `VICTORY_GPU_TIMESTAMPS`).
+    #[cfg(feature = "diagnostics")]
+    ts_freq: u64,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -540,6 +543,8 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        #[cfg(feature = "diagnostics")]
+        let ts_freq = queue.GetTimestampFrequency().unwrap_or(0);
         tracing::info!(caps = %caps.summary(), "host D3D12 device ready");
         let wave64_mode = recommended_wave64_mode(&device);
         crate::shader_cache::set_wave64_mode(wave64_mode);
@@ -560,6 +565,8 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            #[cfg(feature = "diagnostics")]
+            ts_freq,
         })
     }
 }
@@ -612,6 +619,39 @@ pub(crate) struct HostList {
     /// data without marker texts).
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<String>>,
+    /// Per-op GPU timestamp query heap & readback (`VICTORY_GPU_TIMESTAMPS=1`).
+    #[cfg(feature = "diagnostics")]
+    gpu_stamps: Mutex<Option<GpuStamps>>,
+}
+
+/// Maximum timed draws/dispatches per command list (`2 * MAX_GPU_STAMPS` queries).
+#[cfg(feature = "diagnostics")]
+const MAX_GPU_STAMPS: u32 = 1024;
+
+#[cfg(feature = "diagnostics")]
+struct GpuStamps {
+    heap: ID3D12QueryHeap,
+    readback: ID3D12Resource,
+    /// `(kind, pipeline_name, args)` per timed draw/dispatch.
+    entries: Vec<(&'static str, String, [u32; 3])>,
+}
+
+/// Aggregated per-pipeline GPU timestamp stats over the current 5-second window:
+/// `(count, total_ms, max_ms, kind, args_at_max)`.
+#[cfg(feature = "diagnostics")]
+type StampWindow = HashMap<String, (u64, f64, f64, &'static str, [u32; 3])>;
+
+#[cfg(feature = "diagnostics")]
+static STAMP_WINDOW: OnceLock<Mutex<StampWindow>> = OnceLock::new();
+
+/// Whether per-dispatch/draw GPU timestamp profiling is enabled
+/// (`VICTORY_GPU_TIMESTAMPS=1`, diagnostics builds only).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn gpu_timestamps_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_GPU_TIMESTAMPS").is_some_and(|v| !v.is_empty() && v != "0")
+    })
 }
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
@@ -793,6 +833,57 @@ impl Host {
             )?;
             name(&prelude, || format!("victory prelude #{id}"));
             prelude.Close()?;
+            #[cfg(feature = "diagnostics")]
+            let gpu_stamps = if gpu_timestamps_on() && self.ts_freq > 0 {
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                let hdesc = D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: MAX_GPU_STAMPS * 2,
+                    NodeMask: 0,
+                };
+                let mut readback: Option<ID3D12Resource> = None;
+                let rheap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                };
+                let rdesc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: u64::from(MAX_GPU_STAMPS) * 2 * 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                if self.device.CreateQueryHeap(&hdesc, &mut heap).is_ok()
+                    && self
+                        .device
+                        .CreateCommittedResource(
+                            &rheap,
+                            D3D12_HEAP_FLAG_NONE,
+                            &rdesc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            None,
+                            &mut readback,
+                        )
+                        .is_ok()
+                    && let (Some(heap), Some(readback)) = (heap, readback)
+                {
+                    Some(GpuStamps {
+                        heap,
+                        readback,
+                        entries: Vec::new(),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             Ok(HostList {
                 allocator,
                 list,
@@ -807,6 +898,8 @@ impl Host {
                 executed: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                gpu_stamps: Mutex::new(gpu_stamps),
             })
         }
     }
@@ -947,6 +1040,10 @@ impl Host {
                 "slow host submission"
             );
         }
+        #[cfg(feature = "diagnostics")]
+        if completed && self.ts_freq > 0 && gpu_timestamps_on() {
+            self.collect_gpu_timestamps(runs, gpu);
+        }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
@@ -1004,6 +1101,77 @@ impl Host {
         self.log_messages();
         drop(submitted);
         completed
+    }
+
+    /// Reads resolved per-op GPU timestamps for `runs`, updates the 5-second
+    /// window accumulator, and logs the top 5 slowest ops on slow submissions.
+    #[cfg(feature = "diagnostics")]
+    fn collect_gpu_timestamps(&self, runs: &[&HostList], gpu: std::time::Duration) {
+        let freq = self.ts_freq as f64;
+        if freq <= 0.0 {
+            return;
+        }
+        let slow = gpu > std::time::Duration::from_millis(250);
+        let mut batch_ops: Vec<(f64, &'static str, String, [u32; 3])> = Vec::new();
+        let win = STAMP_WINDOW.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut window = win.lock().unwrap_or_else(|e| e.into_inner());
+        for list in runs {
+            let guard = list.gpu_stamps.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(gs) = guard.as_ref() else {
+                continue;
+            };
+            let n = gs.entries.len();
+            if n == 0 {
+                continue;
+            }
+            let range = D3D12_RANGE {
+                Begin: 0,
+                End: n * 2 * size_of::<u64>(),
+            };
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: fence completed, so `ResolveQueryData` finished writing `n * 2` u64s.
+            if unsafe { gs.readback.Map(0, Some(&range), Some(&mut ptr)) }.is_err() {
+                continue;
+            }
+            // SAFETY: mapped for `n * 2` u64 timestamps.
+            let ticks = unsafe { std::slice::from_raw_parts(ptr.cast::<u64>(), n * 2) };
+            for (i, (kind, pipe, args)) in gs.entries.iter().enumerate() {
+                let dt = ticks[i * 2 + 1].saturating_sub(ticks[i * 2]);
+                let ms = (dt as f64) * 1000.0 / freq;
+                let e = window
+                    .entry(pipe.clone())
+                    .or_insert((0, 0.0, 0.0, *kind, *args));
+                e.0 += 1;
+                e.1 += ms;
+                if ms > e.2 {
+                    e.2 = ms;
+                    e.4 = *args;
+                }
+                if slow {
+                    batch_ops.push((ms, *kind, pipe.clone(), *args));
+                }
+            }
+            let empty = D3D12_RANGE { Begin: 0, End: 0 };
+            // SAFETY: matching Unmap for Map above (read-only).
+            unsafe { gs.readback.Unmap(0, Some(&empty)) };
+        }
+        drop(window);
+        if slow && !batch_ops.is_empty() {
+            batch_ops.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let top: Vec<String> = batch_ops
+                .iter()
+                .take(5)
+                .map(|(ms, kind, pipe, a)| {
+                    format!("{ms:.2}ms {kind}({}x{}x{}) {pipe}", a[0], a[1], a[2])
+                })
+                .collect();
+            tracing::warn!(
+                batch_ms = gpu.as_millis(),
+                timed_ops = batch_ops.len(),
+                top = ?top,
+                "slow host submission GPU timestamp breakdown"
+            );
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1205,6 +1373,27 @@ impl HostList {
         for (res_id, depth_tex, twin) in &twins {
             self.copy_twin_to_depth(*res_id as crate::object::This, depth_tex, twin);
         }
+        #[cfg(feature = "diagnostics")]
+        if let Some(gs) = self
+            .gpu_stamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            && !gs.entries.is_empty()
+        {
+            let count = (gs.entries.len() as u32) * 2;
+            // SAFETY: open list, live query heap and readback buffer large enough for `count` u64s.
+            unsafe {
+                self.list.ResolveQueryData(
+                    &gs.heap,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    0,
+                    count,
+                    &gs.readback,
+                    0,
+                );
+            }
+        }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -1295,6 +1484,15 @@ impl HostList {
             .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        if let Some(gs) = self
+            .gpu_stamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            gs.entries.clear();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1589,6 +1787,41 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    /// Records a start GPU timestamp for a draw/dispatch (`VICTORY_GPU_TIMESTAMPS=1`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn stamp_begin(&self) -> Option<u32> {
+        if !gpu_timestamps_on() {
+            return None;
+        }
+        let guard = self.gpu_stamps.lock().unwrap_or_else(|e| e.into_inner());
+        let gs = guard.as_ref()?;
+        let idx = gs.entries.len() as u32;
+        if idx >= MAX_GPU_STAMPS {
+            return None;
+        }
+        // SAFETY: open list, valid timestamp query index `< MAX_GPU_STAMPS * 2`.
+        unsafe {
+            self.list
+                .EndQuery(&gs.heap, D3D12_QUERY_TYPE_TIMESTAMP, idx * 2);
+        }
+        Some(idx)
+    }
+
+    /// Records an end GPU timestamp paired with `stamp_begin`.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn stamp_end(&self, idx: u32, kind: &'static str, pipeline: &str, args: [u32; 3]) {
+        let mut guard = self.gpu_stamps.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(gs) = guard.as_mut() else {
+            return;
+        };
+        // SAFETY: open list, valid timestamp query index `< MAX_GPU_STAMPS * 2`.
+        unsafe {
+            self.list
+                .EndQuery(&gs.heap, D3D12_QUERY_TYPE_TIMESTAMP, idx * 2 + 1);
+        }
+        gs.entries.push((kind, pipeline.to_owned(), args));
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -2670,6 +2903,38 @@ struct Meter {
     caption: Option<Vec<u16>>,
 }
 
+/// Logs the top 10 pipelines by cumulative GPU timestamp ms over the last
+/// reporting window and clears the window.
+#[cfg(feature = "diagnostics")]
+fn log_gpu_timestamps(log_frames: f64) {
+    let Some(win) = STAMP_WINDOW.get() else {
+        return;
+    };
+    let map = std::mem::take(&mut *win.lock().unwrap_or_else(|e| e.into_inner()));
+    if map.is_empty() {
+        return;
+    }
+    let mut rows: Vec<_> = map.into_iter().collect();
+    rows.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+    let total_ms: f64 = rows.iter().map(|(_, v)| v.1).sum();
+    tracing::info!(
+        total_ms_per_frame = format_args!("{:.1}", total_ms / log_frames),
+        unique_pipelines = rows.len(),
+        "GPU timestamp top pipelines:"
+    );
+    for (pipe, (count, sum_ms, max_ms, kind, a)) in rows.into_iter().take(10) {
+        tracing::info!(
+            "  gpu {kind} {pipe}: {:.2} ms/frame ({:.1}x/frame, max {:.2} ms at {}x{}x{})",
+            sum_ms / log_frames,
+            count as f64 / log_frames,
+            max_ms,
+            a[0],
+            a[1],
+            a[2],
+        );
+    }
+}
+
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
@@ -2735,6 +3000,10 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             crate::copystat::log(log_frames);
+            #[cfg(feature = "diagnostics")]
+            if gpu_timestamps_on() {
+                log_gpu_timestamps(log_frames);
+            }
         }
         if self.caption.is_none() {
             // The window's own text, read without a message.

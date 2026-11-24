@@ -316,7 +316,12 @@ impl State {
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
             *slot = VertexView::default();
         }
     }
@@ -631,8 +636,14 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        let stamp = list.stamp_begin();
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(s) = stamp {
+            list.stamp_end(s, "dispatch", &p.name, [x, y, z]);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         DISP_OK.fetch_add(1, Ordering::Relaxed);
     }
@@ -727,8 +738,16 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    let stamp = list.stamp_begin();
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(s) = stamp {
+                        let name = crate::pipeline::host_pipeline(self.pipeline as This)
+                            .map_or("?", |p| p.name.as_str());
+                        list.stamp_end(s, "mesh", name, [x, 1, 1]);
+                    }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     MESH_OK.fetch_add(1, Ordering::Relaxed);
                     true
@@ -1019,11 +1038,19 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let stamp = list.stamp_begin();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(s) = stamp {
+                let name = crate::pipeline::host_pipeline(self.pipeline as This)
+                    .map_or("?", |p| p.name.as_str());
+                list.stamp_end(s, "draw", name, [count, instances, 0]);
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
             DRAWS_OK.fetch_add(1, Ordering::Relaxed);
         }
@@ -1108,11 +1135,19 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let stamp = list.stamp_begin();
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(s) = stamp {
+                let name = crate::pipeline::host_pipeline(self.pipeline as This)
+                    .map_or("?", |p| p.name.as_str());
+                list.stamp_end(s, "indexed", name, [indices, instances, 0]);
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
             DRAWS_OK.fetch_add(1, Ordering::Relaxed);
         }
