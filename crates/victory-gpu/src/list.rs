@@ -355,11 +355,14 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             },
             ..*b
         }),
+        // Unordered access to a depth target is to its twin.
         2 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
             } else {
-                host(b.first)?
+                let h = crate::resource::existing_host_unordered(b.first)?;
+                list.keep(&h);
+                h.as_raw().cast_const().cast()
             },
             ..*b
         }),
