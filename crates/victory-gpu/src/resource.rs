@@ -3445,10 +3445,13 @@ pub(crate) mod tests {
 
     /// Probes `ID3D12Device3::OpenExistingHeapFromAddress` support and
     /// constraints on plain `VirtualAlloc`, `MEM_WRITE_WATCH`, and `MEM_MAPPED`
-    /// memory (Phase C architectural evaluation).
+    /// memory (Phase C architectural evaluation). Uses a standalone D3D12
+    /// device so negative capability probes never pollute the shared host
+    /// debug InfoQueue.
     #[cfg(windows)]
     #[test]
     fn existing_heap_from_address_capability_probe() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::core::Interface;
         use windows_sys::Win32::System::Memory::{
@@ -3459,7 +3462,15 @@ pub(crate) mod tests {
         let Some(host_gpu) = crate::host::host() else {
             return;
         };
-        let Ok(dev3) = host_gpu.device.cast::<ID3D12Device3>() else {
+        let mut probe_dev: Option<ID3D12Device> = None;
+        // SAFETY: standalone D3D12 device for isolated capability probing.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut probe_dev) }.is_err() {
+            return;
+        }
+        let Some(probe_dev) = probe_dev else {
+            return;
+        };
+        let Ok(dev3) = probe_dev.cast::<ID3D12Device3>() else {
             return;
         };
         let check = |ptr: *const c_void| -> (bool, bool, bool) {
@@ -3471,6 +3482,11 @@ pub(crate) mod tests {
             };
             // SAFETY: live heap query.
             let hdesc = unsafe { heap.GetDesc() };
+            let base_flags = if hdesc.Flags.0 & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER.0 != 0 {
+                D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER
+            } else {
+                D3D12_RESOURCE_FLAG_NONE
+            };
             let make_desc = |flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
                 Width: KIB_64,
@@ -3482,12 +3498,9 @@ pub(crate) mod tests {
                     Quality: 0,
                 },
                 Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                Flags: flags,
+                Flags: base_flags | flags,
                 ..Default::default()
             };
-            // OpenExistingHeapFromAddress heaps require `COPY_DEST` initial state
-            // when `Properties.Type == READBACK` or `GENERIC_READ` when `UPLOAD`,
-            // or `COMMON` for `CUSTOM`.
             let init_state = if hdesc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD {
                 D3D12_RESOURCE_STATE_GENERIC_READ
             } else if hdesc.Properties.Type == D3D12_HEAP_TYPE_READBACK {
@@ -3499,14 +3512,7 @@ pub(crate) mod tests {
             let mut ro_res: Option<ID3D12Resource> = None;
             // SAFETY: read-only placed buffer inside the opened 64 KiB heap.
             let ro_ok = unsafe {
-                host_gpu.device.CreatePlacedResource(
-                    &heap,
-                    0,
-                    &ro_desc,
-                    init_state,
-                    None,
-                    &mut ro_res,
-                )
+                probe_dev.CreatePlacedResource(&heap, 0, &ro_desc, init_state, None, &mut ro_res)
             }
             .is_ok();
             drop(ro_res);
@@ -3514,14 +3520,7 @@ pub(crate) mod tests {
             let mut uav_res: Option<ID3D12Resource> = None;
             // SAFETY: UAV placed buffer inside the opened 64 KiB heap.
             let uav_ok = unsafe {
-                host_gpu.device.CreatePlacedResource(
-                    &heap,
-                    0,
-                    &uav_desc,
-                    init_state,
-                    None,
-                    &mut uav_res,
-                )
+                probe_dev.CreatePlacedResource(&heap, 0, &uav_desc, init_state, None, &mut uav_res)
             }
             .is_ok();
             drop(uav_res);
