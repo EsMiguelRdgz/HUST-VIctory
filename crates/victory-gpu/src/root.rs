@@ -217,6 +217,44 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    /// The text of an `ID3DBlob` error message from the host serializer, then
+    /// releases it. Null (no message) is tolerated.
+    fn error_text(error: *mut c_void) -> String {
+        if error.is_null() {
+            return "(no error blob)".to_string();
+        }
+        let blob = error.cast_const().cast::<Object>();
+        let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
+        let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
+        let text = if data.is_null() || size == 0 {
+            "(empty error blob)".to_string()
+        } else {
+            // SAFETY: the blob owns `size` bytes at `data` until released below.
+            let bytes = unsafe { std::slice::from_raw_parts(data, size) };
+            String::from_utf8_lossy(bytes)
+                .trim_end_matches('\0')
+                .trim()
+                .to_string()
+        };
+        slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+        text
+    }
+
+    /// Fails with the host's own message when serialization did not succeed;
+    /// releases any message it left on success.
+    fn assert_serialized(name: &str, hr: HRESULT, error: *mut c_void) {
+        if hr != S_OK {
+            panic!(
+                "{name} returned {:#010x}; host error blob: {}",
+                hr as u32,
+                error_text(error)
+            );
+        }
+        if !error.is_null() {
+            error_text(error);
+        }
+    }
+
     /// One 32-bit constant at b0, serialized by the host, then created.
     #[cfg(windows)]
     #[test]
@@ -244,7 +282,8 @@ mod tests {
             flags: 0x0100_0001,
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize(&desc, 1, &mut blob, &mut error), S_OK);
+        let hr = serialize(&desc, 1, &mut blob, &mut error);
+        assert_serialized("D3D12SerializeRootSignature", hr, error);
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
@@ -276,7 +315,8 @@ mod tests {
             },
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+        let hr = serialize_versioned(&desc, &mut blob, &mut error);
+        assert_serialized("D3D12SerializeVersionedRootSignature", hr, error);
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
@@ -312,7 +352,8 @@ mod tests {
             },
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+        let hr = serialize_versioned(&desc, &mut blob, &mut error);
+        assert_serialized("D3D12SerializeVersionedRootSignature", hr, error);
         let blob = blob.cast_const().cast::<Object>();
         assert!(slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob) > 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
