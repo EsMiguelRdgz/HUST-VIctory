@@ -15,12 +15,12 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_MAPPED,
-    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
-    MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc,
-    VirtualAlloc2, VirtualFree, VirtualQuery, VirtualQueryEx,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT, MEM_EXTENDED_PARAMETER,
+    MEM_MAPPED, MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+    MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
+    MapViewOfFile3, MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, SEC_RESERVE,
+    UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -67,6 +67,282 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+/// Minimum `XMemVirtualAlloc` commit size eligible for 64 KiB demand commitment.
+/// Smaller allocations (stacks, scratch buffers, small structs) stay eagerly
+/// committed to avoid VEH overhead and host syscall edge cases.
+const DEMAND_PRIVATE_MIN_BYTES: usize = 4 * MIB;
+const OS_PAGE: usize = 4096;
+
+/// Opt-out diagnostic toggle (`VICTORY_EAGER_PRIVATE_COMMIT=1`) to commit large
+/// `XMemVirtualAlloc` private pools eagerly instead of demand-committing each
+/// 64 KiB chunk on first CPU/kernel/GPU access.
+fn eager_private_commit() -> bool {
+    static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EAGER
+        .get_or_init(|| std::env::var_os("VICTORY_EAGER_PRIVATE_COMMIT").is_some_and(|v| v == "1"))
+}
+
+/// Coalesced set of disjoint `[start, end)` half-open intervals representing
+/// logically committed `MEM_PRIVATE` `XMemVirtualAlloc` ranges whose backing
+/// pages are demand-committed 64 KiB at a time on first access.
+#[derive(Default)]
+struct DemandPrivate {
+    ranges: BTreeMap<usize, usize>,
+}
+
+impl DemandPrivate {
+    const fn new() -> Self {
+        Self {
+            ranges: BTreeMap::new(),
+        }
+    }
+
+    fn add(&mut self, mut start: usize, mut end: usize) {
+        if start >= end {
+            return;
+        }
+        if let Some((&prev_start, &prev_end)) = self.ranges.range(..=start).next_back()
+            && prev_end >= start
+        {
+            start = prev_start;
+            end = end.max(prev_end);
+            self.ranges.remove(&prev_start);
+        }
+        let overlapping: Vec<(usize, usize)> = self
+            .ranges
+            .range(start..=end)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (s, e) in overlapping {
+            self.ranges.remove(&s);
+            end = end.max(e);
+        }
+        self.ranges.insert(start, end);
+    }
+
+    fn remove(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let first = self
+            .ranges
+            .range(..=start)
+            .next_back()
+            .filter(|&(_, &e)| e > start)
+            .map(|(&s, &e)| (s, e));
+        let hit: Vec<(usize, usize)> = first
+            .into_iter()
+            .chain(
+                self.ranges
+                    .range(start.saturating_add(1)..end)
+                    .map(|(&s, &e)| (s, e)),
+            )
+            .collect();
+        for (s, e) in hit {
+            self.ranges.remove(&s);
+            if s < start {
+                self.ranges.insert(s, start);
+            }
+            if e > end {
+                self.ranges.insert(end, e);
+            }
+        }
+    }
+
+    fn contains(&self, addr: usize) -> Option<(usize, usize)> {
+        self.ranges
+            .range(..=addr)
+            .next_back()
+            .filter(|&(_, &e)| addr < e)
+            .map(|(&s, &e)| (s, e))
+    }
+
+    fn overlaps(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        if start >= end {
+            return Vec::new();
+        }
+        let first = self
+            .ranges
+            .range(..=start)
+            .next_back()
+            .filter(|&(_, &e)| e > start)
+            .map(|(&s, &e)| (s, e));
+        first
+            .into_iter()
+            .chain(
+                self.ranges
+                    .range(start.saturating_add(1)..end)
+                    .map(|(&s, &e)| (s, e)),
+            )
+            .map(|(s, e)| (s.max(start), e.min(end)))
+            .filter(|&(s, e)| s < e)
+            .collect()
+    }
+}
+
+static DEMAND_PRIVATE: Mutex<DemandPrivate> = Mutex::new(DemandPrivate::new());
+
+fn demand_private() -> MutexGuard<'static, DemandPrivate> {
+    DEMAND_PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Checks whether `[lo, hi)` is entirely backed by an existing `MEM_PRIVATE`
+/// reservation (`MEM_RESERVE` or `MEM_COMMIT`), with no `MEM_FREE` holes or
+/// non-private mappings.
+fn all_private_reserved_or_committed(lo: usize, hi: usize) -> bool {
+    let mut cur = lo;
+    while cur < hi {
+        // SAFETY: plain `VirtualQuery` output struct.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid output pointer of the right size.
+        let n = unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) };
+        if n == 0
+            || info.RegionSize == 0
+            || info.Type != MEM_PRIVATE
+            || (info.State != MEM_RESERVE && info.State != MEM_COMMIT)
+        {
+            return false;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= cur {
+            return false;
+        }
+        cur = next;
+    }
+    true
+}
+
+/// Returns `[alloc_base, end)` for the virtual memory reservation containing `address`.
+fn reservation_extent(address: usize) -> Option<(usize, usize)> {
+    // SAFETY: plain `VirtualQuery` output struct.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid output pointer.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.RegionSize == 0 || info.AllocationBase.is_null() {
+        return None;
+    }
+    let alloc_base = info.AllocationBase as usize;
+    let mut cur = alloc_base;
+    loop {
+        // SAFETY: plain `VirtualQuery` output struct.
+        let mut sub: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid output pointer.
+        let q = unsafe { VirtualQuery(cur as *const _, &mut sub, size_of_val(&sub)) };
+        if q == 0 || sub.RegionSize == 0 || sub.AllocationBase as usize != alloc_base {
+            break;
+        }
+        let next = (sub.BaseAddress as usize).saturating_add(sub.RegionSize);
+        if next <= cur {
+            break;
+        }
+        cur = next;
+    }
+    (cur > alloc_base).then_some((alloc_base, cur))
+}
+
+/// Scrubs demand-private tracking before a title `VirtualFree` releases or
+/// decommits memory so stale ranges can never outlive their reservation.
+pub(crate) fn on_virtual_free(address: *mut c_void, size: usize, free_type: u32) {
+    if address.is_null() {
+        return;
+    }
+    let addr = address as usize;
+    if (free_type & MEM_RELEASE) != 0 {
+        if let Some((lo, hi)) = reservation_extent(addr) {
+            demand_private().remove(lo, hi);
+        }
+        return;
+    }
+    if (free_type & MEM_DECOMMIT) != 0 {
+        if size == 0 {
+            if let Some((lo, hi)) = reservation_extent(addr) {
+                demand_private().remove(lo, hi);
+            }
+        } else {
+            let lo = addr & !(OS_PAGE - 1);
+            let hi = addr
+                .saturating_add(size)
+                .checked_next_multiple_of(OS_PAGE)
+                .unwrap_or(usize::MAX);
+            demand_private().remove(lo, hi);
+        }
+    }
+}
+
+/// Commits any untouched `MEM_RESERVE | MEM_PRIVATE` pages inside tracked
+/// demand-private ranges overlapping `[at, at + len)`.
+pub(crate) fn ensure_private_committed(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let dp = demand_private();
+    let overlaps = dp.overlaps(at, end);
+    if overlaps.is_empty() {
+        return;
+    }
+    for (ov_lo, ov_hi) in overlaps {
+        let lo = ov_lo & !(OS_PAGE - 1);
+        let hi = ov_hi.checked_next_multiple_of(OS_PAGE).unwrap_or(ov_hi);
+        let mut cur = lo;
+        while cur < hi {
+            // SAFETY: plain `VirtualQuery` output struct.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid output pointer.
+            let n = unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) };
+            if n == 0 || info.RegionSize == 0 {
+                break;
+            }
+            let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+            let chunk_end = region_end.min(hi);
+            if info.State == MEM_RESERVE && info.Type == MEM_PRIVATE && chunk_end > cur {
+                let _ = commit(cur, chunk_end - cur);
+            }
+            if region_end <= cur {
+                break;
+            }
+            cur = region_end;
+        }
+    }
+}
+
+/// Adjusts a host `MEMORY_BASIC_INFORMATION` for `XMemVirtualQuery` /
+/// `VirtualQuery` / `VirtualQueryEx` so logically committed demand-mapped
+/// physical views and demand-committed private pools report `MEM_COMMIT`
+/// and `PAGE_READWRITE`.
+pub(crate) fn adjust_query_info(address: usize, info: &mut MEMORY_BASIC_INFORMATION) {
+    if info.State != MEM_RESERVE {
+        return;
+    }
+    let base = info.BaseAddress as usize;
+    if info.Type == MEM_MAPPED {
+        let physical = physical();
+        if let Some((&view_base, &(view_len, _))) = physical
+            .views
+            .range(..=address)
+            .next_back()
+            .filter(|&(&b, &(len, _))| address < b.saturating_add(len))
+        {
+            info.State = MEM_COMMIT;
+            info.Protect = PAGE_READWRITE;
+            let view_end = view_base.saturating_add(view_len);
+            if view_end > base {
+                info.RegionSize = info.RegionSize.min(view_end - base);
+            }
+        }
+        return;
+    }
+    if info.Type == MEM_PRIVATE
+        && let Some((_, range_end)) = demand_private().contains(address)
+    {
+        info.State = MEM_COMMIT;
+        info.Protect = PAGE_READWRITE;
+        if range_end > base {
+            info.RegionSize = info.RegionSize.min(range_end - base);
+        }
+    }
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -105,6 +381,29 @@ pub extern "system" fn XMemVirtualAlloc(
     if placeholder {
         kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
     }
+    let demand_commit_private = !eager_private_commit()
+        && !placeholder
+        && (kind & MEM_COMMIT) != 0
+        && protect == PAGE_READWRITE
+        && size >= DEMAND_PRIVATE_MIN_BYTES;
+
+    // Committing a large sub-range of an existing private reservation: keep
+    // pages `MEM_RESERVE` until first CPU/kernel/GPU access instead of eagerly
+    // charging gigabytes of unused zero pages to system commit.
+    if !base.is_null() && (kind & MEM_RESERVE) == 0 && demand_commit_private {
+        let lo = (base as usize) & !(OS_PAGE - 1);
+        if let Some(hi) = (base as usize)
+            .checked_add(size)
+            .and_then(|e| e.checked_next_multiple_of(OS_PAGE))
+            && hi > lo
+            && all_private_reserved_or_committed(lo, hi)
+        {
+            install_demand_commit();
+            demand_private().add(lo, hi);
+            return lo as *mut c_void;
+        }
+    }
+
     let mut parameter = MEM_EXTENDED_PARAMETER::default();
     parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
@@ -119,6 +418,11 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    let alloc_kind = if constrained && demand_commit_private {
+        kind & !MEM_COMMIT
+    } else {
+        kind
+    };
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
@@ -126,7 +430,7 @@ pub extern "system" fn XMemVirtualAlloc(
             GetCurrentProcess(),
             base,
             size,
-            kind,
+            alloc_kind,
             protect,
             if constrained {
                 &mut parameter
@@ -136,12 +440,26 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() && constrained {
+        let lo = at as usize;
+        let hi = lo.saturating_add(size.next_multiple_of(OS_PAGE));
+        if demand_commit_private {
+            install_demand_commit();
+            let mut dp = demand_private();
+            dp.remove(lo, hi);
+            dp.add(lo, hi);
+        } else if size > 0 {
+            demand_private().remove(lo, hi);
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),
+            alloc_kind = format_args!("{alloc_kind:#x}"),
             flags = format_args!("{flags:#x}"),
             at = format_args!("{at:p}"),
+            demand_private = constrained && demand_commit_private,
             "XMemVirtualAlloc"
         );
     }
@@ -175,13 +493,7 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
-        if info.host.State == MEM_RESERVE
-            && info.host.Type == MEM_MAPPED
-            && is_mapped_physical(address as usize)
-        {
-            info.host.State = MEM_COMMIT;
-            info.host.Protect = PAGE_READWRITE;
-        }
+        adjust_query_info(address as usize, &mut info.host);
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS
         } else {
@@ -713,19 +1025,9 @@ fn eager_physical_commit() -> bool {
         .get_or_init(|| std::env::var_os("VICTORY_EAGER_PHYSICAL_COMMIT").is_some_and(|v| v == "1"))
 }
 
-/// Whether `address` currently lies inside a mapped physical-page view.
-fn is_mapped_physical(address: usize) -> bool {
-    let physical = physical();
-    physical
-        .views
-        .range(..=address)
-        .next_back()
-        .is_some_and(|(&base, &(len, _))| address < base.saturating_add(len))
-}
-
-/// Ensures every demand-mapped physical page overlapping `[at, at + len)` is
-/// committed in its view before a host kernel write (`ReadFile`, `fread`,
-/// DirectStorage memory read) or GPU copy-back writes into it.
+/// Ensures every demand-mapped physical page and demand-committed private page
+/// overlapping `[at, at + len)` is committed before a host kernel read/write
+/// (`ReadFile`, `WriteFile`, `fread`, DirectStorage) or GPU copy-back touches it.
 pub fn ensure_committed(at: usize, len: usize) {
     if len == 0 {
         return;
@@ -796,11 +1098,12 @@ pub fn ensure_committed(at: usize, len: usize) {
     for (base, size) in remapped {
         victory_gpu::title_memory_remapped(base, size);
     }
+    ensure_private_committed(at, len);
 }
 
 /// Registers the vectored exception handler that demand-commits `SEC_RESERVE`
-/// physical-page views on first CPU read/write (64 KiB granularity) and wires
-/// `victory_gpu::use_commit_range(ensure_committed)`.
+/// physical-page views and large `XMemVirtualAlloc` private pools on first CPU
+/// read/write (64 KiB granularity) and wires `victory_gpu::use_commit_range`.
 fn install_demand_commit() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -819,55 +1122,100 @@ fn install_demand_commit() {
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        let access = r.ExceptionInformation[0];
         let at = r.ExceptionInformation[1];
-        let committed_page = {
+        enum PhysicalOutcome {
+            NotInViews,
+            Committed(usize),
+            ContinueExecution,
+            ContinueSearch,
+        }
+        let outcome = {
             let physical = physical();
-            let Some((&view_base, &(_view_len, ref slice))) = physical
+            if let Some((&view_base, &(_view_len, ref slice))) = physical
                 .views
                 .range(..=at)
                 .next_back()
                 .filter(|&(&base, &(size, _))| at < base.saturating_add(size))
-            else {
-                return EXCEPTION_CONTINUE_SEARCH;
-            };
-            let page_base = at & !(PAGE - 1);
-            let page_idx = slice.index + (page_base - view_base) / PAGE;
-            // SAFETY: plain `VirtualQuery` on our mapped view.
-            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-            // SAFETY: valid out pointer.
-            let queried =
-                unsafe { VirtualQuery(page_base as *const _, &mut mbi, size_of_val(&mbi)) };
-            if queried == 0 {
-                return EXCEPTION_CONTINUE_SEARCH;
-            }
-            if mbi.State == MEM_COMMIT {
-                // Another thread may have demand-committed this page while we
-                // waited for `PHYSICAL` (and `watch::guard()` may even have
-                // immediately transitioned it to `PAGE_READONLY`).
-                // - For a READ fault, any readable protection means the read
-                //   can now succeed (`watch::on_write` only handles writes, so
-                //   returning CONTINUE_SEARCH on a read of PAGE_READONLY would
-                //   erroneously crash).
-                // - For a WRITE fault, only writable protections retry directly;
-                //   `PAGE_READONLY` falls through to `watch::on_write`.
-                let writable = (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
-                let readable = writable || (mbi.Protect & (PAGE_READONLY | PAGE_EXECUTE_READ)) != 0;
-                if (r.ExceptionInformation[0] == READ && readable) || writable {
-                    return EXCEPTION_CONTINUE_EXECUTION;
+            {
+                let page_base = at & !(PAGE - 1);
+                let page_idx = slice.index + (page_base - view_base) / PAGE;
+                // SAFETY: plain `VirtualQuery` on our mapped view.
+                let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: valid out pointer.
+                let queried =
+                    unsafe { VirtualQuery(page_base as *const _, &mut mbi, size_of_val(&mbi)) };
+                if queried == 0 {
+                    PhysicalOutcome::ContinueSearch
+                } else if mbi.State == MEM_COMMIT {
+                    // Another thread may have demand-committed this page while we
+                    // waited for `PHYSICAL` (and `watch::guard()` may even have
+                    // immediately transitioned it to `PAGE_READONLY`).
+                    // - For a READ fault, any readable protection means the read
+                    //   can now succeed (`watch::on_write` only handles writes, so
+                    //   returning CONTINUE_SEARCH on a read of PAGE_READONLY would
+                    //   erroneously crash).
+                    // - For a WRITE fault, only writable protections retry directly;
+                    //   `PAGE_READONLY` falls through to `watch::on_write`.
+                    let writable = (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
+                    let readable =
+                        writable || (mbi.Protect & (PAGE_READONLY | PAGE_EXECUTE_READ)) != 0;
+                    if (access == READ && readable) || writable {
+                        PhysicalOutcome::ContinueExecution
+                    } else {
+                        PhysicalOutcome::ContinueSearch
+                    }
+                } else if mbi.State == MEM_RESERVE && commit(page_base, PAGE) {
+                    slice.section.committed(page_idx, 1);
+                    PhysicalOutcome::Committed(page_base)
+                } else {
+                    PhysicalOutcome::ContinueSearch
                 }
-                return EXCEPTION_CONTINUE_SEARCH;
+            } else {
+                PhysicalOutcome::NotInViews
             }
-            if mbi.State != MEM_RESERVE {
-                return EXCEPTION_CONTINUE_SEARCH;
-            }
-            if !commit(page_base, PAGE) {
-                return EXCEPTION_CONTINUE_SEARCH;
-            }
-            slice.section.committed(page_idx, 1);
-            Some(page_base)
         };
-        if let Some(page_base) = committed_page {
-            victory_gpu::title_memory_remapped(page_base, PAGE);
+        match outcome {
+            PhysicalOutcome::Committed(page_base) => {
+                victory_gpu::title_memory_remapped(page_base, PAGE);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            PhysicalOutcome::ContinueExecution => return EXCEPTION_CONTINUE_EXECUTION,
+            PhysicalOutcome::ContinueSearch => return EXCEPTION_CONTINUE_SEARCH,
+            PhysicalOutcome::NotInViews => {}
+        }
+
+        // Check demand-committed `XMemVirtualAlloc` private pools.
+        let dp = demand_private();
+        let Some((range_start, range_end)) = dp.contains(at) else {
+            return EXCEPTION_CONTINUE_SEARCH;
+        };
+        let os_page = at & !(OS_PAGE - 1);
+        // SAFETY: plain `VirtualQuery` on our tracked private range.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer.
+        let queried = unsafe { VirtualQuery(os_page as *const _, &mut mbi, size_of_val(&mbi)) };
+        if queried == 0 || mbi.RegionSize == 0 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if mbi.State == MEM_COMMIT {
+            let writable = (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
+            let readable = writable || (mbi.Protect & (PAGE_READONLY | PAGE_EXECUTE_READ)) != 0;
+            if (access == READ && readable) || writable {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if mbi.State != MEM_RESERVE || mbi.Type != MEM_PRIVATE {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let page_lo = at & !(PAGE - 1);
+        let page_hi = page_lo.saturating_add(PAGE);
+        let mbi_lo = mbi.BaseAddress as usize;
+        let mbi_hi = mbi_lo.saturating_add(mbi.RegionSize);
+        let commit_lo = page_lo.max(range_start).max(mbi_lo);
+        let commit_hi = page_hi.min(range_end).min(mbi_hi);
+        if commit_hi > commit_lo && commit(commit_lo, commit_hi - commit_lo) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         EXCEPTION_CONTINUE_SEARCH
@@ -876,7 +1224,7 @@ fn install_demand_commit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         victory_gpu::use_commit_range(ensure_committed);
-        // SAFETY: handler only commits pages in our own `PHYSICAL.views`.
+        // SAFETY: handler only commits pages in our own tracked views/pools.
         unsafe { AddVectoredExceptionHandler(1, Some(on_physical_fault)) };
     });
 }
@@ -1550,5 +1898,220 @@ mod tests {
         // SAFETY: our own placeholder reservation.
         unsafe { VirtualFree(at, 0, MEM_RELEASE) };
         steps
+    }
+
+    #[test]
+    fn demand_private_interval_set_coalescing_and_splitting() {
+        let mut set = DemandPrivate::new();
+        set.add(0x1000, 0x3000);
+        set.add(0x3000, 0x5000);
+        assert_eq!(set.contains(0x2500), Some((0x1000, 0x5000)));
+        set.add(0x8000, 0xA000);
+        set.add(0x4000, 0x8000);
+        assert_eq!(set.contains(0x7000), Some((0x1000, 0xA000)));
+        set.remove(0x3000, 0x6000);
+        assert_eq!(set.contains(0x2000), Some((0x1000, 0x3000)));
+        assert_eq!(set.contains(0x4000), None);
+        assert_eq!(set.contains(0x7000), Some((0x6000, 0xA000)));
+        assert_eq!(
+            set.overlaps(0x2000, 0x8000),
+            vec![(0x2000, 0x3000), (0x6000, 0x8000)]
+        );
+    }
+
+    #[test]
+    fn demand_private_pool_commits_only_touched_pages_and_preserves_write_watch() {
+        let size = 64 * MIB;
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+
+        // Logical query reports committed graphics RW memory while OS pages
+        // remain uncommitted MEM_RESERVE (0 commit charge until touched).
+        let xq = query(p);
+        assert_eq!(xq.host.State, MEM_COMMIT);
+        assert_eq!(xq.host.Protect, PAGE_READWRITE);
+        assert_eq!(xq.flags & GRAPHICS, GRAPHICS);
+
+        // SAFETY: `MEMORY_BASIC_INFORMATION` is a plain zeroable C struct.
+        let mut hle_mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            crate::modules::kernel::VirtualQuery(
+                p,
+                (&raw mut hle_mbi).cast(),
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            ),
+            0
+        );
+        assert_eq!(hle_mbi.State, MEM_COMMIT);
+        assert_eq!(hle_mbi.Protect, PAGE_READWRITE);
+
+        if !eager_private_commit() {
+            // SAFETY: `MEMORY_BASIC_INFORMATION` is a plain zeroable C struct.
+            let mut raw: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out pointer on our allocation.
+            assert_ne!(unsafe { VirtualQuery(p, &mut raw, size_of_val(&raw)) }, 0);
+            assert_eq!(
+                raw.State, MEM_RESERVE,
+                "untouched pool must stay MEM_RESERVE"
+            );
+        }
+
+        // Write-watch still works natively on partially committed regions.
+        let mut found = [0usize; 64];
+        let mut count = found.len();
+        let mut gran = 0u32;
+        assert_eq!(
+            // SAFETY: room for `count` entries.
+            unsafe {
+                windows_sys::Win32::System::Memory::GetWriteWatch(
+                    1,
+                    p,
+                    size,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut gran,
+                )
+            },
+            0
+        );
+        assert_eq!(count, 0);
+
+        // First read demand-commits page 0 as zero; write demand-commits page 10.
+        // SAFETY: inside our 64 MiB logically-committed pool.
+        unsafe {
+            assert_eq!(p.cast::<u8>().read(), 0);
+            p.cast::<u8>().add(10 * PAGE).write(0x5A);
+            assert_eq!(p.cast::<u8>().add(10 * PAGE).read(), 0x5A);
+        }
+
+        // Untouched page 100 remains MEM_RESERVE.
+        if !eager_private_commit() {
+            // SAFETY: `MEMORY_BASIC_INFORMATION` is a plain zeroable C struct.
+            let mut raw100: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let p100 = p.wrapping_byte_add(100 * PAGE);
+            // SAFETY: valid out pointer inside our allocation.
+            let q = unsafe { VirtualQuery(p100, &mut raw100, size_of_val(&raw100)) };
+            assert_ne!(q, 0);
+            assert_eq!(raw100.State, MEM_RESERVE);
+        }
+
+        // GetWriteWatch reports the written page (page 10).
+        count = found.len();
+        assert_eq!(
+            // SAFETY: room for `count` entries.
+            unsafe {
+                windows_sys::Win32::System::Memory::GetWriteWatch(
+                    1,
+                    p,
+                    size,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut gran,
+                )
+            },
+            0
+        );
+        let p10_addr = p as usize + 10 * PAGE;
+        assert!(
+            found[..count].contains(&p10_addr),
+            "written page 10 missing from GetWriteWatch: {:?}",
+            &found[..count]
+        );
+
+        // HLE VirtualProtect on an untouched page commits it first and succeeds.
+        let p200 = p.wrapping_byte_add(200 * PAGE);
+        let mut old = 0u32;
+        assert_ne!(
+            crate::modules::kernel::VirtualProtect(p200, PAGE, PAGE_READONLY, &mut old),
+            0
+        );
+        // SAFETY: page 200 is committed read-only zero memory.
+        assert_eq!(unsafe { p200.cast::<u8>().read() }, 0);
+
+        // HLE VirtualFree(MEM_DECOMMIT) clears demand-private tracking for that slice.
+        let p300 = p.wrapping_byte_add(300 * PAGE);
+        assert_ne!(
+            crate::modules::kernel::VirtualFree(p300, PAGE, MEM_DECOMMIT),
+            0
+        );
+        assert_eq!(query(p300).host.State, MEM_RESERVE);
+
+        // Sub-range commit on an existing MEM_RESERVE pool.
+        let reserved = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            32 * MIB,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!reserved.is_null());
+        let sub = reserved.wrapping_byte_add(8 * MIB);
+        let committed = XMemVirtualAlloc(sub, 8 * MIB, MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+        assert_eq!(committed, sub);
+        assert_eq!(query(sub).host.State, MEM_COMMIT);
+        // SAFETY: logically committed sub-range.
+        unsafe {
+            sub.cast::<u8>().add(3 * PAGE).write(0xC3);
+            assert_eq!(sub.cast::<u8>().add(3 * PAGE).read(), 0xC3);
+        }
+
+        // HLE VirtualFree(MEM_RELEASE) cleans up both allocations.
+        assert_ne!(crate::modules::kernel::VirtualFree(p, 0, MEM_RELEASE), 0);
+        assert_ne!(
+            crate::modules::kernel::VirtualFree(reserved, 0, MEM_RELEASE),
+            0
+        );
+        assert!(demand_private().contains(p as usize).is_none());
+        assert!(demand_private().contains(sub as usize).is_none());
+    }
+
+    #[test]
+    fn demand_private_concurrent_faults_and_kernel_ensure_committed() {
+        let size = 16 * MIB;
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        let base = p as usize;
+        let threads: Vec<_> = (0..4usize)
+            .map(|tid| {
+                std::thread::spawn(move || {
+                    for i in 0..64usize {
+                        let page = base + i * PAGE;
+                        if (i + tid) % 5 == 0 {
+                            ensure_committed(page, PAGE);
+                        }
+                        // SAFETY: disjoint byte per thread within each 64 KiB page.
+                        unsafe {
+                            let slot = (page as *mut u8).add(tid * 16);
+                            let _ = slot.read_volatile();
+                            slot.write_volatile((tid as u8).wrapping_add(i as u8));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("demand-private worker panicked");
+        }
+        for i in 0..64usize {
+            let page = base + i * PAGE;
+            for tid in 0..4usize {
+                // SAFETY: all written pages are committed.
+                let got = unsafe { (page as *const u8).add(tid * 16).read_volatile() };
+                assert_eq!(got, (tid as u8).wrapping_add(i as u8));
+            }
+        }
+        assert_ne!(crate::modules::kernel::VirtualFree(p, 0, MEM_RELEASE), 0);
     }
 }

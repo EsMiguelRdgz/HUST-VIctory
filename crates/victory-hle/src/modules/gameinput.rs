@@ -1647,7 +1647,10 @@ mod tests {
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(r).buttons, UP | A);
         release(r);
-        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(READING_NOT_FOUND));
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
 
         // Releasing scripted buttons returns slot 1 to physical state only.
         host.lock().unwrap().scripted_buttons = 0;

@@ -382,7 +382,7 @@ impl Staging {
             return (size, lent);
         }
         if !committed(self.memory, size) {
-            if !partially_committed_mapped(self.memory, size) {
+            if !partially_committed(self.memory, size) {
                 #[cfg(feature = "diagnostics")]
                 tracing::debug!(
                     memory = ?self.memory,
@@ -516,13 +516,13 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     true
 }
 
-/// Whether `[at, at + len)` is entirely `MEM_MAPPED` (mapped physical-page
-/// views) with at least one `MEM_COMMIT` page. Returns `false` if any page is
-/// unmapped (`MEM_FREE`) or a placeholder (`MEM_PRIVATE`), or if none of the
+/// Whether `[at, at + len)` is entirely `MEM_MAPPED` or `MEM_PRIVATE`
+/// (`MEM_COMMIT` or `MEM_RESERVE`) with at least one `MEM_COMMIT` page.
+/// Returns `false` if any page is unmapped (`MEM_FREE`), or if none of the
 /// pages have been written/committed yet.
-fn partially_committed_mapped(at: *const u8, len: usize) -> bool {
+fn partially_committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     let mut p = at as usize;
     let end = p.saturating_add(len);
@@ -532,7 +532,11 @@ fn partially_committed_mapped(at: *const u8, len: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.RegionSize == 0 || info.Type != MEM_MAPPED {
+        if n == 0
+            || info.RegionSize == 0
+            || (info.Type != MEM_MAPPED && info.Type != MEM_PRIVATE)
+            || (info.State != MEM_COMMIT && info.State != MEM_RESERVE)
+        {
             return false;
         }
         if info.State == MEM_COMMIT {

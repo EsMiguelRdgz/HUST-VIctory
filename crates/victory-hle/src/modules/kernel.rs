@@ -350,6 +350,38 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+/// Keeps demand-committed `xmem` private ranges coherent when the title frees
+/// or decommits virtual memory directly via Win32 `VirtualFree`.
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32 {
+    host::virtual_free(address, size, free_type)
+}
+
+/// Ensures demand-committed `xmem` private pages in `[address, address + size)`
+/// are committed before Win32 `VirtualProtect` changes their protection.
+pub extern "system" fn VirtualProtect(
+    address: *mut c_void,
+    size: usize,
+    new_protect: u32,
+    old_protect: *mut u32,
+) -> i32 {
+    host::virtual_protect(address, size, new_protect, old_protect)
+}
+
+/// Reports demand-committed `xmem` ranges as `MEM_COMMIT` / `PAGE_READWRITE`.
+pub extern "system" fn VirtualQuery(address: *const c_void, out: *mut c_void, len: usize) -> usize {
+    host::virtual_query(address, out, len)
+}
+
+/// See [`VirtualQuery`].
+pub extern "system" fn VirtualQueryEx(
+    process: *mut c_void,
+    address: *const c_void,
+    out: *mut c_void,
+    len: usize,
+) -> usize {
+    host::virtual_query_ex(process, address, out, len)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -357,6 +389,7 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
@@ -382,6 +415,10 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(VirtualFree),
+            hle_export!(VirtualProtect),
+            hle_export!(VirtualQuery),
+            hle_export!(VirtualQueryEx),
         ],
     }
 }
@@ -402,7 +439,12 @@ mod host {
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
         GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
     };
-    use windows_sys::Win32::System::Threading::TerminateProcess;
+    use windows_sys::Win32::System::Memory::{
+        MEMORY_BASIC_INFORMATION, VirtualFree, VirtualProtect, VirtualQuery, VirtualQueryEx,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetProcessId, TerminateProcess,
+    };
 
     unsafe extern "C" {
         #[link_name = "exit"]
@@ -484,6 +526,58 @@ mod host {
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
+    }
+
+    pub(super) fn virtual_free(address: *mut c_void, size: usize, free_type: u32) -> i32 {
+        super::super::xmem::on_virtual_free(address, size, free_type);
+        // SAFETY: forwarding the title's own arguments to host `VirtualFree`.
+        unsafe { VirtualFree(address, size, free_type) }
+    }
+
+    pub(super) fn virtual_protect(
+        address: *mut c_void,
+        size: usize,
+        new_protect: u32,
+        old_protect: *mut u32,
+    ) -> i32 {
+        if !address.is_null() && size > 0 {
+            super::super::xmem::ensure_private_committed(address as usize, size);
+        }
+        // SAFETY: forwarding the title's own arguments to host `VirtualProtect`.
+        unsafe { VirtualProtect(address, size, new_protect, old_protect) }
+    }
+
+    pub(super) fn virtual_query(address: *const c_void, out: *mut c_void, len: usize) -> usize {
+        // SAFETY: forwarding the title's own arguments to host `VirtualQuery`.
+        let n = unsafe { VirtualQuery(address, out.cast(), len) };
+        if n >= size_of::<MEMORY_BASIC_INFORMATION>() && !out.is_null() {
+            // SAFETY: `VirtualQuery` wrote a complete `MEMORY_BASIC_INFORMATION`.
+            super::super::xmem::adjust_query_info(address as usize, unsafe { &mut *out.cast() });
+        }
+        n
+    }
+
+    pub(super) fn virtual_query_ex(
+        process: *mut c_void,
+        address: *const c_void,
+        out: *mut c_void,
+        len: usize,
+    ) -> usize {
+        // SAFETY: forwarding the title's own arguments to host `VirtualQueryEx`.
+        let n = unsafe { VirtualQueryEx(process, address, out.cast(), len) };
+        if n >= size_of::<MEMORY_BASIC_INFORMATION>() && !out.is_null() {
+            // SAFETY: querying current process handle/id for self-process check.
+            let is_self = unsafe {
+                process == GetCurrentProcess() || GetProcessId(process) == GetCurrentProcessId()
+            };
+            if is_self {
+                // SAFETY: `VirtualQueryEx` wrote a complete `MEMORY_BASIC_INFORMATION`.
+                super::super::xmem::adjust_query_info(address as usize, unsafe {
+                    &mut *out.cast()
+                });
+            }
+        }
+        n
     }
 
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
@@ -579,6 +673,27 @@ mod host {
 
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
+    }
+
+    pub(super) fn virtual_free(_: *mut c_void, _: usize, _: u32) -> i32 {
+        0
+    }
+
+    pub(super) fn virtual_protect(_: *mut c_void, _: usize, _: u32, _: *mut u32) -> i32 {
+        0
+    }
+
+    pub(super) fn virtual_query(_: *const c_void, _: *mut c_void, _: usize) -> usize {
+        0
+    }
+
+    pub(super) fn virtual_query_ex(
+        _: *mut c_void,
+        _: *const c_void,
+        _: *mut c_void,
+        _: usize,
+    ) -> usize {
+        0
     }
 
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
