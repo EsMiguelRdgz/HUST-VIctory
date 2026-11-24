@@ -1,14 +1,14 @@
 # Current Project Status
 
-- Current milestone: Phase 13 — Private GitHub (`EsMiguelRdgz/HUST-VIctory`), DPAPI Discord Notifications, Upstream Comparison & Selective Integration (`Marvisak/VIctory` @ `d2a4bae`), Phase 12 Correctness Audit, and Controlled PowerShell Diagnostic Harness
-- Current subphase: Phase 13 offline engineering COMPLETE; READY for optional local Discord webhook setup and ONE controlled, instrumented RTX 3070 diagnostic run (NO-GO for gameplay/stress testing)
+- Current milestone: Phase 13.1 — Fully Autonomous GPU Debugging, Repair & Hardware Validation on NVIDIA GeForce RTX 3070 (8 GB VRAM, 32 GB DDR4 RAM)
+- Current subphase: Phase 13.1 autonomous loop complete (4/4 rolling 24h hardware launches used); Frame-2 `0x887A0001` GPU device removal CONFIRMED FIXED on RTX 3070, >10 GB boot commit reduction CONFIRMED on RTX 3070 (full 90 s / 2048+ frames @ 30.0 FPS locked, 665 MB VRAM, 9.03 GB free commit headroom), and Launch #4/4 `watch::title_memory_remapped` `PAGE_READONLY` concurrency race FIXED & OFFLINE VERIFIED (ready for next hardware validation once 24h budget resets or user manually runs)
 - Current branch: `hust/phase12-memory` (tracks private `origin/hust/phase12-memory` at `https://github.com/EsMiguelRdgz/HUST-VIctory.git`; `upstream` = `https://github.com/Marvisak/VIctory.git`)
-- Latest verified commit: `135fd56` (Phase 13 commits: `0227ffa`, `65d66d9`, `b0cc7ce`, `a6f5988`, `ed88284`, `484dfad`, `135fd56`, plus this progress checkpoint; preserves all Phase 1–12 commits)
+- Latest verified commit: `b8266dd` (Phase 13.1 commits: `57a3da9`, `74180c2`, `fd55aac`, `849b764`, `b8266dd`, plus this checkpoint; preserves all Phase 1–13 commits)
 - Current working-tree status: clean except this checkpoint
 - Active agent: Antigravity
-- Last checkpoint timestamp: 2026-11-24 (Phase 13 complete offline)
-- Current build status: diag build OK (`target/diag/victory.exe`, not launched)
-- Current test status: full matrix PASSED at `135fd56` (workspace `305 passed / 0 failed / 8 ignored`: 3 external-data + 5 benchmarks; WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` `99 passed / 0 failed / 4 ignored`, 0 debug layer errors; `cargo xtask policy` 160 files ok; clippy both configs 0 new warnings, only pre-existing `list.rs:1441`; PowerShell harness 6/6 synthetic self-tests passed; diag build OK)
+- Last checkpoint timestamp: 2026-11-24T05:01Z (Phase 13.1 complete)
+- Current build status: diag build OK (`target/diag/victory.exe` rebuilt at `b8266dd`)
+- Current test status: full matrix PASSED at `b8266dd` (`cargo xtask policy` 160 files ok; `cargo test --workspace` all passed, 0 failed; WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` `100 passed / 0 failed / 4 ignored`, 0 debug layer errors; `cargo clippy --workspace --all-targets` & `--features diagnostics` 0 new warnings; `bench_physical_page_commit` 512 MiB `mapped=+3 MiB`; diag build OK)
 
 ## Phase 11 trigger (user report, RTX 3070 test 1)
 
@@ -50,20 +50,34 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 
 ## Active Task
 
-- Objective: none in progress; Phase 13 offline work complete and pushed to private `origin` (`EsMiguelRdgz/HUST-VIctory`). Full checkpoints at `G:\VIctory-Results\phase13-progress.md` and `G:\VIctory-Results\upstream-comparison-phase13.md`.
+- Objective: Phase 13.1 complete (4/4 rolling 24h autonomous hardware launches used). Next step requires either waiting for the rolling 24h launch budget to refresh (earliest slot frees at `2026-11-25T04:36:56Z`) or manual user launch of `target\diag\victory.exe` at `b8266dd` to validate scripted progression past the `"ACCOUNT PICKER (Y)   PLAYER (A)"` prompt with the `watch::title_memory_remapped` `PAGE_READONLY` race fix included. Full checkpoint at `G:\VIctory-Results\phase13-progress.md`.
 
 ## Immediate Resume Instructions
 
 - One-message session recovery (after any pause/quota reset): `"Resume HUST VIctory from the latest checkpoint."`
-- First action:
-  1. Optionally configure the local DPAPI Discord webhook (`powershell -ExecutionPolicy Bypass -File G:\VIctory\tools\discord\Setup-DiscordWebhook.ps1 -Test`).
-  2. When ready, run ONE controlled hardware diagnostic via `tools\diag\Run-VictoryDiagnostic.ps1 -TitleExe "<path-to-title-exe>" -AuthorizeGameLaunch -MaxDurationSeconds 600 -MinCommitHeadroomGB 5.0` (close heavy non-essential background apps first; commit guard stays ON; debug/DRED/capture OFF) and inspect the resulting `G:\VIctory-Results\diag-hw-<timestamp>\report.md` and `memory-*.log`.
-- Next implementation step (evidence-dependent after controlled hardware run):
-  - Evaluate real GTA VI `host textures` vs `deferred textures`, `lazy mat`, `tex evicted`, `commit breakdown`, pipeline compile/cache timings, and whether the run progresses past Phase 11 without hitting the commit guard or `DXGI_ERROR_DEVICE_HUNG`.
-  - If visual artifacts appear with lazy textures, A/B test with `-DisableLazyTextures` (`VICTORY_LAZY_TEXTURES=0`).
-  - Once Phase 12/13 memory stability is hardware-confirmed, evaluate Phase 14 selective integration of upstream `indirect.rs` (currently deferred because upstream reports ~55 s GPU page faults with indirect enabled) and `4e94c2b` DirectStorage single-view-per-run writes (adapted to our 16 MiB sections) or `OpenExistingHeapFromAddress` for buffer shadows if buffer copies become dominant.
-- Pending user authorizations: local Discord webhook setup (secret stays local in DPAPI), and explicit user execution/authorization for any real RTX 3070 game run.
-- Remaining risks: actual GTA VI used-vs-unused texture ratio and real commit reduction remain UNVERIFIED until measured on hardware; upstream GPU RAW/WAW command-ordering fixes are NOT yet published in `Marvisak/VIctory` (`d2a4bae`); NVIDIA WDDM retains a bounded driver reuse pool after `DEFAULT` texture release; `DXGI_ERROR_DEVICE_HUNG` post-Phase-12/13 changes remains unverified on hardware.
+- First action (once 24h hardware launch budget frees or user launches manually):
+  1. Verify `git status` clean on `hust/phase12-memory` @ `b8266dd` (or latest checkpoint commit) and `G:\VIctory\target\diag\victory.exe` up to date.
+  2. Run controlled RTX 3070 progression test past Account Picker via `Run-VictoryDiagnostic.ps1`:
+     ```powershell
+     powershell -NoProfile -ExecutionPolicy Bypass -File G:\VIctory\tools\diag\Run-VictoryDiagnostic.ps1 `
+       -TitleExe "C:\Users\esmig\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe" `
+       -AuthorizeGameLaunch `
+       -EnableDred `
+       -EnableCapture `
+       -ScriptedKeys "12:Enter,18:Enter,25:Enter,33:Enter,42:Enter,52:Enter" `
+       -CaptureFrames "350,450,600,800,1200,1500,1800,2200,2600" `
+       -MaxDurationSeconds 90 `
+       -MinPreLaunchHeadroomGB 10.0 `
+       -MinCommitHeadroomGB 5.0 `
+       -TestLabel "post-watch-fix-progression"
+     ```
+- Next implementation step (evidence-dependent after progression past Account Picker):
+  - Inspect captured frames & `memory-*.log` during setup/loading/world streaming; verify zero `0xC0000005` regressions and check whether any later D3D12 shader/barrier/indirect issue appears during world loading.
+  - Note: Do NOT run `-EnableDebugLayer` while baseline desktop commit is ~25.6/43.4 GB (Debug Layer overhead trips the 5 GB harness headroom cutoff before Frame 1); use `-EnableDred` + zero-overhead `host::check_removed()` checkpoints instead.
+- Remaining risks:
+  - `b8266dd` (`watch::title_memory_remapped` `PAGE_READONLY` race fix) is verified offline with deterministic + 200-iteration concurrent stress tests, but NOT YET re-tested on GTA VI hardware because the 4/4 rolling 24h launch budget was exhausted on Launch #4/4.
+  - Progression past `"ACCOUNT PICKER (Y)   PLAYER (A)"` into world loading/gameplay has NOT YET been measured on hardware (Launch #3/4 sat at Account Picker for 90 s @ 30.0 FPS; Launch #4/4 hit the `watch.rs` race at Frame 32 before the first scripted `Enter` at 12 s).
+  - Upstream GPU RAW/WAW command-ordering fixes are not yet published in `Marvisak/VIctory` (`d2a4bae`); world-loading rendering completeness remains to be validated once past menus.
 - Commands required:
   - `cargo xtask policy`
   - `cargo test --workspace`
@@ -211,3 +225,19 @@ Uncertain without a run: the real sizes of items 1-2 for GTA VI, whether host te
 - Upstream audit (`upstream/main` = `d2a4bae1f49533ef5cb512fd1b1ba1513f2e1989`): detailed 74-commit triage written to `G:\VIctory-Results\upstream-comparison-phase13.md`. Confirmed async/cached pipelines published in `35b054e`; confirmed GPU command ordering / RAW & WAW barrier fixes are NOT yet published in upstream source; deferred `indirect.rs` until Phase 12/13 memory stability is hardware-verified.
 - Full verification at `135fd56`: `cargo xtask policy` (`160 files ok`); `cargo test --workspace` (`305 passed, 0 failed, 8 ignored`); WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` (`99 passed, 0 failed, 4 ignored`, 0 debug layer errors); `cargo clippy --workspace --all-targets` & `--features diagnostics` (0 new warnings; only pre-existing `list.rs:1441`); `cargo build --profile diag -p victory --features diagnostics` OK (`target/diag/victory.exe`, not launched); synthetic `bench_phase12_lazy_textures_and_eviction` re-verified (`+1030 MiB -> 0 MiB / +66 MiB`, `256 -> 0 MiB` eviction).
 - Status: GO for ONE controlled, instrumented RTX 3070 diagnostic run (manual execution via `tools/diag/Run-VictoryDiagnostic.ps1 -AuthorizeGameLaunch`); NO-GO for gameplay/stress testing. Real GTA VI memory reduction and world rendering remain UNVERIFIED until measured on hardware.
+
+### 2026-11-24 — Antigravity — Phase 13.1 Autonomous GPU Debugging, Repair & Hardware Validation (4/4 24h launches used)
+
+- Starting commit: `8f7ce146c66821f09325e37a2e923d620bdf44f8` (after user's initial Phase 13 hardware test `diag-hw-20261124-002335` hit Frame-2 `0x887A0005` / `0x887A0001 (DXGI_ERROR_INVALID_CALL)` at 9.44 s).
+- Phase 13.1 commits pushed to private `origin/hust/phase12-memory`:
+  - `57a3da9`: Early failure memory snapshot + stderr flush (`host.rs::fail`), first-failure logging (`resource.rs::host_texture`), unconditional `queue::presented()`, A/B toggles `VICTORY_SYNC_PIPELINES=1` & `VICTORY_PIPELINE_CACHE=0`, and hardened `Run-VictoryDiagnostic.ps1` with rolling 24h 4-launch ledger (`%LOCALAPPDATA%\HUST-VIctory\hw-launch-history.json`), >=10 GB pre-launch headroom, >=5 GB runtime cutoff, >=60 s recovery wait, single-instance & NVIDIA adapter health checks, and start+completion Discord notifications.
+  - `74180c2`: **Root-cause fix for Frame-2 `0x887A0001 (DXGI_ERROR_INVALID_CALL)`** — hardened `descriptor/host.rs::sanitize_null_srv` & `sanitize_null_uav` to always use universally valid host formats (`DXGI_FORMAT_R8G8B8A8_UNORM` for texture SRVs, `DXGI_FORMAT_R32_UINT` for texture UAVs, bounded `StructureByteStride <= 2048` & `NumElements: 1` for buffer NULLs) and `D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING`, eliminating console-only formats (`116, 117, 189, 190, 191`), BC-on-1D/2DMS mismatches, and invalid component-mapping bits passed to `CreateShaderResourceView(None, ...)` during `Heap::host()` pending mirror; added zero-overhead `host::check_removed()` checkpoints across `Heap::host()`, `pipeline::library`, `Host::execute`, and `Host::present` + expanded WARP+Debug regression tests.
+  - `fd55aac`: **Demand-committed guest physical pages (`xmem.rs`)** — kept untouched 64 KiB `SEC_RESERVE` pages `MEM_RESERVE` (0 bytes system commit) until first CPU read/write fault (VEH handler `on_physical_fault`), kernel write (`ensure_committed` wired through `victory_gpu::kernel_will_write` for `ReadFile`/`fread`/DirectStorage), `write_physical`, or GPU copy-back (`host::copy_mapped`, `host::write_mapped`, `list::copy_memory`); added partially-committed `MEM_MAPPED` texture upload support (`texture.rs::partially_committed_mapped`); added 2 s initial `memstat` tick; opt-out `VICTORY_EAGER_PHYSICAL_COMMIT=1`; verified 512 MiB synthetic benchmark `mapped=+3 MiB` (was `+515 MiB`).
+  - `849b764`: Added optional `-ScriptedKeys` (`VICTORY_KEYS`) and `-CaptureFrames` (`VICTORY_CAPTURE_FRAMES`) to `Run-VictoryDiagnostic.ps1`.
+  - `b8266dd`: **Root-cause fix for Launch #4/4 `0xC0000005` (`watch.rs` concurrency race)** — fixed `watch::title_memory_remapped()` to call `open(&mut guards(), at, at + len)` so `PAGE_READWRITE` is always restored before removing blocks from `g.protected` (preventing a race where `watch::guard()` marks a freshly demand-committed block `PAGE_READONLY` right before `title_memory_remapped()` runs and strands it read-only outside `g.protected`); added deterministic + 200-iteration multi-threaded stress test (`concurrent_guard_and_title_memory_remapped_never_strands_readonly`); updated `Run-VictoryDiagnostic.ps1` to classify only newly appended `crashes.log` bytes.
+- Hardware validation launches on RTX 3070 (4/4 rolling 24h budget used):
+  1. Launch #1/4 (`57a3da9`, `G:\VIctory-Results\diag-hw-20261124-003643`, `-EnableDebugLayer -EnableDred`): stopped safely by `HarnessCommitHeadroomGuard` at `7.95 s` (`4,622.5 MB < 5 GB`) before Frame 1 due to Debug Layer overhead (~700 MB) on 25.6 GB desktop baseline.
+  2. Launch #2/4 (`74180c2`, `G:\VIctory-Results\diag-hw-20261124-004401`, `-EnableDred`): **CONFIRMED `0x887A0001` FIXED** — survived `HostHeap::new` & pending mirror with 0 GPU errors, reached **Frame 16** (`draws=24, drawn=24`, audio connected, `284.6 MB` GPU local), stopped safely by `HarnessCommitHeadroomGuard` at `8.80 s` (`5,101.8 MB`, 18.2 MB below 5 GB floor) due to eager 6.1 GiB `XMemMapPhysicalPages` commit.
+  3. Launch #3/4 (`fd55aac`, `G:\VIctory-Results\diag-hw-20261124-005340`, `-EnableDred -EnableCapture`): **FULL 90-SECOND RUN (`MaxDurationReached`, 92.84 s, 0 crashes, 0 GPU errors)** — reached **Frame 2048+ locked at 30.0 FPS** (`13/13` draws, `1/1` dispatches, `0` dropped), `guest physical` dropped to **769.7 MB** (-89.1% vs Phase 11's 7,090.4 MB), `host textures` **555.4 MB** live + **3,964.7 MB** deferred at 0 VRAM/commit (-87.2% vs Phase 11's 4,326.9 MB), `GPU local VRAM` **665 MB** (-85% vs Phase 11's 4,429 MB), `private` flat at **7,737 MB**, `min commit headroom` **9,032 MB** (total `victory` commit **8,507 MB** vs >18,544 MB in Phase 11 — **>10 GB saved**). Captured PNGs (`frame-256.png`..`frame-2048.png`) visually confirmed crisp 4K UI at `"ACCOUNT PICKER (Y)   PLAYER (A)"`.
+  4. Launch #4/4 (`849b764`, `G:\VIctory-Results\diag-hw-20261124-005728`, `-EnableDred -EnableCapture -ScriptedKeys ...`): hit `0xC0000005` write fault at `0x990ffe8` (inside 182 MB `MEM_MAPPED` buffer `0x9390000`) at Frame 32 (`9.43 s`, before first scripted key at 12 s) due to the `watch::title_memory_remapped` stranded-`PAGE_READONLY` race — fixed and offline-verified in `b8266dd`.
+- Full verification at `b8266dd`: `cargo xtask policy` (`160 files ok`); `cargo test --workspace` (all passed, 0 failed); WARP + D3D12 Debug Layer `victory-gpu --features diagnostics` (`100 passed, 0 failed, 4 ignored`, 0 debug errors); `cargo clippy --workspace --all-targets` & `--features diagnostics` (0 new warnings); `cargo build --profile diag -p victory --features diagnostics` OK (`target/diag/victory.exe`).
