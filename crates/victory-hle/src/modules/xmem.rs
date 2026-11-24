@@ -318,13 +318,46 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 }
 
 // Physical pages: on the console, 64 KiB frames a title maps into its own
-// reservations, at more than one address if it likes. Here each allocation
-// is a pagefile-backed section, its pages are 64 KiB slices of it, and a
-// mapping is a view of consecutive slices in place of a host placeholder.
+// reservations, at more than one address if it likes. Here an allocation is
+// pagefile-backed sections of up to `CHUNK` pages each, its pages are 64 KiB
+// slices of them, and a mapping is a view of consecutive slices of one
+// section in place of a host placeholder.
+//
+// A section's committed pages are charged to the system commit until the
+// section is gone, which is when every page of it has been freed and
+// unmapped: pages of one section cannot be decommitted on their own. One
+// section per allocation (Grand Theft Auto VI asks for 6.1 GiB at once) kept
+// a whole pool committed while any page of it was still allocated; chunks
+// give back what the title frees, 16 MiB at a time.
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// Pages per section.
+const CHUNK: usize = 256;
+
+struct Section {
+    handle: HANDLE,
+    /// Which of its pages have been committed (pages are committed when
+    /// first mapped or written, and stay so for the section's life).
+    committed: Mutex<Vec<bool>>,
+}
+
+impl Section {
+    /// Notes pages `[first, first + n)` committed; counts those that were not.
+    fn committed(&self, first: usize, n: usize) {
+        let mut committed = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pages) = committed.get_mut(first..first + n) else {
+            return;
+        };
+        let new = pages.iter().filter(|&&c| !c).count();
+        pages.fill(true);
+        victory_gpu::memstat::adjust(
+            victory_gpu::memstat::Kind::GuestPhysical,
+            (new * PAGE) as u64,
+            0,
+        );
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -333,9 +366,37 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
-        // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        let committed = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = committed.iter().filter(|&&c| c).count() * PAGE;
+        victory_gpu::memstat::free(victory_gpu::memstat::Kind::GuestPhysical, bytes as u64);
+        // SAFETY: our handle; views keep the section alive on their own,
+        // and none is left: every slice (views hold theirs) is gone.
+        unsafe { CloseHandle(self.handle) };
     }
+}
+
+/// A pagefile-backed section of `pages` pages, none committed yet.
+fn section(pages: usize) -> Option<Section> {
+    let size = (pages * PAGE) as u64;
+    // SAFETY: plain section creation.
+    let handle = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            PAGE_READWRITE | SEC_RESERVE,
+            (size >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return None;
+    }
+    victory_gpu::memstat::alloc(victory_gpu::memstat::Kind::GuestPhysical, 0);
+    Some(Section {
+        handle,
+        committed: Mutex::new(vec![false; pages]),
+    })
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -377,43 +438,37 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).is_none_or(|s| s == 0) {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            PAGE_READWRITE | SEC_RESERVE,
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    }
+    // Sections of up to `CHUNK` pages, committed page by page when first
+    // mapped or written (`commit`): Grand Theft Auto VI asks for 6.1 GiB at
+    // once, which a busy host often cannot commit (error 1450).
+    let mut sections = Vec::with_capacity(n.div_ceil(CHUNK));
+    for first in (0..n).step_by(CHUNK) {
+        let Some(section) = section(CHUNK.min(n - first)) else {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            victory_gpu::memstat::count(victory_gpu::memstat::Event::Failures, 1);
+            // All or nothing: the sections made so far close as they drop.
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        };
+        sections.push(Arc::new(section));
     }
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
     for index in 0..n {
         let slice = Slice {
-            section: section.clone(),
-            index,
+            section: sections[index / CHUNK].clone(),
+            index: index % CHUNK,
         };
         let number = first + index * FRAMES;
         physical.pages.insert(number, slice);
@@ -459,7 +514,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         // SAFETY: one page of a section we own, mapped for the copy only.
         let view = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (at >> 32) as u32,
                 at as u32,
@@ -474,6 +529,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
             unsafe { UnmapViewOfFile(view) };
             return false;
         }
+        slice.section.committed(slice.index, 1);
         let n = (PAGE - within).min(data.len() - done);
         // SAFETY: the view holds `PAGE` bytes; `within + n <= PAGE`.
         unsafe {
@@ -602,7 +658,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -627,6 +683,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    slice.section.committed(slice.index, len / PAGE);
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     physical.views.insert(base, (len, slice));
@@ -644,6 +701,7 @@ fn commit(base: usize, len: usize) -> bool {
             error = %std::io::Error::last_os_error(),
             "committing physical pages failed"
         );
+        victory_gpu::memstat::count(victory_gpu::memstat::Event::Failures, 1);
     }
     done
 }
@@ -952,5 +1010,101 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// Synthetic benchmark (run alone, `--ignored --test-threads=1`): system
+    /// commit charged by 512 MiB of physical pages at each step of their
+    /// life. Prints `phase commit-delta-MiB` lines; the regression test
+    /// [`partly_freed_physical_pages_return_their_commit`] asserts on them.
+    #[test]
+    #[ignore]
+    fn bench_physical_page_commit() {
+        for (phase, delta) in physical_page_commit_steps(512 * MIB) {
+            println!("physical-pages {phase} {:+.0}", delta as f64 / MIB as f64);
+        }
+    }
+
+    /// Freeing most of a pool gives its commit back (it used to stay charged
+    /// until the last page was freed), and freeing all of it gives back the
+    /// rest. The system commit moves with other processes too: margins.
+    #[test]
+    fn partly_freed_physical_pages_return_their_commit() {
+        let steps = physical_page_commit_steps(256 * MIB);
+        let step = |name| steps.iter().find(|s| s.0 == name).expect("step").1 / MIB as i128;
+        assert!(step("allocated") < 64, "{steps:?}");
+        assert!(step("mapped") > 192, "{steps:?}");
+        assert!(
+            step("unmapped") > 192,
+            "allocated pages keep their data: {steps:?}"
+        );
+        assert!(step("seven-eighths-freed") < 128, "{steps:?}");
+        assert!(step("all-freed") < 64, "{steps:?}");
+    }
+
+    /// Pages committed through views are counted once per page, and
+    /// uncounted when their sections go.
+    #[test]
+    fn physical_page_commit_is_accounted() {
+        use victory_gpu::memstat::{Kind, live};
+        let mut pages = [0usize; 2 * CHUNK];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let at = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!at.is_null());
+        let before = live(Kind::GuestPhysical).0;
+        assert_eq!(XMemMapPhysicalPages(at, n, pages.as_ptr()), at);
+        // Mapped twice (a second view of the first chunk): still once.
+        assert!(write_physical(&pages[..1], 0, &[1]));
+        let mapped = live(Kind::GuestPhysical).0;
+        assert!(mapped >= before + (n * PAGE) as u64, "{before} {mapped}");
+        assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+        // Other tests commit physical pages too: what this one freed is gone.
+        assert!(live(Kind::GuestPhysical).0 + (n * PAGE) as u64 <= mapped + (64 * PAGE) as u64);
+        // SAFETY: our own placeholder reservation.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+    }
+
+    /// Allocates `size` bytes of physical pages, maps them, unmaps them, frees
+    /// the first 7/8, then the rest; the system commit after each step
+    /// relative to before the allocation.
+    fn physical_page_commit_steps(size: usize) -> Vec<(&'static str, i128)> {
+        let commit = || victory_gpu::memstat::system_commit().expect("commit").0 as i128;
+        let n = size / PAGE;
+        let mut pages = vec![0usize; n];
+        let base = commit();
+        let mut steps = Vec::new();
+        let mut count = n;
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
+            1
+        );
+        steps.push(("allocated", commit() - base));
+        let at = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!at.is_null());
+        assert_eq!(XMemMapPhysicalPages(at, n, pages.as_ptr()), at);
+        steps.push(("mapped", commit() - base));
+        assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
+        steps.push(("unmapped", commit() - base));
+        let freed = n / 8 * 7;
+        assert_eq!(XMemFreePhysicalPages(freed, pages.as_ptr()), 1);
+        steps.push(("seven-eighths-freed", commit() - base));
+        assert_eq!(XMemFreePhysicalPages(n - freed, pages[freed..].as_ptr()), 1);
+        steps.push(("all-freed", commit() - base));
+        // SAFETY: our own placeholder reservation.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+        steps
     }
 }
