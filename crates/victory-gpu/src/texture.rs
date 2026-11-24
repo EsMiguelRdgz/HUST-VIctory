@@ -105,12 +105,18 @@ fn give_read(v: Vec<u8>) {
 }
 
 // SAFETY: the staging mapping is written only at submission, under
-// `last`'s lock; the title memory is only read.
+// `last`'s lock (by that thread, or by workers it waits for, each on its own
+// subresources); the title memory is only read.
 unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+/// Bytes of a texture past which its subresources detile on several
+/// threads. shortcut: not measured; tune from an authorized run's texture
+/// preparing times (`VICTORY_COPY_WORKERS=1` for the serial baseline).
+const PARALLEL_DETILE: usize = 8 << 20;
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
@@ -257,23 +263,41 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
-            let f = footprint.Footprint;
-            let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
-            }
-        }
+        // Subresources detile into disjoint parts of the staging buffer, so
+        // a big texture's are shared among a few threads.
+        let subresources: Vec<usize> = (0..self.footprints.len()).collect();
+        crate::par::for_each(
+            &subresources,
+            crate::par::workers(),
+            PARALLEL_DETILE,
+            |&i| self.subresource_len(i),
+            |&i| {
+                let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+                let footprint = &self.footprints[i];
+                let pitch = footprint.Footprint.RowPitch as usize;
+                // SAFETY: subresource `i`'s own part of the mapped staging
+                // buffer; no other item writes it, nothing reads it now.
+                let linear = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.data.add(footprint.Offset as usize),
+                        self.subresource_len(i),
+                    )
+                };
+                let depth_pitch = pitch * self.rows[i] as usize;
+                if let Err(e) = self
+                    .layout
+                    .detile(tiled, mip, slice, linear, pitch, depth_pitch)
+                {
+                    tracing::warn!(?e, mip, slice, "texture subresource not detiled");
+                }
+            },
+        );
+    }
+
+    /// Bytes of subresource `i` in the staging buffer.
+    fn subresource_len(&self, i: usize) -> usize {
+        let f = self.footprints[i].Footprint;
+        f.RowPitch as usize * self.rows[i] as usize * f.Depth as usize
     }
 }
 
@@ -361,6 +385,114 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+    /// Every subresource of a texture big enough to detile on several
+    /// threads lands, row for row, where the host texture's footprints say.
+    #[test]
+    fn detiling_fills_every_subresource() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (width, mips, slices, bpe) = (512u32, 3u32, 2u32, 16u32);
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width,
+            height: width,
+            depth: slices,
+            mips,
+            element_bytes: bpe,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_D,
+        })
+        .expect("layout");
+        assert!(
+            layout.size as usize > PARALLEL_DETILE,
+            "detiles in parallel"
+        );
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(width),
+            Height: width,
+            DepthOrArraySize: slices as u16,
+            MipLevels: mips as u16,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_UINT,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let count = (mips * slices) as usize;
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count];
+        let mut rows = vec![0u32; count];
+        let mut total = 0;
+        // SAFETY: outputs for `count` subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                0,
+                count as u32,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                None,
+                Some(&mut total),
+            );
+        }
+        let (buffer, data) = host.upload_buffer(total).expect("staging");
+        memstat::alloc(Kind::TextureStaging, total);
+        let staging = Staging {
+            buffer,
+            data,
+            footprints,
+            rows,
+            layout: layout.clone(),
+            mips,
+            memory: std::ptr::null(),
+            last: Mutex::default(),
+            bytes: total,
+        };
+
+        // Distinct contents per subresource and texel, tiled as the console.
+        let mut tiled = vec![0u8; layout.size as usize];
+        let texel = |i: usize, x: usize, y: usize| (i * 131 + x * 7 + y * 13) as u8;
+        let linear_of = |i: usize| {
+            let w = (width >> (i as u32 % mips)) as usize;
+            let mut v = vec![0u8; w * w * bpe as usize];
+            for y in 0..w {
+                for x in 0..w * bpe as usize {
+                    v[y * w * bpe as usize + x] = texel(i, x, y);
+                }
+            }
+            (w, v)
+        };
+        for i in 0..count {
+            let (w, linear) = linear_of(i);
+            let pitch = w * bpe as usize;
+            let (mip, slice) = (i as u32 % mips, i as u32 / mips);
+            layout
+                .tile(&mut tiled, mip, slice, &linear, pitch, pitch * w)
+                .expect("tile");
+        }
+        staging.detile(&tiled);
+        for i in 0..count {
+            let (w, linear) = linear_of(i);
+            let f = staging.footprints[i];
+            let pitch = f.Footprint.RowPitch as usize;
+            for y in 0..w {
+                // SAFETY: row `y` of subresource `i` in the mapped staging.
+                let row = unsafe {
+                    std::slice::from_raw_parts(
+                        staging.data.add(f.Offset as usize + y * pitch),
+                        w * bpe as usize,
+                    )
+                };
+                assert_eq!(row, &linear[y * w * bpe as usize..][..w * bpe as usize]);
+            }
+        }
+    }
 
     /// Read buffers are reused when big enough and the pool keeps within
     /// its bounds; a buffer bigger than the whole budget is not kept.
