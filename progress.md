@@ -1,15 +1,21 @@
 # Current Project Status
 
-- Current milestone: Phase 10 — memory architecture, copy-back performance, bounded parallelism, GPU acceleration, resource budgeting, and robustness
-- Current subphase: Phase 10 source work for priorities 1-8 committed and unit-verified; Phase 10 is NOT complete: the memory/parallelism/GPU objectives still need an authorized hardware run (see Manual validation) and the GPU-detile decision depends on it
+- Current milestone: Phase 11 — P0 RAM / system-commit exhaustion investigation (supersedes Phase 10 performance tuning)
+- Current subphase: Phase 11A — memory ownership audit (started 2026-11-23)
 - Current branch: `hust/nvidia-rtx3070`
-- Latest verified commit: `dc93210`. Phase 10 commits: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`, `13c97ad`, `ec38425`, `7036da9`, `ba4cb15`, `2798f11`, `6e0728c`, `e9d3629`, `ac7525f`, `341fbd6`, `24dd7ab`, `bd1e569`, `318c2ca`, `b16585e`, `dc93210`
-- Current working-tree status: clean except this progress.md checkpoint (committed with the next change)
+- Latest verified commit: `05d6207` (end of Phase 10 work; Phase 10 left open pending hardware validation)
+- Current working-tree status: clean at Phase 11 start
 - Active agent: Claude Code
 - Model: Claude Opus 5.5
-- Last checkpoint timestamp: 2026-11-23 (Claude recovery checkpoint)
-- Current build status: PASS (`cargo test --workspace --no-run`)
-- Current test status: at `dc93210`: `cargo test --workspace` 258 passed / 0 failed / 3 ignored; `cargo clippy --workspace --all-targets` only the pre-existing undocumented-unsafe warning (now at `list.rs:1430`, shifted from 1398 by new code above it); 40 gpu stress runs 0 failures
+- Last checkpoint timestamp: 2026-11-23 (Phase 11 start)
+- Current build status: PASS at `dc93210`
+- Current test status: workspace 258/0/3 at `dc93210`
+
+## Phase 11 trigger (user report, RTX 3070 test 1)
+
+- Windows 11, RTX 3070 8 GB, 32 GB RAM. Task Manager: RAM 26.8/31.9 GB, available 5.1 GB, system commit 49.5/50.5 GB (~1 GB headroom); game unresponsive; manually closed; no new frame captures; no GPU crash confirmed.
+- `G:\VIctory-Resultstx3070-test-1.txt` has no application log (transcript only). It shows the run used `VICTORY_D3D12_DEBUG=1` (D3D12 debug layer ON), `VICTORY_D3D12_DRED=1`, `VICTORY_COPY_WORKERS=1`, `VICTORY_LOG=victory_gpu=info,info`, `VICTORY_CAPTURE` set, diag build `target\diagictory.exe`.
+- Earlier logs (`phase9-rtx3070/run-20261123-205042/console.txt`, UTF-16LE) predate memstat: only 8 "large buffer copied" lines (>=16 MiB) totalling ~465 MB; no commit data.
 
 ## Active Task
 
@@ -136,3 +142,8 @@
 - Session 2 (same agent, after user granted standing commit authorization): committed `54a7346`, `8f834d1`, `e24bc28` as recorded in Completed Tasks. Resume at Priority 3 accounting.
 - Session 2 continued: committed `6e0728c`, `e9d3629`, `ac7525f`, `341fbd6`, `24dd7ab`, `bd1e569`, `318c2ca`. Phase 10 remains open pending the authorized hardware run.
 - Session 3 (user: continue without hardware): committed `dc93210` (allocation guards); assessed the shared-shadow refresh race (no fix needed). All remaining Phase 10 work needs the authorized hardware run.
+
+### 2026-11-23 — Claude Code / Claude Opus 5.5 — Phase 11 memory investigation
+
+- Starting commit: `05d6207`; tree clean; AGENTS.md/CLAUDE.md/progress.md present.
+- In progress: see Phase 11 sections above.
