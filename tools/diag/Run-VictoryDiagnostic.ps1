@@ -1,16 +1,17 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Controlled, safety-guarded diagnostic harness for HUST-VIctory.
 .DESCRIPTION
-    Verifies Git branch/commit, builds the diagnostics executable, runs either a
-    synthetic test command (-SyntheticCommand) or an explicitly authorized title
-    executable (`victory run <exe> --execute` with -AuthorizeGameLaunch), samples
-    process memory, Windows system commit headroom, and GPU memory counters,
-    enforces max duration and >= 5 GB commit headroom safety cutoff, classifies
-    stop reasons (memory guard vs D3D12 device removal vs timeout vs crash),
-    writes timestamped reports under G:\VIctory-Results, and optionally sends a
-    Discord completion notification.
+    Verifies Git branch/commit, enforces rolling 24-hour hardware launch limits
+    (max 4 hardware launches/24h persisted outside the repo), verifies GPU
+    adapter health, single-instance exclusivity, >= 60 s recovery interval,
+    >= 10 GB pre-launch system commit headroom, builds the diagnostics
+    executable, runs either a synthetic test command (-SyntheticCommand) or an
+    explicitly authorized title executable (`victory run <exe> --execute` with
+    -AuthorizeGameLaunch), enforces max duration (default 90 s) and >= 5 GB
+    runtime commit headroom cutoff, classifies outcomes, writes timestamped
+    reports under G:\VIctory-Results, and sends structured Discord notifications.
 
     Never disables VICTORY_MEMORY_GUARD, never clears shader caches, never
     modifies pagefile/TDR settings, and never runs an automatic retry loop.
@@ -38,14 +39,21 @@ param(
 
     [string]$RepoRoot = 'G:\VIctory',
     [string]$ResultsRoot = 'G:\VIctory-Results',
-    [int]$MaxDurationSeconds = 600,
+    [int]$MaxDurationSeconds = 90,
+    [double]$MinPreLaunchHeadroomGB = 10.0,
     [double]$MinCommitHeadroomGB = 5.0,
+    [int]$RecoveryIntervalSeconds = 60,
+    [int]$MaxLaunchesPer24h = 4,
     [int]$SampleIntervalSeconds = 2,
     [string]$VictoryLog = 'info',
+    [string]$IsolatedCacheDir = '',
+    [string]$TestLabel = '',
     [switch]$EnableCapture,
     [switch]$EnableDebugLayer,
     [switch]$EnableDred,
     [switch]$DisableLazyTextures,
+    [switch]$SyncPipelines,
+    [switch]$DisablePipelineCache,
     [switch]$SkipBuild,
     [switch]$NoDiscord
 )
@@ -158,8 +166,47 @@ function Format-CommandArgs {
     return ($escaped -join ' ')
 }
 
-# Safety gate: never allow accidental or unapproved proprietary game launch.
+function Read-LaunchHistory {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+        $parsed = $raw | ConvertFrom-Json
+        if ($parsed -is [System.Array]) { return @($parsed) }
+        return @($parsed)
+    } catch {
+        return @()
+    }
+}
+
+function Save-LaunchHistory {
+    param([string]$Path, [object[]]$Entries)
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    ConvertTo-Json -InputObject @($Entries) -Depth 5 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+# Safety gates: never allow accidental or unapproved proprietary game launch.
 $isSynthetic = ($PSCmdlet.ParameterSetName -eq 'Synthetic')
+if ($MaxLaunchesPer24h -gt 4) {
+    throw "Hard safety limit: MaxLaunchesPer24h cannot exceed 4."
+}
+if ($MinCommitHeadroomGB -lt 5.0 -and -not $isSynthetic) {
+    throw "Hard safety limit: MinCommitHeadroomGB must be at least 5.0 GB for hardware launches."
+}
+if ($MinPreLaunchHeadroomGB -lt 10.0 -and -not $isSynthetic) {
+    throw "Hard safety limit: MinPreLaunchHeadroomGB must be at least 10.0 GB for hardware launches."
+}
+
+$launchHistoryPath = Join-Path (Join-Path $env:LOCALAPPDATA 'HUST-VIctory') 'hw-launch-history.json'
+$recentLaunches = @()
+$launchNumber24h = 0
+
 if (-not $isSynthetic) {
     if (-not $AuthorizeGameLaunch) {
         throw "Refusing to launch a title executable without explicit -AuthorizeGameLaunch authorization."
@@ -167,10 +214,45 @@ if (-not $isSynthetic) {
     if (-not (Test-Path -LiteralPath $TitleExe)) {
         throw "Title executable not found: $TitleExe"
     }
-}
 
-if ($MinCommitHeadroomGB -lt 1.0) {
-    throw "MinCommitHeadroomGB must be at least 1.0 GB (default 5.0 GB)."
+    # Single-instance exclusivity check.
+    $existing = @(Get-Process -Name 'victory', 'game_scarlett_master' -ErrorAction SilentlyContinue)
+    if ($existing.Count -gt 0) {
+        $pids = ($existing | ForEach-Object { "$($_.ProcessName)($($_.Id))" }) -join ', '
+        throw "Refusing launch: existing VIctory/game process already running: $pids"
+    }
+
+    # Verify NVIDIA GPU adapter is present and healthy before launch.
+    $gpuAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue)
+    $nv = $gpuAdapters | Where-Object { $_.Name -like '*NVIDIA*' } | Select-Object -First 1
+    if ($null -eq $nv) {
+        throw "Refusing launch: no NVIDIA display adapter found in Win32_VideoController."
+    }
+    if ($nv.Status -ne 'OK') {
+        throw "Refusing launch: NVIDIA adapter '$($nv.Name)' status is '$($nv.Status)' (expected OK)."
+    }
+
+    # Rolling 24-hour launch cap & 60-second recovery interval.
+    $nowUtc = [DateTime]::UtcNow
+    $cutoffUtc = $nowUtc.AddHours(-24)
+    $allHistory = @(Read-LaunchHistory -Path $launchHistoryPath)
+    $recentLaunches = @($allHistory | Where-Object {
+        try { [DateTime]::Parse($_.StartUtc).ToUniversalTime() -ge $cutoffUtc } catch { $false }
+    })
+    if ($recentLaunches.Count -ge $MaxLaunchesPer24h) {
+        throw ("Refusing launch: rolling 24-hour hardware launch cap reached ({0}/{1})." -f $recentLaunches.Count, $MaxLaunchesPer24h)
+    }
+    $lastLaunch = $recentLaunches | Sort-Object { [DateTime]::Parse($_.EndUtc).ToUniversalTime() } | Select-Object -Last 1
+    if ($null -ne $lastLaunch -and $RecoveryIntervalSeconds -gt 0) {
+        $lastEnd = [DateTime]::Parse($lastLaunch.EndUtc).ToUniversalTime()
+        $sinceSec = ($nowUtc - $lastEnd).TotalSeconds
+        if ($sinceSec -lt $RecoveryIntervalSeconds) {
+            $waitSec = [Math]::Ceiling($RecoveryIntervalSeconds - $sinceSec)
+            Write-Host "Enforcing ${RecoveryIntervalSeconds}s recovery interval: waiting ${waitSec}s..."
+            Start-Sleep -Seconds $waitSec
+        }
+    }
+    $launchNumber24h = $recentLaunches.Count + 1
 }
 
 # 1. Verify Git state.
@@ -192,10 +274,10 @@ $reportPath = Join-Path $runDir 'report.md'
 $summaryPath = Join-Path $runDir 'summary.json'
 
 Write-Host "=== HUST-VIctory Diagnostic Harness ==="
-Write-Host "Mode:      $modeTag"
+Write-Host "Mode:      $modeTag$(if (-not $isSynthetic) { " (24h launch #$launchNumber24h/$MaxLaunchesPer24h)" } else { '' })"
 Write-Host "Branch:    $branch ($shortCommit)$(if ($isDirty) { ' [DIRTY]' } else { '' })"
 Write-Host "Output:    $runDir"
-Write-Host "Limits:    MaxDuration=${MaxDurationSeconds}s, MinCommitHeadroom=${MinCommitHeadroomGB} GB"
+Write-Host "Limits:    MaxDuration=${MaxDurationSeconds}s, PreLaunchHeadroom>=${MinPreLaunchHeadroomGB} GB, RuntimeHeadroom>=${MinCommitHeadroomGB} GB"
 
 # 2. Build diagnostics executable unless skipped.
 $diagExe = Join-Path $RepoRoot 'target\diag\victory.exe'
@@ -226,14 +308,16 @@ if (-not $isSynthetic -and -not (Test-Path -LiteralPath $diagExe)) {
 
 # 3. Pre-launch system memory baseline check.
 $baselineMem = Get-SystemMemorySnapshot
+$minPreLaunchMB = $MinPreLaunchHeadroomGB * 1024.0
 $minHeadroomMB = $MinCommitHeadroomGB * 1024.0
 Write-Host ("Baseline:  Commit {0}/{1} MB (headroom {2} MB), PhysAvail {3}/{4} MB" -f `
     $baselineMem.CommitTotalMB, $baselineMem.CommitLimitMB, $baselineMem.CommitHeadroomMB, `
     $baselineMem.PhysicalAvailMB, $baselineMem.PhysicalTotalMB)
 
-if ($baselineMem.CommitHeadroomMB -lt $minHeadroomMB) {
-    throw ("Refusing launch: preexisting system commit headroom ({0} MB) is already below the {1} GB safety floor. Close heavy background applications first." -f `
-        $baselineMem.CommitHeadroomMB, $MinCommitHeadroomGB)
+$requiredStartMB = if ($isSynthetic) { $minHeadroomMB } else { $minPreLaunchMB }
+if ($baselineMem.CommitHeadroomMB -lt $requiredStartMB) {
+    throw ("Refusing launch: preexisting system commit headroom ({0} MB) is below the {1} MB pre-launch safety floor." -f `
+        $baselineMem.CommitHeadroomMB, $requiredStartMB)
 }
 
 # 4. Prepare child process environment and command line.
@@ -262,18 +346,8 @@ $psi.EnvironmentVariables.Remove('VICTORY_MEMORY_GUARD')
 $psi.EnvironmentVariables['VICTORY_LOG'] = $VictoryLog
 $psi.EnvironmentVariables['VICTORY_MEMORY_REPORT_DIR'] = $runDir
 
-if ($EnableDebugLayer) {
-    $psi.EnvironmentVariables['VICTORY_D3D12_DEBUG'] = '1'
-} else {
-    $psi.EnvironmentVariables.Remove('VICTORY_D3D12_DEBUG')
-}
-
-if ($EnableDred) {
-    $psi.EnvironmentVariables['VICTORY_D3D12_DRED'] = '1'
-} else {
-    $psi.EnvironmentVariables.Remove('VICTORY_D3D12_DRED')
-}
-
+if ($EnableDebugLayer) { $psi.EnvironmentVariables['VICTORY_D3D12_DEBUG'] = '1' } else { $psi.EnvironmentVariables.Remove('VICTORY_D3D12_DEBUG') }
+if ($EnableDred) { $psi.EnvironmentVariables['VICTORY_D3D12_DRED'] = '1' } else { $psi.EnvironmentVariables.Remove('VICTORY_D3D12_DRED') }
 if ($EnableCapture) {
     $framesDir = Join-Path $runDir 'frames'
     New-Item -ItemType Directory -Path $framesDir -Force | Out-Null
@@ -281,11 +355,29 @@ if ($EnableCapture) {
 } else {
     $psi.EnvironmentVariables.Remove('VICTORY_CAPTURE')
 }
-
-if ($DisableLazyTextures) {
-    $psi.EnvironmentVariables['VICTORY_LAZY_TEXTURES'] = '0'
+if ($DisableLazyTextures) { $psi.EnvironmentVariables['VICTORY_LAZY_TEXTURES'] = '0' } else { $psi.EnvironmentVariables.Remove('VICTORY_LAZY_TEXTURES') }
+if ($SyncPipelines) { $psi.EnvironmentVariables['VICTORY_SYNC_PIPELINES'] = '1' } else { $psi.EnvironmentVariables.Remove('VICTORY_SYNC_PIPELINES') }
+if ($DisablePipelineCache) { $psi.EnvironmentVariables['VICTORY_PIPELINE_CACHE'] = '0' } else { $psi.EnvironmentVariables.Remove('VICTORY_PIPELINE_CACHE') }
+if (-not [string]::IsNullOrWhiteSpace($IsolatedCacheDir)) {
+    New-Item -ItemType Directory -Path $IsolatedCacheDir -Force | Out-Null
+    $psi.EnvironmentVariables['VICTORY_CACHE_DIR'] = $IsolatedCacheDir
 } else {
-    $psi.EnvironmentVariables.Remove('VICTORY_LAZY_TEXTURES')
+    $psi.EnvironmentVariables.Remove('VICTORY_CACHE_DIR')
+}
+
+$discordScript = Join-Path $RepoRoot 'tools\discord\Send-DiscordNotification.ps1'
+$switchSummary = "Debug=$EnableDebugLayer, DRED=$EnableDred, Capture=$EnableCapture, Lazy=$(-not $DisableLazyTextures), SyncPipe=$SyncPipelines, PipeCache=$(-not $DisablePipelineCache)"
+
+if (-not $isSynthetic -and -not $NoDiscord -and (Test-Path -LiteralPath $discordScript)) {
+    $labelPart = if ($TestLabel) { " ($TestLabel)" } else { '' }
+    & $discordScript `
+        -Category 'Diagnostic' `
+        -Status 'Info' `
+        -Description ("Starting RTX 3070 GPU Test #$launchNumber24h/$MaxLaunchesPer24h$labelPart on $shortCommit. Baseline headroom=$([Math]::Round($baselineMem.CommitHeadroomMB / 1024.0, 2)) GB. Switches: $switchSummary") `
+        -NextAction "Monitoring up to ${MaxDurationSeconds}s with 5 GB commit headroom cutoff." `
+        -Branch $branch `
+        -Commit $shortCommit `
+        -RepoRoot $RepoRoot | Out-Null
 }
 
 # 5. Launch and monitor process.
@@ -386,6 +478,8 @@ try {
     if ($null -ne $proc) { $proc.Dispose() }
 }
 
+$runEndUtc = [DateTime]::UtcNow
+
 if ($samples.Count -gt 0) {
     $samples | Export-Csv -LiteralPath $samplesPath -NoTypeInformation
 }
@@ -406,7 +500,7 @@ if (Test-Path -LiteralPath $victoryDataRoot) {
 
 $memLogs = @(Get-ChildItem -Path $runDir -Filter 'memory-*.log' -ErrorAction SilentlyContinue | Sort-Object Name)
 
-# 7. Classify outcome (distinguish memory-guard stop vs D3D12 device removal vs timeout vs crash).
+# 7. Classify outcome (distinguish memory-guard stop vs D3D12 device removal/hang vs AV vs timeout vs clean exit).
 $combinedText = ""
 if (Test-Path -LiteralPath $stdoutPath) { $combinedText += (Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) + "`n" }
 if (Test-Path -LiteralPath $stderrPath) { $combinedText += (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue) + "`n" }
@@ -423,12 +517,18 @@ $notifyStatus = 'Success'
 if ($harnessStopReason -eq 'HarnessCommitHeadroomGuard') {
     $classification = 'HarnessCommitHeadroomGuard'
     $notifyStatus = 'Warning'
-} elseif ($combinedText -match '(?i)(DXGI_ERROR_DEVICE_HUNG|DXGI_ERROR_DEVICE_REMOVED|DXGI_ERROR_DEVICE_RESET|0x887A0005|0x887A0006|0x887A0007|host GPU device removed)') {
+} elseif ($combinedText -match '(?i)(DXGI_ERROR_DEVICE_HUNG|0x887A0006)') {
+    $classification = 'D3D12DeviceHang'
+    $notifyStatus = 'Failure'
+} elseif ($combinedText -match '(?i)(DXGI_ERROR_DEVICE_REMOVED|DXGI_ERROR_DEVICE_RESET|0x887A0005|0x887A0007|host GPU device removed)') {
     $classification = 'D3D12DeviceRemoval'
     $notifyStatus = 'Failure'
 } elseif ($combinedText -match '(?i)(commit guard|stopping before.*commit|out of commit|system commit headroom)') {
     $classification = 'VictoryCommitGuardStop'
     $notifyStatus = 'Warning'
+} elseif ($combinedText -match '(?i)(unhandled exception 0xc0000005)') {
+    $classification = 'WindowsAccessViolation'
+    $notifyStatus = 'Failure'
 } elseif ($harnessStopReason -eq 'MaxDurationReached') {
     $classification = 'MaxDurationReached'
     $notifyStatus = 'Success'
@@ -437,10 +537,28 @@ if ($harnessStopReason -eq 'HarnessCommitHeadroomGuard') {
     $notifyStatus = 'Failure'
 }
 
+# Persist rolling 24h hardware launch ledger outside repository.
+if (-not $isSynthetic) {
+    $entry = [ordered]@{
+        StartUtc       = $runStartUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        EndUtc         = $runEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Commit         = $shortCommit
+        Label          = $TestLabel
+        Classification = $classification
+        ElapsedSec     = $elapsedSec
+        RunDirectory   = $runDir
+    }
+    $updatedHistory = @($recentLaunches) + @($entry)
+    Save-LaunchHistory -Path $launchHistoryPath -Entries $updatedHistory
+}
+
 # 8. Write JSON summary and Markdown report.
 $summary = [ordered]@{
-    TimestampUtc          = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    TimestampUtc          = $runEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
     Mode                  = $modeTag
+    LaunchNumber24h       = $launchNumber24h
+    MaxLaunchesPer24h     = $MaxLaunchesPer24h
+    TestLabel             = $TestLabel
     Branch                = $branch
     Commit                = $commit
     ShortCommit           = $shortCommit
@@ -466,6 +584,9 @@ $summary = [ordered]@{
     DebugLayerEnabled     = [bool]$EnableDebugLayer
     DredEnabled           = [bool]$EnableDred
     LazyTexturesDisabled  = [bool]$DisableLazyTextures
+    SyncPipelines         = [bool]$SyncPipelines
+    PipelineCacheDisabled = [bool]$DisablePipelineCache
+    IsolatedCacheDir      = $IsolatedCacheDir
     RunDirectory          = $runDir
 }
 
@@ -479,9 +600,11 @@ $mdLines = @(
     "",
     "- **Timestamp (UTC)**: $($summary.TimestampUtc)",
     "- **Branch / Commit**: ``$branch`` @ ``$shortCommit`` (full: ``$commit``)$(if ($isDirty) { ' [DIRTY]' } else { '' })",
+    "- **24h Launch Count**: $(if (-not $isSynthetic) { "$launchNumber24h / $MaxLaunchesPer24h" } else { 'N/A (synthetic)' })",
+    "- **Label**: $(if ($TestLabel) { $TestLabel } else { 'default' })",
     "- **Classification**: **$classification** (harness stop: ``$harnessStopReason``, exit code: ``$exitCode``)",
     "- **Duration**: ${elapsedSec}s (max ${MaxDurationSeconds}s; build ${buildDurationSec}s)",
-    "- **Switches**: Capture=$EnableCapture, DebugLayer=$EnableDebugLayer, DRED=$EnableDred, LazyTextures=$(-not $DisableLazyTextures), CommitGuard=ON",
+    "- **Switches**: $switchSummary, CommitGuard=ON",
     "",
     "## Memory & GPU Summary",
     "",
@@ -514,26 +637,26 @@ Write-Host "Peak Private:   $peakPrivateMB MB | Min Commit Headroom: $minObserve
 Write-Host "Report:         $reportPath"
 
 # 9. Notify Discord if configured and enabled.
-if (-not $NoDiscord) {
-    $discordScript = Join-Path $RepoRoot 'tools\discord\Send-DiscordNotification.ps1'
-    if (Test-Path -LiteralPath $discordScript) {
-        $desc = "Diagnostic ($modeTag) finished: $classification (exit=$exitCode, ${elapsedSec}s). Peak private=${peakPrivateMB} MB, min commit headroom=${minObservedHeadroomMB} MB. Report: $reportPath"
-        $next = if ($classification -eq 'D3D12DeviceRemoval') {
-            "Inspect DRED/stderr/crash logs in $runDir."
-        } elseif ($classification -like '*Commit*') {
-            "Inspect memory-*.log commit breakdown in $runDir."
-        } else {
-            "Review report.md and samples.csv in $runDir."
-        }
-        & $discordScript `
-            -Category 'Diagnostic' `
-            -Status $notifyStatus `
-            -Description $desc `
-            -NextAction $next `
-            -Branch $branch `
-            -Commit $shortCommit `
-            -RepoRoot $RepoRoot | Out-Null
+if (-not $NoDiscord -and (Test-Path -LiteralPath $discordScript)) {
+    $headroomGB = [Math]::Round($minObservedHeadroomMB / 1024.0, 2)
+    $labelPart = if ($TestLabel) { " ($TestLabel)" } else { '' }
+    $header = if (-not $isSynthetic) { "GPU Test #$launchNumber24h/$MaxLaunchesPer24h$labelPart" } else { "Synthetic Diagnostic" }
+    $desc = "$header — Duration: ${elapsedSec}s | Result: $classification (exit=$exitCode) | Peak private: ${peakPrivateMB} MB | GPU local: $gpuLocalStr | Min commit headroom: ${headroomGB} GB | Report: $reportPath"
+    $next = if ($classification -like 'D3D12*') {
+        "Analyze D3D12 Debug/DRED/stderr logs in $runDir offline before retrying."
+    } elseif ($classification -like '*Commit*') {
+        "Inspect memory-*.log commit breakdown in $runDir."
+    } else {
+        "Inspect report.md, stderr.log, and samples.csv in $runDir."
     }
+    & $discordScript `
+        -Category 'Diagnostic' `
+        -Status $notifyStatus `
+        -Description $desc `
+        -NextAction $next `
+        -Branch $branch `
+        -Commit $shortCommit `
+        -RepoRoot $RepoRoot | Out-Null
 }
 
 [PSCustomObject]$summary

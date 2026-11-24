@@ -1201,7 +1201,24 @@ fn host_texture(
         )
     };
     if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
+        static FIRST_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !FIRST_ERR.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: a plain query on a live device.
+            let removed = unsafe { host.device.GetDeviceRemovedReason() }.err();
+            let dbg = host.log_messages();
+            tracing::error!(
+                error = %e,
+                removed = ?removed,
+                debug_layer = ?dbg,
+                thread = ?std::thread::current().id(),
+                frame = crate::queue::presented(),
+                pipelines_making = crate::pipeline::making(),
+                desc = ?d,
+                "first host texture creation failure"
+            );
+        } else {
+            tracing::warn!(error = %e, desc = ?d, "no host texture");
+        }
         crate::memstat::count(crate::memstat::Event::Failures, 1);
     }
     let t = texture?;

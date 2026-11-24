@@ -57,6 +57,10 @@ fn library() -> Option<&'static Mutex<Library>> {
     static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            if std::env::var_os("VICTORY_PIPELINE_CACHE").is_some_and(|v| v == "0") {
+                tracing::info!("host pipeline library disabled by VICTORY_PIPELINE_CACHE=0");
+                return None;
+            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR
                 .get()

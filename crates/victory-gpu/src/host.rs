@@ -383,17 +383,26 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
+    use std::io::Write;
     let mut text = what.to_string();
-    if let Some(host) = host() {
+    if let Some(host) = existing_host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
         }
+        text.push_str(&format!(
+            "; frame={} pipelines_making={}",
+            crate::queue::presented(),
+            crate::pipeline::making()
+        ));
         text.push_str(&format!("; host caps: {}", host.caps.summary()));
         let heaps = crate::descriptor::shader_heap_stats();
         if !heaps.is_empty() {
             text.push_str(&format!("; descriptor heaps: {heaps}"));
         }
+        let mem = crate::memstat::summary(video_memory());
+        crate::memstat::report(&format!("failure-snapshot {mem}"));
+        text.push_str(&format!("; {mem}"));
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => {
@@ -403,6 +412,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    let _ = std::io::stderr().flush();
+    let _ = std::io::stdout().flush();
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),

@@ -112,12 +112,23 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Whether `VICTORY_SYNC_PIPELINES=1` forces synchronous pipeline creation on
+/// the caller thread (diagnostic A/B switch).
+fn sync_pipelines() -> bool {
+    static SYNC: OnceLock<bool> = OnceLock::new();
+    *SYNC.get_or_init(|| std::env::var_os("VICTORY_SYNC_PIPELINES").is_some_and(|v| v == "1"))
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p);
-        wait(p, crate::frame::current());
+        if sync_pipelines() {
+            p.make();
+        } else {
+            start(p);
+            wait(p, crate::frame::current());
+        }
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
@@ -140,7 +151,7 @@ fn start(p: &Arc<Pending>) {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !sync_pipelines() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p);
     }
