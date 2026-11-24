@@ -3,13 +3,13 @@
 - Current milestone: Phase 10 — memory architecture, copy-back performance, bounded parallelism, GPU acceleration, resource budgeting, and robustness
 - Current subphase: Phase 10 source work for priorities 1-8 committed and unit-verified; Phase 10 is NOT complete: the memory/parallelism/GPU objectives still need an authorized hardware run (see Manual validation) and the GPU-detile decision depends on it
 - Current branch: `hust/nvidia-rtx3070`
-- Latest verified commit: `318c2ca`. Phase 10 commits: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`, `13c97ad`, `ec38425`, `7036da9`, `ba4cb15`, `2798f11`, `6e0728c`, `e9d3629`, `ac7525f`, `341fbd6`, `24dd7ab`, `bd1e569`, `318c2ca`
+- Latest verified commit: `dc93210`. Phase 10 commits: `941d966`, `2fcebdf`, `bc9d31b`, `e0c66a2`, `54a7346`, `8f834d1`, `e24bc28`, `13c97ad`, `ec38425`, `7036da9`, `ba4cb15`, `2798f11`, `6e0728c`, `e9d3629`, `ac7525f`, `341fbd6`, `24dd7ab`, `bd1e569`, `318c2ca`, `b16585e`, `dc93210`
 - Current working-tree status: clean except this progress.md checkpoint (committed with the next change)
 - Active agent: Claude Code
 - Model: Claude Opus 5.5
 - Last checkpoint timestamp: 2026-11-23 (Claude recovery checkpoint)
 - Current build status: PASS (`cargo test --workspace --no-run`)
-- Current test status: full matrix PASSED at `318c2ca` (workspace 256/0/3; policy 152 ok; clippy both configs only the old warning; diag build OK)
+- Current test status: at `dc93210`: `cargo test --workspace` 258 passed / 0 failed / 3 ignored; `cargo clippy --workspace --all-targets` only the pre-existing undocumented-unsafe warning (now at `list.rs:1430`, shifted from 1398 by new code above it); 40 gpu stress runs 0 failures
 
 ## Active Task
 
@@ -23,7 +23,7 @@
 - Next implementation step (only after hardware numbers exist): decide on priority 8 GPU detiling (see evaluation in Completed Tasks); tune budgets/thresholds from `host memory` and frame-rate lines; consider removing the permanent per-texture upload staging copy if `texture staging` dominates.
 - Pending tests: authorized hardware run (manual, below). No automated test is pending.
 - Known blockers: hardware validation must be done by the user (agents must not launch the game or GPU workloads).
-- Remaining known risks: (1) a thread's `run_deferred` refresh can still write a shared shadow while another thread's submission runs on the GPU (pre-existing broader shared-shadow concurrency; not addressed). (2) Unconfirmed fence waits still write bottom-of-pipe markers (deliberate, avoids title deadlock). (3) Descriptor slots now keep loose/aligned copies alive; stale slots the title never rewrites retain those copies (bounded by what was previously never freed anyway). (4) Pre-existing clippy warning `list.rs:1398` untouched.
+- Remaining known risks: (1) ASSESSED, no fix needed: another thread's refresh can write a shared shadow while a submission runs on the GPU, but it skips that submission's pending (shader-written) ranges, so copy-back baselines are safe; on read-only ranges it only brings in bytes the title wrote concurrently, the same race the title has on the console where the GPU reads its memory directly. (2) Unconfirmed fence waits still write bottom-of-pipe markers (deliberate, avoids title deadlock). (3) Descriptor slots now keep loose/aligned copies alive; stale slots the title never rewrites retain those copies (bounded by what was previously never freed anyway). (4) Pre-existing clippy warning untouched (now reported at `list.rs:1430`).
 - Diagnostic executable: `cargo build --profile diag -p victory --features diagnostics` → `target/diag/victory.exe` (built by the matrix; not run).
 - Commands required:
   - `cargo xtask policy`
@@ -94,6 +94,8 @@
 
 - VERIFIED — Full Phase 10 verification matrix at `318c2ca` (Claude, 2026-11-23): `cargo xtask policy` → `asset policy: 152 files ok`; `cargo test --workspace` → 256 passed, 0 failed, 3 ignored (the 3 need external reference data, as at baseline); `cargo clippy --workspace --all-targets` exit 0, only pre-existing `list.rs:1398` undocumented-unsafe warning; `cargo clippy -p victory-gpu -p victory --features diagnostics --all-targets` exit 0, same single warning; `cargo build --profile diag -p victory --features diagnostics` exit 0 → `target/diag/victory.exe` (not launched).
 
+- VERIFIED — Priority F title-sized allocations (`dc93210`): audit of `vec!`/`with_capacity`/`resize` in host/list/draw/resource/queue/shadow/texture/descriptor found three title-controlled infallible allocations: `allocate_upload` (now `try_reserve_exact`, returns null as documented), `SetRenderTargets` one-range handle list (count capped at D3D12's 8), root constants `resize` to title offset (writes ending past 65,536 DWORDs dropped). Others are bounded by API limits, internal sizes, or debug-layer message sizes. Tests `title_sized_upload_allocations_fail_softly`, `root_constant_offsets_are_bounded`. Workspace 258/0/3.
+
 ## Incomplete Tasks
 
 - IN_PROGRESS — Remaining Priority A: shadow lifetime audit DONE (see Completed); snapshot pool bounded DONE; remaining: staging/scratch/upload allocations in `host.rs` (`list.scratch`, texture uploads) audit and allocation-failure handling.
@@ -101,7 +103,7 @@
 - IMPLEMENTED_UNVERIFIED (hardware) — Priority C bounded CPU parallelism for refresh batches (`ac7525f`); unit-verified, speedup unmeasured.
 - DEFERRED — Priority D: evaluated (see Completed Tasks); awaiting hardware measurements.
 - IMPLEMENTED_UNVERIFIED (hardware) — Priority E: reporting (`ec38425`), bounded pools (`ec38425`, `bd1e569`), reclamation (`ba4cb15`) done and unit-tested; effect on real commit unmeasured.
-- IN_PROGRESS — Priority F: snapshot and texture-read allocations now fallible (`try_reserve_exact`); `shared_buffer`/`upload_buffer` already return `None` with a warning; remaining: audit other `vec!`/`Vec::with_capacity` of title-controlled sizes in `host.rs`/`list.rs`.
+- VERIFIED — Priority F allocation robustness (see Completed Tasks, `dc93210`).
 - VERIFIED (software) / PENDING (hardware) — Final verification matrix passed at `318c2ca`; manual authorized-hardware validation instructions written (see Manual validation) and not yet performed.
 
 ## Agent Handoff History
@@ -133,3 +135,4 @@
 - Resume point: add the full-page write-watch regression, then run focused/full tests.
 - Session 2 (same agent, after user granted standing commit authorization): committed `54a7346`, `8f834d1`, `e24bc28` as recorded in Completed Tasks. Resume at Priority 3 accounting.
 - Session 2 continued: committed `6e0728c`, `e9d3629`, `ac7525f`, `341fbd6`, `24dd7ab`, `bd1e569`, `318c2ca`. Phase 10 remains open pending the authorized hardware run.
+- Session 3 (user: continue without hardware): committed `dc93210` (allocation guards); assessed the shared-shadow refresh race (no fix needed). All remaining Phase 10 work needs the authorized hardware run.
