@@ -1330,7 +1330,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     if eager_physical_commit() {
         if !commit(base, len) {
             // SAFETY: the view just mapped, back to a placeholder.
-            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            unsafe { victory_gpu::unmap_title_view(base, len) };
             return false;
         }
         slice.section.committed(slice.index, len / PAGE);
@@ -1343,7 +1343,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         for (off_pages, count_pages) in slice.section.committed_runs(slice.index, len / PAGE) {
             if !commit(base + off_pages * PAGE, count_pages * PAGE) {
                 // SAFETY: the view just mapped, back to a placeholder.
-                unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+                unsafe { victory_gpu::unmap_title_view(base, len) };
                 return false;
             }
         }
@@ -1402,17 +1402,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 physical.section_views.remove(&sec_key);
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        };
+        // SAFETY: a view we mapped; it becomes a placeholder again, then GPU guards clear.
+        unsafe { victory_gpu::unmap_title_view(at, size) };
         if at < base {
             map(physical, at, base - at, slice.clone());
         }

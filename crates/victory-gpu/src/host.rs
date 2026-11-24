@@ -632,8 +632,8 @@ const MAX_GPU_STAMPS: u32 = 1024;
 struct GpuStamps {
     heap: ID3D12QueryHeap,
     readback: ID3D12Resource,
-    /// `(kind, pipeline_name, args)` per timed draw/dispatch.
-    entries: Vec<(&'static str, String, [u32; 3])>,
+    /// `(kind, pipeline_name, args, note_idx)` per timed draw/dispatch.
+    entries: Vec<(&'static str, String, [u32; 3], Option<usize>)>,
 }
 
 /// Aggregated per-pipeline GPU timestamp stats over the current 5-second window:
@@ -1135,7 +1135,7 @@ impl Host {
             }
             // SAFETY: mapped for `n * 2` u64 timestamps.
             let ticks = unsafe { std::slice::from_raw_parts(ptr.cast::<u64>(), n * 2) };
-            for (i, (kind, pipe, args)) in gs.entries.iter().enumerate() {
+            for (i, (kind, pipe, args, note_idx)) in gs.entries.iter().enumerate() {
                 let dt = ticks[i * 2 + 1].saturating_sub(ticks[i * 2]);
                 let ms = (dt as f64) * 1000.0 / freq;
                 let e = window
@@ -1146,6 +1146,33 @@ impl Host {
                 if ms > e.2 {
                     e.2 = ms;
                     e.4 = *args;
+                }
+                if ms > 100.0
+                    && let Some(ni) = *note_idx
+                {
+                    static LOGGED_SLOW: OnceLock<Mutex<std::collections::HashSet<String>>> =
+                        OnceLock::new();
+                    let set = LOGGED_SLOW.get_or_init(|| Mutex::new(Default::default()));
+                    if set
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(pipe.clone())
+                    {
+                        let note = list
+                            .notes
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(ni)
+                            .cloned();
+                        if let Some(note) = note {
+                            tracing::warn!(
+                                ms = format_args!("{ms:.2}"),
+                                pipe = %pipe,
+                                detail = %note,
+                                "first >100ms GPU op descriptor state"
+                            );
+                        }
+                    }
                 }
                 if slow {
                     batch_ops.push((ms, *kind, pipe.clone(), *args));
@@ -1812,6 +1839,12 @@ impl HostList {
     /// Records an end GPU timestamp paired with `stamp_begin`.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn stamp_end(&self, idx: u32, kind: &'static str, pipeline: &str, args: [u32; 3]) {
+        let note_idx = if dred_on() {
+            let n = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            n.checked_sub(1)
+        } else {
+            None
+        };
         let mut guard = self.gpu_stamps.lock().unwrap_or_else(|e| e.into_inner());
         let Some(gs) = guard.as_mut() else {
             return;
@@ -1821,7 +1854,7 @@ impl HostList {
             self.list
                 .EndQuery(&gs.heap, D3D12_QUERY_TYPE_TIMESTAMP, idx * 2 + 1);
         }
-        gs.entries.push((kind, pipeline.to_owned(), args));
+        gs.entries.push((kind, pipeline.to_owned(), args, note_idx));
     }
 
     /// Notes what the command about to be recorded does, as a marker

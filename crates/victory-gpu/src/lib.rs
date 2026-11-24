@@ -93,3 +93,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     watch::title_memory_remapped(at, len);
     resource::on_title_memory_remapped(at as u64, len as u64);
 }
+
+/// Unmaps the view of `size` bytes at `at` back to a placeholder, then clears
+/// write-watch guards/view caches and evicts cached placed host textures.
+///
+/// # Safety
+///
+/// A view the runtime mapped at `at`, unmapped once.
+#[cfg(windows)]
+pub unsafe fn unmap_title_view(at: usize, size: usize) {
+    // SAFETY: forwarded to `watch::unmap_title_view` with the same precondition.
+    unsafe { watch::unmap_title_view(at, size) };
+    resource::on_title_memory_remapped(at as u64, size as u64);
+}
