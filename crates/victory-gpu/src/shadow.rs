@@ -688,20 +688,27 @@ fn reclaim(
 fn reclaim_buffers(incoming: u64) -> u64 {
     let mut dropped: Vec<Arc<Shadow>> = Vec::new();
     let mut freed = 0u64;
+    let (mut live_bytes, mut busy_bytes, mut pending_bytes) = (0u64, 0u64, 0u64);
     {
         let mut map = buffers();
         let mut idle: Vec<(u64, (u64, usize), u64)> = map
             .iter()
             .filter_map(|(&key, entry)| {
                 let s = entry.shadow.as_ref()?;
-                if Arc::strong_count(s) == 1
-                    && s.pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_empty()
-                {
+                live_bytes += s.bytes;
+                let has_pending = !s
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
+                if has_pending {
+                    pending_bytes += s.bytes;
+                    return None;
+                }
+                if Arc::strong_count(s) == 1 {
                     Some((s.used.load(Ordering::Relaxed), key, s.bytes))
                 } else {
+                    busy_bytes += s.bytes;
                     None
                 }
             })
@@ -723,7 +730,15 @@ fn reclaim_buffers(incoming: u64) -> u64 {
     drop(dropped);
     if freed > 0 {
         memstat::count(memstat::Event::ReclaimedBytes, freed);
-        tracing::debug!(freed, "idle buffer-object host copies freed under pressure");
+    }
+    if live_bytes > 0 {
+        tracing::info!(
+            live_mb = live_bytes / (1 << 20),
+            busy_mb = busy_bytes / (1 << 20),
+            pending_mb = pending_bytes / (1 << 20),
+            freed_mb = freed / (1 << 20),
+            "buffer shadow pressure breakdown"
+        );
     }
     freed
 }

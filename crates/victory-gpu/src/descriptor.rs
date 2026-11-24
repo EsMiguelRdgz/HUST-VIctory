@@ -349,8 +349,11 @@ pub(crate) fn prepare_bindless_heap(list: &crate::host::HostList, heap_ptr: usiz
         (u, s)
     };
 
+    let (mut uavs_mat, mut srvs_mat) = (0usize, 0usize);
+    let before_host_tex = crate::memstat::live(crate::memstat::Kind::HostTexture).0;
     for res in uavs {
         if crate::resource::host_resource(res as This).is_some() {
+            uavs_mat += 1;
             crate::list::ensure_state(list, res as This, UNORDERED_ACCESS);
         }
     }
@@ -362,11 +365,21 @@ pub(crate) fn prepare_bindless_heap(list: &crate::host::HostList, heap_ptr: usiz
             continue;
         }
         if let Some(tex) = crate::resource::host_resource(res as This) {
+            srvs_mat += 1;
             if crate::texture::title_written(&tex) {
                 crate::texture::upload(list, res as This, &tex);
             }
             crate::list::ensure_state(list, res as This, SHADER_RESOURCE);
         }
+    }
+    if uavs_mat > 0 || srvs_mat > 0 {
+        let after_host_tex = crate::memstat::live(crate::memstat::Kind::HostTexture).0;
+        tracing::info!(
+            uavs_mat,
+            srvs_mat,
+            delta_mb = after_host_tex.saturating_sub(before_host_tex) / (1 << 20),
+            "bindless heap materialized deferred textures"
+        );
     }
 }
 

@@ -584,6 +584,10 @@ pub(crate) struct HostList {
     copy_epoch: AtomicU64,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// Set once the list completes execution on the host GPU; cleared on
+    /// `reset()`. Allows post-execution pins and shadow references to drop
+    /// immediately rather than waiting 1-2 frames for the title's `Reset()`.
+    executed: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts).
     #[cfg(feature = "diagnostics")]
@@ -771,6 +775,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 copy_epoch: AtomicU64::new(0),
                 pipelines: Mutex::default(),
+                executed: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
             })
@@ -788,6 +793,10 @@ impl Host {
         // back to the pool once the submission has run.
         let mut uploads: Vec<crate::texture::Upload> = Vec::new();
         for list in runs {
+            if list.executed.load(Ordering::Acquire) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("host command list re-executed without reset"));
+            }
             let mine = list.run_deferred(&mut batch);
             if let Some(prelude) = list.prelude(&mine) {
                 lists.push(Some(prelude));
@@ -920,7 +929,16 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        if completed {
+            for list in runs {
+                list.on_executed();
+            }
+        }
         self.log_messages();
+        drop(submitted);
+        if completed && crate::memstat::under_pressure(0) {
+            crate::shadow::relieve_pressure(1);
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1125,9 +1143,33 @@ impl HostList {
         }
     }
 
+    /// Releases post-execution pins (`list_guard`, `bindless_guard`), shadow
+    /// references, upload buffers, and kept COM refs as soon as the host GPU
+    /// finishes running this list, so idle textures and buffer shadows can be
+    /// reclaimed under commit pressure without waiting 1-2 frames for `Reset()`.
+    fn on_executed(&self) {
+        self.executed.store(true, Ordering::Release);
+        let old_deferred = std::mem::take(&mut *self.deferred());
+        drop(old_deferred);
+        let state_guards: Vec<Option<std::sync::Arc<()>>> = {
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            states.values_mut().map(|entry| entry.2.take()).collect()
+        };
+        drop(state_guards);
+        if crate::memstat::under_pressure(0) {
+            let dropped_chunks = {
+                let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+                (scratch.current, scratch.used) = (0, 0);
+                std::mem::take(&mut scratch.chunks)
+            };
+            drop(dropped_chunks);
+        }
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.executed.store(false, Ordering::Release);
         *self.deferred() = Deferred::default();
         self.states
             .lock()
