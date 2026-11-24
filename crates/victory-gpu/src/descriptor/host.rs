@@ -175,6 +175,13 @@ impl HostHeap {
                 device.GetDescriptorHandleIncrementSize(kind),
             )
         };
+        // SAFETY: a live heap.
+        let slots = unsafe { heap.GetDesc() }.NumDescriptors;
+        crate::host::track(
+            &heap,
+            crate::memstat::Kind::DescriptorHeap,
+            u64::from(slots) * u64::from(step),
+        );
         tracing::debug!(
             count,
             requested,

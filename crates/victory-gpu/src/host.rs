@@ -253,6 +253,18 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// The host GPU's memory use and budget, for the memory monitor.
+fn video_memory() -> Option<crate::memstat::Video> {
+    host().and_then(Host::video_memory)
+}
+
+/// Counts `bytes` of `kind` for as long as the D3D12 object lives.
+pub(crate) fn track(object: &impl Interface, kind: crate::memstat::Kind, bytes: u64) {
+    if let Ok(object) = object.cast::<ID3D12Object>() {
+        crate::memstat::track(&object, kind, bytes);
+    }
+}
+
 /// How long a failed fence-event wait falls back to polling the fence.
 const UNCONFIRMED_POLL: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -384,7 +396,10 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(made) => {
+            crate::memstat::start_monitor(video_memory);
+            Some(made)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -1217,6 +1232,7 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
+        track(&buffer, crate::memstat::Kind::ListUpload, size);
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
     }
@@ -1229,6 +1245,7 @@ impl HostList {
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
+            track(&buffer, crate::memstat::Kind::ListUpload, len);
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1240,6 +1257,7 @@ impl HostList {
         }
         if s.current == s.chunks.len() {
             let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
+            track(&buffer, crate::memstat::Kind::ListUpload, SCRATCH_CHUNK);
             name(&buffer, || "list scratch".into());
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1653,10 +1671,6 @@ impl Meter {
                 c.drop_no_pipeline as f64 / log_frames,
                 c.drop_bind as f64 / log_frames,
                 c.drop_other as f64 / log_frames,
-            );
-            tracing::info!(
-                "{}",
-                crate::memstat::summary(host().and_then(Host::video_memory))
             );
             #[cfg(feature = "diagnostics")]
             crate::copystat::log(log_frames);

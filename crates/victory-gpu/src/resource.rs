@@ -644,7 +644,15 @@ impl Memory {
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        let Some(ptr) = NonNull::new(unsafe { alloc_zeroed(layout) }) else {
+            crate::memstat::count(crate::memstat::Event::Failures, 1);
+            tracing::warn!(
+                size = layout.size(),
+                "no memory for a title heap or resource"
+            );
+            return Err(E_OUTOFMEMORY);
+        };
+        crate::memstat::alloc(crate::memstat::Kind::TitleHeap, layout.size() as u64);
         Ok(Memory {
             ptr,
             layout,
@@ -657,8 +665,11 @@ impl Drop for Memory {
     fn drop(&mut self) {
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
-            // SAFETY: allocated in `new` with this layout.
-            _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
+            _ => {
+                crate::memstat::free(crate::memstat::Kind::TitleHeap, self.layout.size() as u64);
+                // SAFETY: allocated in `new` with this layout.
+                unsafe { dealloc(self.ptr.as_ptr(), self.layout) }
+            }
         }
     }
 }
@@ -916,8 +927,15 @@ fn host_texture(
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
+        crate::memstat::count(crate::memstat::Event::Failures, 1);
     }
     if let Some(t) = &texture {
+        // SAFETY: a plain query with the description the texture was made of.
+        let info = unsafe {
+            host.device
+                .GetResourceAllocationInfo(0, &[*(&raw const d).cast::<D3D12_RESOURCE_DESC>()])
+        };
+        crate::host::track(t, crate::memstat::Kind::HostTexture, info.SizeInBytes);
         crate::host::name(t, || {
             format!(
                 "texture {}x{} f{} flags {:#x}",

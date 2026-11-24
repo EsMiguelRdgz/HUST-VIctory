@@ -697,6 +697,7 @@ dependencies = [
  "victory-pipeline",
  "victory-shader",
  "windows",
+ "windows-core",
  "windows-sys",
 ]
 
