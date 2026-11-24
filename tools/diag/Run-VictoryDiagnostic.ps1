@@ -593,20 +593,21 @@ if (-not $isSynthetic) {
 # 7b. Extract observable rendering & progression evidence from stderr.log and captured frames.
 $stderrRaw = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { '' }
 if ($null -eq $stderrRaw) { $stderrRaw = '' }
+$stderrClean = [regex]::Replace($stderrRaw, '\x1b\[[0-9;]*m', '')
 
 $maxFramePresented = 0
-foreach ($m in [regex]::Matches($stderrRaw, 'frame presented[^\r\n]*?\bframe=(\d+)')) {
+foreach ($m in [regex]::Matches($stderrClean, 'frame presented[^\r\n]*?\bframe=(\d+)')) {
     $f = [int]$m.Groups[1].Value
     if ($f -gt $maxFramePresented) { $maxFramePresented = $f }
 }
 $uniquePipelines = New-Object 'System.Collections.Generic.HashSet[string]'
-foreach ($m in [regex]::Matches($stderrRaw, 'first bind[^\r\n]*?\bpipeline=(0x[0-9a-fA-F]+)')) {
+foreach ($m in [regex]::Matches($stderrClean, 'first bind[^\r\n]*?\bpipeline=(0x[0-9a-fA-F]+)')) {
     [void]$uniquePipelines.Add($m.Groups[1].Value)
 }
 $uniquePipelinesBound = $uniquePipelines.Count
-$scriptedInputsInjected = [regex]::Matches($stderrRaw, 'scripted input injected').Count
+$scriptedInputsInjected = [regex]::Matches($stderrClean, 'scripted input injected').Count
 $maxDrawsPerFrame = 0
-foreach ($m in [regex]::Matches($stderrRaw, '(\d+)\s+draws/frame')) {
+foreach ($m in [regex]::Matches($stderrClean, '(\d+)\s+draws/frame')) {
     $d = [int]$m.Groups[1].Value
     if ($d -gt $maxDrawsPerFrame) { $maxDrawsPerFrame = $d }
 }

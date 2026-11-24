@@ -1590,6 +1590,12 @@ static PLACED_TEXTURES: std::sync::Mutex<
     std::collections::BTreeMap<(u64, [u32; 14]), PlacedEntry>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Lock-free count of live `PLACED_TEXTURES` entries so frequent
+/// `on_title_memory_remapped()` calls skip locking when the cache is empty.
+#[cfg(windows)]
+static PLACED_TEXTURE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Placed textures evicted from `PLACED_TEXTURES` while an open command list
 /// still referenced them; released as soon as their list resets.
 #[cfg(windows)]
@@ -1691,6 +1697,7 @@ fn reclaim_placed_textures(budget: u64) -> u64 {
                 break;
             }
             if let Some(entry) = map.remove(&key) {
+                PLACED_TEXTURE_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
                 out.push((entry.resource, entry.host_bytes));
                 over = over.saturating_sub(bytes);
             }
@@ -1711,6 +1718,10 @@ pub(crate) fn on_title_memory_remapped(at: u64, len: u64) {
     let Some(end) = at.checked_add(len).filter(|&e| e > at) else {
         return;
     };
+    if PLACED_TEXTURE_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        drain_retired_placed();
+        return;
+    }
     let evicted: Vec<(usize, u64)> = {
         let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, [u32; 14])> = map
@@ -1721,9 +1732,12 @@ pub(crate) fn on_title_memory_remapped(at: u64, len: u64) {
             })
             .map(|(k, _)| *k)
             .collect();
-        keys.into_iter()
+        let out: Vec<_> = keys
+            .into_iter()
             .filter_map(|k| map.remove(&k).map(|e| (e.resource, e.host_bytes)))
-            .collect()
+            .collect();
+        PLACED_TEXTURE_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
+        out
     };
     for (res, bytes) in evicted {
         release_placed_entry(res, bytes);
@@ -1906,6 +1920,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
                     last_used: tick,
                 },
             );
+            PLACED_TEXTURE_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
         }
     }
     if let Some(dup) = duplicate {

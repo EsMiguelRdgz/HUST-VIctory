@@ -600,9 +600,12 @@ impl HostHeap {
                 // taking `self.made` so `on_texture_materialized` /
                 // `PLACED_TEXTURES` never re-enter or invert `self.made`.
                 ensure_view_materialized(v);
-            } else if matches!(v, View::Placed(false, r, _) if r[0] != 1) {
-                // Resolve placed textures before locking `self.made` to keep
-                // lock order strictly acyclic (`PLACED_TEXTURES` never under `made`).
+            } else if !crate::resource::lazy_textures_enabled()
+                && matches!(v, View::Placed(false, r, _) if r[0] != 1)
+            {
+                // Eager rollback mode (`VICTORY_LAZY_TEXTURES=0`): resolve
+                // placed textures before locking `self.made` to keep lock
+                // order strictly acyclic (`PLACED_TEXTURES` never under `made`).
                 let _ = placed_texture(v);
             }
         }
@@ -620,7 +623,11 @@ impl HostHeap {
             let mut register = None;
             if made[index as usize] != key {
                 let deferred_tex = (!for_draw).then(|| deferred_texture_of(view)).flatten();
-                let later = (!for_draw && view.is_buffer()) || deferred_tex.is_some();
+                let deferred_placed = !for_draw
+                    && crate::resource::lazy_textures_enabled()
+                    && matches!(view, View::Placed(false, r, _) if r[0] != 1);
+                let later =
+                    (!for_draw && view.is_buffer()) || deferred_tex.is_some() || deferred_placed;
                 made[index as usize] = if later { 0 } else { key };
                 let mut owner = None;
                 let mut tex_owner = None;
