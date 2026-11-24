@@ -3,15 +3,17 @@
 .SYNOPSIS
     Controlled, safety-guarded diagnostic harness for HUST-VIctory.
 .DESCRIPTION
-    Verifies Git branch/commit, enforces rolling 24-hour hardware launch limits
-    (max 4 hardware launches/24h persisted outside the repo), verifies GPU
-    adapter health, single-instance exclusivity, >= 60 s recovery interval,
-    >= 10 GB pre-launch system commit headroom, builds the diagnostics
-    executable, runs either a synthetic test command (-SyntheticCommand) or an
-    explicitly authorized title executable (`victory run <exe> --execute` with
-    -AuthorizeGameLaunch), enforces max duration (default 90 s) and >= 5 GB
-    runtime commit headroom cutoff, classifies outcomes, writes timestamped
-    reports under G:\VIctory-Results, and sends structured Discord notifications.
+    Verifies Git branch/commit, records persistent hardware launch history
+    outside the repo (with no fixed daily launch quota by default; optional
+    -MaxLaunchesPer24h if explicitly set > 0), verifies NVIDIA GPU adapter
+    health and recent display-driver TDR stability, enforces single-instance
+    exclusivity, >= 60 s recovery interval, >= 10 GB pre-launch system commit
+    headroom, builds the diagnostics executable, runs either a synthetic test
+    command (-SyntheticCommand) or an authorized title executable
+    (`victory run <exe> --execute` with -AuthorizeGameLaunch), enforces max
+    duration (default 90 s) and >= 5 GB runtime commit headroom cutoff,
+    classifies outcomes, writes timestamped reports under G:\VIctory-Results,
+    and sends consolidated Discord notifications.
 
     Never disables VICTORY_MEMORY_GUARD, never clears shader caches, never
     modifies pagefile/TDR settings, and never runs an automatic retry loop.
@@ -43,7 +45,7 @@ param(
     [double]$MinPreLaunchHeadroomGB = 10.0,
     [double]$MinCommitHeadroomGB = 5.0,
     [int]$RecoveryIntervalSeconds = 60,
-    [int]$MaxLaunchesPer24h = 4,
+    [int]$MaxLaunchesPer24h = 0,
     [int]$SampleIntervalSeconds = 2,
     [string]$VictoryLog = 'info',
     [string]$IsolatedCacheDir = '',
@@ -206,8 +208,10 @@ if ($MinPreLaunchHeadroomGB -lt 10.0 -and -not $isSynthetic) {
 }
 
 $launchHistoryPath = Join-Path (Join-Path $env:LOCALAPPDATA 'HUST-VIctory') 'hw-launch-history.json'
+$allHistory = @()
 $recentLaunches = @()
 $launchNumber24h = 0
+$launchNumberTotal = 0
 
 if (-not $isSynthetic) {
     if (-not $AuthorizeGameLaunch) {
@@ -217,44 +221,50 @@ if (-not $isSynthetic) {
         throw "Title executable not found: $TitleExe"
     }
 
-    # Single-instance exclusivity check.
+    # Single-instance exclusivity check (sequential execution only).
     $existing = @(Get-Process -Name 'victory', 'game_scarlett_master' -ErrorAction SilentlyContinue)
     if ($existing.Count -gt 0) {
         $pids = ($existing | ForEach-Object { "$($_.ProcessName)($($_.Id))" }) -join ', '
         throw "Refusing launch: existing VIctory/game process already running: $pids"
     }
 
-    # Verify NVIDIA GPU adapter is present and healthy before launch.
+    # Verify NVIDIA GPU adapter is present, healthy, and has no recent OS TDR reset.
     $gpuAdapters = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue)
     $nv = $gpuAdapters | Where-Object { $_.Name -like '*NVIDIA*' } | Select-Object -First 1
     if ($null -eq $nv) {
         throw "Refusing launch: no NVIDIA display adapter found in Win32_VideoController."
     }
-    if ($nv.Status -ne 'OK') {
-        throw "Refusing launch: NVIDIA adapter '$($nv.Name)' status is '$($nv.Status)' (expected OK)."
+    if ($nv.Status -ne 'OK' -or ($null -ne $nv.ConfigManagerErrorCode -and $nv.ConfigManagerErrorCode -ne 0)) {
+        throw "Refusing launch: NVIDIA adapter '$($nv.Name)' unhealthy (Status='$($nv.Status)', ConfigManagerErrorCode=$($nv.ConfigManagerErrorCode))."
+    }
+    $recentTdr = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Display'; Id = 4101; StartTime = (Get-Date).AddMinutes(-3) } -ErrorAction SilentlyContinue)
+    if ($recentTdr.Count -gt 0) {
+        $tdrTime = $recentTdr[0].TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        throw "Refusing launch: Windows recorded a display driver reset (Event 4101) at $tdrTime (< 3 min ago). Allow system recovery before resuming hardware tests."
     }
 
-    # Rolling 24-hour launch cap & 60-second recovery interval.
+    # Persistent launch history & recovery interval (no daily launch cap unless MaxLaunchesPer24h > 0).
     $nowUtc = [DateTime]::UtcNow
     $cutoffUtc = $nowUtc.AddHours(-24)
     $allHistory = @(Read-LaunchHistory -Path $launchHistoryPath)
     $recentLaunches = @($allHistory | Where-Object {
         try { [DateTime]::Parse($_.StartUtc).ToUniversalTime() -ge $cutoffUtc } catch { $false }
     })
-    if ($recentLaunches.Count -ge $MaxLaunchesPer24h) {
-        throw ("Refusing launch: rolling 24-hour hardware launch cap reached ({0}/{1})." -f $recentLaunches.Count, $MaxLaunchesPer24h)
+    if ($MaxLaunchesPer24h -gt 0 -and $recentLaunches.Count -ge $MaxLaunchesPer24h) {
+        throw ("Refusing launch: optional 24-hour hardware launch cap reached ({0}/{1})." -f $recentLaunches.Count, $MaxLaunchesPer24h)
     }
-    $lastLaunch = $recentLaunches | Sort-Object { [DateTime]::Parse($_.EndUtc).ToUniversalTime() } | Select-Object -Last 1
+    $lastLaunch = $allHistory | Sort-Object { try { [DateTime]::Parse($_.EndUtc).ToUniversalTime() } catch { [DateTime]::MinValue } } | Select-Object -Last 1
     if ($null -ne $lastLaunch -and $RecoveryIntervalSeconds -gt 0) {
         $lastEnd = [DateTime]::Parse($lastLaunch.EndUtc).ToUniversalTime()
         $sinceSec = ($nowUtc - $lastEnd).TotalSeconds
         if ($sinceSec -lt $RecoveryIntervalSeconds) {
             $waitSec = [Math]::Ceiling($RecoveryIntervalSeconds - $sinceSec)
-            Write-Host "Enforcing ${RecoveryIntervalSeconds}s recovery interval: waiting ${waitSec}s..."
+            Write-Host "Enforcing ${RecoveryIntervalSeconds}s GPU recovery interval: waiting ${waitSec}s..."
             Start-Sleep -Seconds $waitSec
         }
     }
     $launchNumber24h = $recentLaunches.Count + 1
+    $launchNumberTotal = $allHistory.Count + 1
 }
 
 # 1. Verify Git state.
@@ -276,7 +286,11 @@ $reportPath = Join-Path $runDir 'report.md'
 $summaryPath = Join-Path $runDir 'summary.json'
 
 Write-Host "=== HUST-VIctory Diagnostic Harness ==="
-Write-Host "Mode:      $modeTag$(if (-not $isSynthetic) { " (24h launch #$launchNumber24h/$MaxLaunchesPer24h)" } else { '' })"
+$launchBadge = if (-not $isSynthetic) {
+    if ($MaxLaunchesPer24h -gt 0) { " (launch #$launchNumberTotal total, #$launchNumber24h/$MaxLaunchesPer24h in 24h)" }
+    else { " (launch #$launchNumberTotal total, #$launchNumber24h in 24h, unlimited)" }
+} else { '' }
+Write-Host "Mode:      $modeTag$launchBadge"
 Write-Host "Branch:    $branch ($shortCommit)$(if ($isDirty) { ' [DIRTY]' } else { '' })"
 Write-Host "Output:    $runDir"
 Write-Host "Limits:    MaxDuration=${MaxDurationSeconds}s, PreLaunchHeadroom>=${MinPreLaunchHeadroomGB} GB, RuntimeHeadroom>=${MinCommitHeadroomGB} GB"
@@ -380,18 +394,6 @@ if (-not [string]::IsNullOrWhiteSpace($IsolatedCacheDir)) {
 
 $discordScript = Join-Path $RepoRoot 'tools\discord\Send-DiscordNotification.ps1'
 $switchSummary = "Debug=$EnableDebugLayer, DRED=$EnableDred, Capture=$EnableCapture, Lazy=$(-not $DisableLazyTextures), SyncPipe=$SyncPipelines, PipeCache=$(-not $DisablePipelineCache)"
-
-if (-not $isSynthetic -and -not $NoDiscord -and (Test-Path -LiteralPath $discordScript)) {
-    $labelPart = if ($TestLabel) { " ($TestLabel)" } else { '' }
-    & $discordScript `
-        -Category 'Diagnostic' `
-        -Status 'Info' `
-        -Description ("Starting RTX 3070 GPU Test #$launchNumber24h/$MaxLaunchesPer24h$labelPart on $shortCommit. Baseline headroom=$([Math]::Round($baselineMem.CommitHeadroomMB / 1024.0, 2)) GB. Switches: $switchSummary") `
-        -NextAction "Monitoring up to ${MaxDurationSeconds}s with 5 GB commit headroom cutoff." `
-        -Branch $branch `
-        -Commit $shortCommit `
-        -RepoRoot $RepoRoot | Out-Null
-}
 
 # Record pre-launch byte offsets of existing crashes.log files so outcome
 # classification inspects only entries appended during THIS run.
@@ -569,7 +571,7 @@ if ($harnessStopReason -eq 'HarnessCommitHeadroomGuard') {
     $notifyStatus = 'Failure'
 }
 
-# Persist rolling 24h hardware launch ledger outside repository.
+# Persist complete hardware launch history outside repository (never prunes prior records).
 if (-not $isSynthetic) {
     $entry = [ordered]@{
         StartUtc       = $runStartUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -577,10 +579,14 @@ if (-not $isSynthetic) {
         Commit         = $shortCommit
         Label          = $TestLabel
         Classification = $classification
+        ExitCode       = $exitCode
         ElapsedSec     = $elapsedSec
+        PeakPrivateMB  = $peakPrivateMB
+        MinHeadroomMB  = $minObservedHeadroomMB
+        PeakGpuLocalMB = $peakGpuLocalMB
         RunDirectory   = $runDir
     }
-    $updatedHistory = @($recentLaunches) + @($entry)
+    $updatedHistory = @($allHistory) + @($entry)
     Save-LaunchHistory -Path $launchHistoryPath -Entries $updatedHistory
 }
 
@@ -588,6 +594,7 @@ if (-not $isSynthetic) {
 $summary = [ordered]@{
     TimestampUtc          = $runEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
     Mode                  = $modeTag
+    LaunchNumberTotal     = $launchNumberTotal
     LaunchNumber24h       = $launchNumber24h
     MaxLaunchesPer24h     = $MaxLaunchesPer24h
     TestLabel             = $TestLabel
@@ -632,7 +639,7 @@ $mdLines = @(
     "",
     "- **Timestamp (UTC)**: $($summary.TimestampUtc)",
     "- **Branch / Commit**: ``$branch`` @ ``$shortCommit`` (full: ``$commit``)$(if ($isDirty) { ' [DIRTY]' } else { '' })",
-    "- **24h Launch Count**: $(if (-not $isSynthetic) { "$launchNumber24h / $MaxLaunchesPer24h" } else { 'N/A (synthetic)' })",
+    "- **Launch Count**: $(if (-not $isSynthetic) { if ($MaxLaunchesPer24h -gt 0) { "#$launchNumberTotal total (#$launchNumber24h / $MaxLaunchesPer24h in 24h)" } else { "#$launchNumberTotal total (#$launchNumber24h in 24h; no daily quota)" } } else { 'N/A (synthetic)' })",
     "- **Label**: $(if ($TestLabel) { $TestLabel } else { 'default' })",
     "- **Classification**: **$classification** (harness stop: ``$harnessStopReason``, exit code: ``$exitCode``)",
     "- **Duration**: ${elapsedSec}s (max ${MaxDurationSeconds}s; build ${buildDurationSec}s)",
@@ -672,7 +679,7 @@ Write-Host "Report:         $reportPath"
 if (-not $NoDiscord -and (Test-Path -LiteralPath $discordScript)) {
     $headroomGB = [Math]::Round($minObservedHeadroomMB / 1024.0, 2)
     $labelPart = if ($TestLabel) { " ($TestLabel)" } else { '' }
-    $header = if (-not $isSynthetic) { "GPU Test #$launchNumber24h/$MaxLaunchesPer24h$labelPart" } else { "Synthetic Diagnostic" }
+    $header = if (-not $isSynthetic) { "GPU Test #$launchNumberTotal$labelPart" } else { "Synthetic Diagnostic" }
     $desc = "$header — Duration: ${elapsedSec}s | Result: $classification (exit=$exitCode) | Peak private: ${peakPrivateMB} MB | GPU local: $gpuLocalStr | Min commit headroom: ${headroomGB} GB | Report: $reportPath"
     $next = if ($classification -like 'D3D12*') {
         "Analyze D3D12 Debug/DRED/stderr logs in $runDir offline before retrying."
