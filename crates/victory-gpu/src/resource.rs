@@ -3276,4 +3276,507 @@ pub(crate) mod tests {
         assert_eq!(slot::<Release>(rt_tex, 0x10)(rt_tex), 0);
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
+
+    /// Creating 1,250 synthetic overlapping/aliased textures (mirroring GTA VI's
+    /// 1,210 startup texture burst) plus 1,250 shader-visible SRVs allocates
+    /// zero host D3D12 textures until actually bound, materializes only the 8
+    /// used textures, and returns cleanly to baseline on release.
+    #[cfg(windows)]
+    #[test]
+    fn thousands_of_deferred_textures_consume_zero_host_vram_and_release_cleanly() {
+        let _serial = TEXTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        const COUNT: usize = 1250;
+        #[repr(C)]
+        struct ExtendedHeap([u32; 4], [u64; 2]);
+        let hdesc = ExtendedHeap([0, COUNT as u32 + 16, 1, 0], [0, 0]);
+        let mut sheap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                (&raw const hdesc.0).cast(),
+                &heap_iid,
+                &mut sheap
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(sheap);
+        let _host_heap = title_heap.host().expect("host view heap");
+        let start = title_heap.start;
+
+        let made_before = crate::memstat::made(crate::memstat::Kind::HostTexture);
+        let def_before = crate::memstat::live(crate::memstat::Kind::DeferredTexture).1;
+        // Overlapping/aliased virtual backing for 1,250 1024x1024 RGBA8 textures (4 MiB each = 5 GiB nominal).
+        let backing = vec![0u8; 64 << 10];
+        let mut textures = Vec::with_capacity(COUNT);
+        for i in 0..COUNT {
+            let mut tex = null;
+            let desc = ResourceDesc {
+                flags: if i % 3 == 0 { 1 } else { 0 }, // mix of RT and SRV-only
+                ..texture(1024, 1024, 28, 1)
+            };
+            assert_eq!(
+                create_at_address(
+                    null,
+                    backing.as_ptr() as u64,
+                    &desc,
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut tex
+                ),
+                S_OK
+            );
+            crate::descriptor::create_srv(null, tex, std::ptr::null(), start + (i as u64) * 32);
+            textures.push(tex);
+        }
+        assert_eq!(
+            crate::memstat::made(crate::memstat::Kind::HostTexture),
+            made_before,
+            "1,250 unused textures + SRVs must allocate 0 host D3D12 textures"
+        );
+        assert!(
+            crate::memstat::live(crate::memstat::Kind::DeferredTexture).1
+                >= def_before + COUNT as u64
+        );
+
+        // Delayed first use on 8 of the 1,250 textures.
+        for idx in (0..COUNT).step_by(COUNT / 8).take(8) {
+            let ht = host_resource(textures[idx]).expect("delayed materialization");
+            assert!(has_host_resource(textures[idx]));
+            drop(ht);
+        }
+        assert_eq!(
+            crate::memstat::made(crate::memstat::Kind::HostTexture) - made_before,
+            8,
+            "only the 8 used textures materialized"
+        );
+
+        for tex in textures {
+            assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
+        }
+        assert_eq!(slot::<Release>(sheap, 0x10)(sheap), 0);
+        assert_eq!(
+            crate::memstat::live(crate::memstat::Kind::DeferredTexture).1,
+            def_before,
+            "deferred count returns to baseline after release"
+        );
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Long-running stability: 20 cycles of create, upload, evict under
+    /// pressure, re-upload, and release keep live host/deferred texture counts
+    /// and bytes flat with zero D3D12 debug errors.
+    #[cfg(windows)]
+    #[test]
+    fn long_running_texture_alloc_evict_release_cycles_stay_bounded() {
+        let _serial = TEXTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let (host_b0, host_c0, _) = crate::memstat::live(crate::memstat::Kind::HostTexture);
+        let (def_b0, def_c0, _) = crate::memstat::live(crate::memstat::Kind::DeferredTexture);
+
+        for cycle in 0..20u8 {
+            let mut batch = Vec::new();
+            for j in 0..4u8 {
+                let mut tex = null;
+                let desc = texture(64, 64, 28, 1);
+                assert_eq!(
+                    create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, &mut tex),
+                    S_OK
+                );
+                let (mem, d) = texture_memory(tex).unwrap();
+                let layout = texture_layout(&d).unwrap().planes[0].layout.clone();
+                // SAFETY: `mem` holds `layout.size` bytes.
+                unsafe {
+                    mem.cast_mut()
+                        .write_bytes(cycle.wrapping_add(j + 1), layout.size as usize)
+                };
+                let list = host_gpu.new_list().unwrap();
+                let ht = host_resource(tex).unwrap();
+                crate::texture::upload(&list, tex, &ht);
+                crate::list::ensure_state(&list, tex, 0x40 | 0x80);
+                list.close();
+                host_gpu.execute(&[&list]);
+                batch.push(tex);
+            }
+            let freed = evict_idle_textures(0);
+            assert!(
+                freed > 0,
+                "cycle {cycle} evicted idle title-written textures"
+            );
+            for &tex in &batch {
+                assert!(!has_host_resource(tex));
+            }
+            for tex in batch {
+                assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
+            }
+        }
+
+        let (host_b1, host_c1, _) = crate::memstat::live(crate::memstat::Kind::HostTexture);
+        let (def_b1, def_c1, _) = crate::memstat::live(crate::memstat::Kind::DeferredTexture);
+        assert_eq!(
+            (host_b1, host_c1),
+            (host_b0, host_c0),
+            "host texture counts flat"
+        );
+        assert_eq!(
+            (def_b1, def_c1),
+            (def_b0, def_c0),
+            "deferred texture counts flat"
+        );
+        crate::host::assert_no_debug_errors(&host_gpu.device);
+    }
+
+    /// Probes `ID3D12Device3::OpenExistingHeapFromAddress` support and
+    /// constraints on plain `VirtualAlloc`, `MEM_WRITE_WATCH`, and `MEM_MAPPED`
+    /// memory (Phase C architectural evaluation).
+    #[cfg(windows)]
+    #[test]
+    fn existing_heap_from_address_capability_probe() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let Ok(dev3) = host_gpu.device.cast::<ID3D12Device3>() else {
+            return;
+        };
+        let check = |ptr: *const c_void| -> (bool, bool, bool) {
+            // SAFETY: `ptr` is a live 64 KiB aligned allocation for the duration of the check.
+            let heap: windows::core::Result<ID3D12Heap> =
+                unsafe { dev3.OpenExistingHeapFromAddress(ptr) };
+            let Ok(heap) = heap else {
+                return (false, false, false);
+            };
+            // SAFETY: live heap query.
+            let hdesc = unsafe { heap.GetDesc() };
+            let make_desc = |flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: KIB_64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            // OpenExistingHeapFromAddress heaps require `COPY_DEST` initial state
+            // when `Properties.Type == READBACK` or `GENERIC_READ` when `UPLOAD`,
+            // or `COMMON` for `CUSTOM`.
+            let init_state = if hdesc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD {
+                D3D12_RESOURCE_STATE_GENERIC_READ
+            } else if hdesc.Properties.Type == D3D12_HEAP_TYPE_READBACK {
+                D3D12_RESOURCE_STATE_COPY_DEST
+            } else {
+                D3D12_RESOURCE_STATE_COMMON
+            };
+            let ro_desc = make_desc(D3D12_RESOURCE_FLAG_NONE);
+            let mut ro_res: Option<ID3D12Resource> = None;
+            // SAFETY: read-only placed buffer inside the opened 64 KiB heap.
+            let ro_ok = unsafe {
+                host_gpu.device.CreatePlacedResource(
+                    &heap,
+                    0,
+                    &ro_desc,
+                    init_state,
+                    None,
+                    &mut ro_res,
+                )
+            }
+            .is_ok();
+            drop(ro_res);
+            let uav_desc = make_desc(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            let mut uav_res: Option<ID3D12Resource> = None;
+            // SAFETY: UAV placed buffer inside the opened 64 KiB heap.
+            let uav_ok = unsafe {
+                host_gpu.device.CreatePlacedResource(
+                    &heap,
+                    0,
+                    &uav_desc,
+                    init_state,
+                    None,
+                    &mut uav_res,
+                )
+            }
+            .is_ok();
+            drop(uav_res);
+            drop(heap);
+            (true, ro_ok, uav_ok)
+        };
+
+        // SAFETY: 64 KiB plain VirtualAlloc freed after heap drop.
+        let plain = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                KIB_64 as usize,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!plain.is_null());
+        let plain_res = check(plain);
+        // SAFETY: heap already dropped above.
+        unsafe { VirtualFree(plain, 0, MEM_RELEASE) };
+
+        // SAFETY: 64 KiB write-watched VirtualAlloc freed after heap drop.
+        let watched = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                KIB_64 as usize,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!watched.is_null());
+        let watched_res = check(watched);
+        // SAFETY: heap already dropped above.
+        unsafe { VirtualFree(watched, 0, MEM_RELEASE) };
+
+        // SAFETY: 64 KiB pagefile section view unmapped after heap drop.
+        let (section, mapped) = unsafe {
+            let s = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                KIB_64 as u32,
+                std::ptr::null(),
+            );
+            assert!(!s.is_null());
+            let v = MapViewOfFile(s, FILE_MAP_WRITE, 0, 0, KIB_64 as usize);
+            (s, v)
+        };
+        assert!(!mapped.Value.is_null());
+        let mapped_res = check(mapped.Value);
+        // SAFETY: heap already dropped above.
+        unsafe {
+            UnmapViewOfFile(mapped);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        };
+
+        println!(
+            "OpenExistingHeapFromAddress probe (adapter={}, existing_heaps={}): (opened, ro_buf, uav_buf) plain={plain_res:?}, write_watch={watched_res:?}, mapped_section={mapped_res:?}",
+            host_gpu.caps.adapter_name, host_gpu.caps.existing_heaps
+        );
+        if !host_gpu.caps.existing_heaps {
+            assert!(!plain_res.0);
+        }
+    }
+
+    /// Synthetic Phase 12 before/after benchmark (`--ignored --test-threads=1 --nocapture`):
+    /// compares eager vs lazy host texture creation on 256 x 4 MiB (1 GiB)
+    /// aliased textures (16 used) and measures eviction reclamation across
+    /// 64 x 4 MiB (256 MiB) title-written textures + 10 steady-state cycles.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn bench_phase12_lazy_textures_and_eviction() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mib = |b: i128| b as f64 / (1 << 20) as f64;
+        let commit = || crate::memstat::system_commit().expect("commit").0 as i128;
+        let private = || crate::memstat::process().expect("process").0 as i128;
+        let local = || host_gpu.video_memory().map_or(0, |v| v[0].0 as i128);
+
+        // 1. BEFORE baseline: 256 x 4 MiB (1024x1024 RGBA8) eager D3D12 DEFAULT textures.
+        let (c0, p0, l0) = (commit(), private(), local());
+        let eager_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let eager: Vec<ID3D12Resource> = (0..256)
+            .map(|_| {
+                let mut t: Option<ID3D12Resource> = None;
+                // SAFETY: plain texture creation.
+                unsafe {
+                    host_gpu
+                        .device
+                        .CreateCommittedResource(
+                            &heap,
+                            D3D12_HEAP_FLAG_NONE,
+                            &eager_desc,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            None,
+                            &mut t,
+                        )
+                        .unwrap();
+                }
+                t.unwrap()
+            })
+            .collect();
+        let (c_eager, p_eager, l_eager) = (commit() - c0, private() - p0, local() - l0);
+        drop(eager);
+        // Settle driver cache after eager release.
+        let settle = host_gpu.new_list().unwrap();
+        settle.close();
+        host_gpu.execute(&[&settle]);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // 2. AFTER (Phase 12 lazy): 256 x 4 MiB aliased textures + 256 SRVs, 0 used then 16 used.
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        #[repr(C)]
+        struct ExtendedHeap([u32; 4], [u64; 2]);
+        let hdesc = ExtendedHeap([0, 512, 1, 0], [0, 0]);
+        let mut sheap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                (&raw const hdesc.0).cast(),
+                &heap_iid,
+                &mut sheap
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(sheap);
+        let _host_heap = title_heap.host().expect("host view heap");
+        let start = title_heap.start;
+
+        let (c1, p1, l1) = (commit(), private(), local());
+        let backing = vec![0u8; 64 << 10];
+        let mut lazy_tex = Vec::with_capacity(256);
+        for i in 0..256u64 {
+            let mut tex = null;
+            let desc = ResourceDesc {
+                flags: 1,
+                ..texture(1024, 1024, 28, 1)
+            };
+            assert_eq!(
+                create_at_address(
+                    null,
+                    backing.as_ptr() as u64,
+                    &desc,
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut tex
+                ),
+                S_OK
+            );
+            crate::descriptor::create_srv(null, tex, std::ptr::null(), start + i * 32);
+            lazy_tex.push(tex);
+        }
+        let (c_lazy0, p_lazy0, l_lazy0) = (commit() - c1, private() - p1, local() - l1);
+        let (ht_live0, ht_cnt0, _) = crate::memstat::live(crate::memstat::Kind::HostTexture);
+        let (df_live0, df_cnt0, _) = crate::memstat::live(crate::memstat::Kind::DeferredTexture);
+
+        // Materialize 16 of 256 (64 MiB active working set).
+        for &tex in lazy_tex.iter().take(16) {
+            let _ = host_resource(tex).expect("materialize");
+        }
+        let (c_lazy16, p_lazy16, l_lazy16) = (commit() - c1, private() - p1, local() - l1);
+        let (ht_live16, ht_cnt16, _) = crate::memstat::live(crate::memstat::Kind::HostTexture);
+        for tex in lazy_tex {
+            assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
+        }
+        assert_eq!(slot::<Release>(sheap, 0x10)(sheap), 0);
+
+        // 3. Idle title-written texture eviction: 64 x 4 MiB = 256 MiB materialized -> evicted.
+        let mut evict_tex = Vec::with_capacity(64);
+        for _ in 0..64 {
+            let mut tex = null;
+            let desc = texture(1024, 1024, 28, 1);
+            assert_eq!(
+                create_at_address(
+                    null,
+                    backing.as_ptr() as u64,
+                    &desc,
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut tex
+                ),
+                S_OK
+            );
+            let _ = host_resource(tex).expect("materialize title-written");
+            evict_tex.push(tex);
+        }
+        let ht_before_evict = crate::memstat::live(crate::memstat::Kind::HostTexture);
+        let freed = evict_idle_textures(0);
+        let ht_after_evict = crate::memstat::live(crate::memstat::Kind::HostTexture);
+        for tex in evict_tex {
+            assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
+        }
+
+        let line1 = format!(
+            "phase12-lazy-256x4MiB: BEFORE(eager 256) commit={:+.0}MiB private={:+.0}MiB gpu-local={:+.0}MiB | AFTER(lazy 0/256 used) commit={:+.0}MiB private={:+.0}MiB gpu-local={:+.0}MiB host-tex={}({:.0}MiB) deferred={}({:.0}MiB) | AFTER(lazy 16/256 used) commit={:+.0}MiB private={:+.0}MiB gpu-local={:+.0}MiB host-tex={}({:.0}MiB)",
+            mib(c_eager),
+            mib(p_eager),
+            mib(l_eager),
+            mib(c_lazy0),
+            mib(p_lazy0),
+            mib(l_lazy0),
+            ht_cnt0,
+            mib(ht_live0 as i128),
+            df_cnt0,
+            mib(df_live0 as i128),
+            mib(c_lazy16),
+            mib(p_lazy16),
+            mib(l_lazy16),
+            ht_cnt16,
+            mib(ht_live16 as i128),
+        );
+        let line2 = format!(
+            "phase12-evict-64x4MiB: before-evict host-tex={}({:.0}MiB) -> freed={:.0}MiB -> after-evict host-tex={}({:.0}MiB)",
+            ht_before_evict.1,
+            mib(ht_before_evict.0 as i128),
+            mib(freed as i128),
+            ht_after_evict.1,
+            mib(ht_after_evict.0 as i128),
+        );
+        println!("{line1}");
+        println!("{line2}");
+        crate::memstat::report(&format!("synthetic {line1}"));
+        crate::memstat::report(&format!("synthetic {line2}"));
+        assert_eq!(ht_cnt0, 0);
+        assert_eq!(ht_cnt16, 16);
+        assert!(freed >= 256 << 20);
+        assert_eq!(ht_after_evict.1, 0);
+    }
 }
