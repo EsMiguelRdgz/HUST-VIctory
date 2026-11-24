@@ -912,7 +912,12 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
+    // The size is the title's: a failed allocation returns null (as
+    // documented for the call) rather than ending the process.
+    let Some(mut block) = zeroed(len) else {
+        tracing::warn!(size, "upload memory for a list not allocated");
+        return std::ptr::null_mut();
+    };
     let start = block.as_mut_ptr();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
@@ -925,6 +930,17 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
         .push(block);
     at
 }
+
+/// `len` zero bytes, or `None` if they cannot be allocated.
+fn zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut block = Vec::new();
+    block.try_reserve_exact(len).ok()?;
+    block.resize(len, 0);
+    Some(block)
+}
+
+/// D3D12's limit on render targets bound at once.
+const MAX_TARGETS: u32 = 8;
 
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
@@ -1049,6 +1065,13 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
+        // The count is the title's; more than the API allows is a bad call
+        // (and with one range would allocate that many handles).
+        if count > super::MAX_TARGETS {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(count, "more render targets than D3D12 allows"));
+        }
+        let count = count.min(super::MAX_TARGETS);
         let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
@@ -1353,6 +1376,15 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_sized_upload_allocations_fail_softly() {
+        assert!(zeroed(1 << 60).is_none(), "an impossible size is refused");
+        assert_eq!(zeroed(64).expect("small"), vec![0u8; 64]);
+        // A non-null list is never touched when the allocation fails.
+        let fake = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        assert!(allocate_upload(fake, 1 << 60, 16).is_null());
+    }
     use crate::object::slot;
 
     #[test]

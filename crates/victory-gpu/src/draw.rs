@@ -192,6 +192,19 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// Root constants a slot can hold: far past D3D12's 64 DWORDs for a whole
+/// root signature, so only nonsense offsets (which would allocate up to
+/// 16 GiB) are refused.
+const MAX_ROOT_CONSTANTS: usize = 1 << 16;
+
+/// Where root constants written at `offset` (`len` of them) end, if inside
+/// [`MAX_ROOT_CONSTANTS`].
+fn constants_end(offset: u32, len: usize) -> Option<usize> {
+    (offset as usize)
+        .checked_add(len)
+        .filter(|&end| end <= MAX_ROOT_CONSTANTS)
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -269,7 +282,14 @@ impl State {
             set(roots, slot, Root::Constants(Vec::new()));
         }
         if let Root::Constants(c) = &mut roots[s] {
-            let end = offset as usize + values.len();
+            let Some(end) = constants_end(offset, values.len()) else {
+                once!(
+                    offset,
+                    len = values.len(),
+                    "root constants past any root signature"
+                );
+                return;
+            };
             if c.len() < end {
                 c.resize(end, 0);
             }
@@ -1173,6 +1193,14 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_constant_offsets_are_bounded() {
+        assert_eq!(constants_end(0, 4), Some(4));
+        assert_eq!(constants_end(60, 4), Some(64));
+        assert_eq!(constants_end(u32::MAX, 1), None);
+        assert_eq!(constants_end(MAX_ROOT_CONSTANTS as u32, 1), None);
+    }
     use crate::object::{Iid, release};
 
     const HEAP_IID: Iid = crate::object::guid(
