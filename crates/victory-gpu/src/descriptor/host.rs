@@ -1839,19 +1839,33 @@ mod tests {
         let owner = heap.owned(0).expect("aligned copy kept");
         assert!(owner.kept_by_views());
 
-        // An aligned view of the buffer copy itself needs no keeping.
+        // Buffer-object copies are also kept by slots so pressure reclamation
+        // can safely free idle buffer copies without breaking live descriptors.
         words[10] = base as u32;
         words[11] = (base >> 32) as u32;
         heap.make_at(1, &View::Placed(false, res_desc, words));
-        assert!(heap.owned(1).is_none());
+        let buf_owner = heap.owned(1).expect("buffer copy kept while bound");
+        assert!(buf_owner.kept_by_views());
 
         let weak = Arc::downgrade(&owner);
+        let buf_weak = Arc::downgrade(&buf_owner);
         drop(owner);
-        crate::shadow::unregister(fake_res_id, base); // prunes the aligned map
-        assert!(weak.upgrade().is_some(), "the slot still reads it");
+        drop(buf_owner);
+        crate::shadow::unregister(fake_res_id, base); // prunes buffer and aligned maps
+        assert!(weak.upgrade().is_some(), "slot 0 still reads aligned copy");
+        assert!(
+            buf_weak.upgrade().is_some(),
+            "slot 1 still reads buffer copy"
+        );
         heap.make_null(0);
         assert!(heap.owned(0).is_none());
-        assert!(weak.upgrade().is_none(), "freed once no slot shows it");
+        assert!(weak.upgrade().is_none(), "aligned copy freed once nulled");
+        heap.make_null(1);
+        assert!(heap.owned(1).is_none());
+        assert!(
+            buf_weak.upgrade().is_none(),
+            "buffer copy freed once nulled"
+        );
         crate::host::assert_no_debug_errors(&host_gpu.device);
     }
 }

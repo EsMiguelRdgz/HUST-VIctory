@@ -52,12 +52,11 @@ pub(crate) struct Shadow {
 static TICK: AtomicU64 = AtomicU64::new(1);
 
 impl Shadow {
-    /// Whether descriptors made on this copy must keep it alive: loose
-    /// windows and aligned copies, which [`reclaim`] frees once nothing
-    /// holds them. Copies of buffer objects live until the title releases
-    /// the buffer, as before.
+    /// Whether descriptors made on this copy must keep it alive: buffer-object
+    /// copies, loose windows and aligned copies, all of which can be reclaimed
+    /// once nothing holds them (no list, descriptor slot, or pending GPU write).
     pub(crate) fn kept_by_views(&self) -> bool {
-        matches!(self.kind, Kind::Loose | Kind::Aligned)
+        matches!(self.kind, Kind::Buffer | Kind::Loose | Kind::Aligned)
     }
 
     fn touch(self: &Arc<Self>) -> Arc<Self> {
@@ -583,7 +582,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             len,
         )));
     }
-    entry.shadow.clone()
+    entry.shadow.as_ref().map(Shadow::touch)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -643,12 +642,60 @@ fn reclaim(
     freed
 }
 
+/// Frees idle buffer-object host copies (`BUFFERS`) that no list, descriptor
+/// slot, or pending GPU write currently holds, oldest-used first. Title memory
+/// remains authoritative, so a later `find()` cleanly recreates and refreshes
+/// the copy. Returns bytes freed.
+fn reclaim_buffers(incoming: u64) -> u64 {
+    let mut dropped: Vec<Arc<Shadow>> = Vec::new();
+    let mut freed = 0u64;
+    {
+        let mut map = buffers();
+        let mut idle: Vec<(u64, (u64, usize), u64)> = map
+            .iter()
+            .filter_map(|(&key, entry)| {
+                let s = entry.shadow.as_ref()?;
+                if Arc::strong_count(s) == 1
+                    && s.pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                {
+                    Some((s.used.load(Ordering::Relaxed), key, s.bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        idle.sort_unstable_by_key(|item| item.0);
+        for (_, key, bytes) in idle {
+            if incoming > 0 && freed >= incoming {
+                break;
+            }
+            if let Some(entry) = map.get_mut(&key)
+                && let Some(shadow) = entry.shadow.take()
+            {
+                dropped.push(shadow);
+                freed += bytes;
+                memstat::count(memstat::Event::Reclaimed, 1);
+            }
+        }
+    }
+    drop(dropped);
+    if freed > 0 {
+        memstat::count(memstat::Event::ReclaimedBytes, freed);
+        tracing::debug!(freed, "idle buffer-object host copies freed under pressure");
+    }
+    freed
+}
+
 /// Memory pressure (commit headroom low before an allocation of
-/// `incoming` bytes): frees every idle loose and aligned copy whatever the
-/// budgets, and the snapshot and texture pools; at most once a second, so
-/// a title that keeps allocating near the limit does not thrash. Returns
-/// the bytes freed. Nothing in use is freed: copies a list, a descriptor or
-/// a pending shader write holds stay, as do allocations the title owns.
+/// `incoming` bytes): frees every idle loose, aligned, and buffer-object copy
+/// whatever the budgets, the snapshot and texture pools, and idle placed /
+/// title-written host textures; at most once a second, so a title that keeps
+/// allocating near the limit does not thrash. Returns the bytes freed.
+/// Nothing in use is freed: copies a list, a descriptor or a pending shader
+/// write holds stay, as do allocations the title owns.
 pub(crate) fn relieve_pressure(incoming: u64) -> u64 {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     {
@@ -664,6 +711,7 @@ pub(crate) fn relieve_pressure(incoming: u64) -> u64 {
         let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
         freed += reclaim(&mut map, u64::MAX / 2, 0, 0);
     }
+    freed += reclaim_buffers(incoming);
     freed += drain_snapshot_pool();
     freed += crate::texture::drain_pools();
     freed += crate::resource::evict_idle_textures(incoming);
@@ -1347,6 +1395,53 @@ mod tests {
             println!("{line}");
             memstat::report(&format!("synthetic {line}"));
         }
+        let _ = host_gpu;
+    }
+
+    /// Idle buffer-object shadows (`BUFFERS`) reclaim under pressure while
+    /// shadows held by a caller/descriptor stay alive, and recreating a
+    /// reclaimed buffer refreshes its contents cleanly from title memory.
+    #[test]
+    fn idle_buffer_shadows_reclaim_under_pressure_while_bound_stay_alive() {
+        let Some(host_gpu) = crate::host::host() else {
+            return;
+        };
+        let mut idle_mem = vec![0x42u8; 256 << 10];
+        let mut bound_mem = vec![0x77u8; 256 << 10];
+        let idle_addr = idle_mem.as_mut_ptr() as u64;
+        let bound_addr = bound_mem.as_mut_ptr() as u64;
+        let idle_id = (idle_addr as usize) ^ 0x1111_2222;
+        let bound_id = (bound_addr as usize) ^ 0x3333_4444;
+        register(idle_id, idle_addr, idle_mem.len() as u64);
+        register(bound_id, bound_addr, bound_mem.len() as u64);
+
+        let idle_weak = Arc::downgrade(&find(idle_addr, 256 << 10).expect("idle shadow"));
+        let bound_arc = find(bound_addr, 256 << 10).expect("bound shadow");
+        assert!(idle_weak.upgrade().is_some());
+        assert!(bound_arc.kept_by_views());
+
+        let freed = reclaim_buffers(0);
+        assert!(
+            freed >= 256 << 10,
+            "expected idle buffer shadow freed: {freed}"
+        );
+        assert!(
+            idle_weak.upgrade().is_none(),
+            "idle buffer shadow must be dropped"
+        );
+        assert_eq!(Arc::strong_count(&bound_arc), 2, "bound shadow stays live");
+
+        // Re-requesting the reclaimed buffer recreates and refreshes it cleanly.
+        let recreated = find(idle_addr, 256 << 10).expect("recreated shadow");
+        assert!(recreated.update(idle_addr as usize, 4096) >= 4096);
+        // SAFETY: `[0, 4096)` lies inside the shadow mapping.
+        let got = unsafe { std::slice::from_raw_parts(recreated.data, 16) };
+        assert_eq!(got, &[0x42u8; 16]);
+
+        drop(recreated);
+        drop(bound_arc);
+        unregister(idle_id, idle_addr);
+        unregister(bound_id, bound_addr);
         let _ = host_gpu;
     }
 }

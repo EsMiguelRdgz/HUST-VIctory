@@ -620,6 +620,8 @@ struct Deferred {
     /// Host COM objects referenced by recorded commands (pipelines, root
     /// signatures, descriptor heaps, textures), held alive until list reset.
     kept: Vec<windows::core::IUnknown>,
+    /// Raw COM pointers already present in `kept` (avoids duplicate AddRefs).
+    kept_ptrs: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1076,6 +1078,10 @@ impl HostList {
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
+            // Release excess 4 MiB upload chunks after a peak frame; under
+            // commit pressure release all idle chunks immediately.
+            let keep = usize::from(!crate::memstat::under_pressure(0));
+            scratch.chunks.truncate(keep);
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -1088,10 +1094,15 @@ impl HostList {
         }
     }
 
-    /// Keeps a host COM object referenced by this list alive until reset.
+    /// Keeps a host COM object referenced by this list alive until reset
+    /// (deduplicated per raw COM pointer to avoid redundant refcount churn).
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(unk) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(unk);
+            let ptr = unk.as_raw() as usize;
+            let mut deferred = self.deferred();
+            if deferred.kept_ptrs.insert(ptr) {
+                deferred.kept.push(unk);
+            }
         }
     }
 
@@ -2500,5 +2511,40 @@ mod tests {
         assert!(report.contains("commands 1..3 between its barriers"));
         assert!(report.contains("DrawIndexedInstanced [op 4]"));
         assert!(report.contains("indexed 36x1 [vertex vs, pixel ps]"));
+    }
+
+    /// `HostList::keep` deduplicates repeated COM references and
+    /// `HostList::reset` trims excess 4 MiB scratch upload chunks.
+    #[test]
+    fn host_list_deduplicates_kept_objects_and_trims_scratch_on_reset() {
+        let Some(host_gpu) = host() else {
+            return;
+        };
+        let list = host_gpu.new_list().expect("list");
+        for _ in 0..20 {
+            list.keep(&host_gpu.rtvs);
+        }
+        assert_eq!(
+            list.deferred().kept.len(),
+            1,
+            "kept COM pointers deduplicated"
+        );
+
+        // Allocate across 3 scratch chunks (3 * 4 MiB).
+        assert!(list.scratch(SCRATCH_CHUNK).is_some());
+        assert!(list.scratch(SCRATCH_CHUNK).is_some());
+        assert!(list.scratch(SCRATCH_CHUNK).is_some());
+        assert_eq!(
+            list.scratch.lock().unwrap().chunks.len(),
+            3,
+            "3 chunks allocated"
+        );
+        list.close();
+        list.reset();
+        assert!(
+            list.scratch.lock().unwrap().chunks.len() <= 1,
+            "excess scratch chunks trimmed on reset"
+        );
+        assert!(list.deferred().kept.is_empty());
     }
 }
