@@ -271,6 +271,110 @@ function Read-VictoryTestProbe {
     return [PSCustomObject]@{ Records = $records.ToArray(); Unparsable = $bad }
 }
 
+# Packages whose tests or binaries reach victory-gpu's host device. Its
+# software-adapter switch (VICTORY_D3D12_WARP) works only with the
+# victory-gpu `diagnostics` feature, which each of these packages'
+# `diagnostics` feature enables.
+$script:GpuReachingPackages = @('victory-gpu', 'victory-hle', 'victory')
+
+function Get-VictoryCargoSelection {
+    <#
+    .SYNOPSIS
+        What a cargo command line selects: subcommand, packages (empty =
+        the whole workspace), features, --all-features. Only arguments
+        before `--` (the test binary's own arguments) are read.
+    #>
+    [CmdletBinding()]
+    param([string[]]$Arguments = @())
+    $own = New-Object System.Collections.Generic.List[string]
+    foreach ($a in $Arguments) { if ($a -eq '--') { break }; $own.Add($a) }
+    $sub = $null; $packages = New-Object System.Collections.Generic.List[string]
+    $features = New-Object System.Collections.Generic.List[string]
+    $workspace = $false; $allFeatures = $false
+    for ($i = 0; $i -lt $own.Count; $i++) {
+        $a = $own[$i]
+        $value = $null
+        if ($a -in @('-p', '--package', '-F', '--features') -and $i + 1 -lt $own.Count) { $value = $own[$i + 1] }
+        if ($a -in @('-p', '--package')) { if ($null -ne $value) { $packages.Add($value); $i++ }; continue }
+        if ($a -match '^(--package=|-p)(.+)$') { $packages.Add($Matches[2]); continue }
+        if ($a -in @('-F', '--features')) { if ($null -ne $value) { $value -split '[,\s]+' | Where-Object { $_ } | ForEach-Object { $features.Add($_) }; $i++ }; continue }
+        if ($a -match '^--features=(.+)$') { $Matches[1] -split '[,\s]+' | Where-Object { $_ } | ForEach-Object { $features.Add($_) }; continue }
+        if ($a -in @('--workspace', '--all')) { $workspace = $true; continue }
+        if ($a -eq '--all-features') { $allFeatures = $true; continue }
+        if ($null -eq $sub -and -not $a.StartsWith('-') -and -not $a.StartsWith('+')) { $sub = $a }
+    }
+    return [PSCustomObject]@{
+        Subcommand  = $sub
+        Packages    = $packages.ToArray()
+        Workspace   = ($workspace -or $packages.Count -eq 0)
+        Features    = $features.ToArray()
+        AllFeatures = $allFeatures
+    }
+}
+
+function Get-VictoryCpuOnlyCargoProblem {
+    <#
+    .SYNOPSIS
+        Why a CPU-only synthetic cargo command could still reach a physical
+        GPU, or $null. A command that runs code (test, bench, run, nextest)
+        and selects a package reaching victory-gpu must enable
+        victory-gpu's `diagnostics` feature, or VICTORY_D3D12_WARP is
+        ignored and the host device is the hardware adapter.
+    #>
+    [CmdletBinding()]
+    param([string]$Command, [string[]]$Arguments = @())
+    if ([IO.Path]::GetFileNameWithoutExtension($Command) -ne 'cargo') { return $null }
+    $sel = Get-VictoryCargoSelection -Arguments $Arguments
+    if ($sel.Subcommand -notin @('test', 'bench', 'run', 'nextest', 't', 'r')) { return $null }
+    $reaching = @($sel.Packages | Where-Object { $_ -in $script:GpuReachingPackages })
+    if (-not $sel.Workspace -and $reaching.Count -eq 0) { return $null }
+    if ($sel.AllFeatures) { return $null }
+    $qualified = @($sel.Features | Where-Object { $_ -in @('victory-gpu/diagnostics', 'victory-hle/diagnostics', 'victory/diagnostics') })
+    if ($qualified.Count -gt 0) { return $null }
+    if (-not $sel.Workspace -and $sel.Packages.Count -eq 1 -and $reaching.Count -eq 1 -and $sel.Features -contains 'diagnostics') { return $null }
+    $what = if ($sel.Workspace) { 'the whole workspace' } else { $reaching -join ', ' }
+    return "CPU-only cargo $($sel.Subcommand) of $what without victory-gpu's diagnostics feature: VICTORY_D3D12_WARP would be ignored and victory-gpu would use the hardware adapter. Add --features victory-gpu/diagnostics."
+}
+
+function Get-VictoryAdapterEvidenceProblems {
+    <#
+    .SYNOPSIS
+        CPU-only adapter evidence from probe records: any adapter that is
+        not software is a violation; a probed crate the command ran that
+        left no adapter record is missing evidence.
+    #>
+    [CmdletBinding()]
+    param([object[]]$Records = @(), [string[]]$ExpectedCrates = @())
+    $violations = New-Object System.Collections.Generic.List[string]
+    $missing = New-Object System.Collections.Generic.List[string]
+    foreach ($r in $Records) {
+        if ($r.PSObject.Properties['adapter'] -and $r.PSObject.Properties['software'] -and -not $r.software) {
+            $crate = if ($r.PSObject.Properties['crate']) { $r.crate } else { '?' }
+            $violations.Add("${crate}: $($r.adapter) is not a software adapter")
+        }
+    }
+    foreach ($c in $ExpectedCrates) {
+        $seen = @($Records | Where-Object { $_.PSObject.Properties['crate'] -and $_.crate -eq $c -and $_.PSObject.Properties['adapter'] })
+        if ($seen.Count -eq 0) { $missing.Add("${c}: no adapter evidence") }
+    }
+    return [PSCustomObject]@{ Violations = $violations.ToArray(); Missing = $missing.ToArray() }
+}
+
+function Get-VictoryProbedCrates {
+    <#
+    .SYNOPSIS
+        The crates with an adapter probe test that a cargo test command runs.
+    #>
+    [CmdletBinding()]
+    param([string]$Command, [string[]]$Arguments = @())
+    if ([IO.Path]::GetFileNameWithoutExtension($Command) -ne 'cargo') { return @() }
+    $sel = Get-VictoryCargoSelection -Arguments $Arguments
+    if ($sel.Subcommand -notin @('test', 't')) { return @() }
+    $probed = @('victory-gpu', 'victory-shader')
+    if ($sel.Workspace) { return $probed }
+    return @($sel.Packages | Where-Object { $_ -in $probed })
+}
+
 function Get-VictoryProbeSkips {
     <#
     .SYNOPSIS

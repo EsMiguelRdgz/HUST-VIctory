@@ -121,6 +121,44 @@ $skips = @(Get-VictoryProbeSkips -Records @(
 Assert-That ($skips.Count -eq 2) "probe skips: skip records and unavailable adapters only ($($skips.Count))"
 
 # ---------------------------------------------------------------------------
+Write-Host 'CPU-only adapter selection (victory-gpu honours VICTORY_D3D12_WARP only with diagnostics)'
+$cases = [ordered]@{
+    'test -p victory-gpu'                                                            = $true
+    'test -p victory-shader -p victory-gpu'                                          = $true
+    'test'                                                                           = $true
+    'test --workspace'                                                               = $true
+    'test -p victory-hle'                                                            = $true
+    'run -p victory'                                                                 = $true
+    'test -p victory-gpu --features diagnostics'                                     = $false
+    'test -p victory-shader -p victory-gpu --features victory-gpu/diagnostics'       = $false
+    'test -p victory-shader -p victory-gpu --features=victory-gpu/diagnostics'       = $false
+    'test --workspace --all-features'                                                = $false
+    'test -p victory-hle --features diagnostics'                                     = $false
+    'test -p victory-shader'                                                         = $false
+    'test -p victory-shader -p victory-gpu --features diagnostics'                   = $true
+    'build -p victory-gpu'                                                           = $false
+    'clippy -p victory-gpu --tests'                                                  = $false
+    'test -p victory-shader -- --features victory-gpu/diagnostics'                   = $false
+    'test -p victory-gpu -- --features victory-gpu/diagnostics'                      = $true
+}
+foreach ($k in $cases.Keys) {
+    $refuse = $null -ne (Get-VictoryCpuOnlyCargoProblem -Command 'cargo' -Arguments ($k -split ' '))
+    Assert-That ($refuse -eq $cases[$k]) ("cargo $k -> " + $(if ($cases[$k]) { 'refused' } else { 'allowed' }))
+}
+Assert-That ($null -eq (Get-VictoryCpuOnlyCargoProblem -Command 'powershell.exe' -Arguments @('test', '-p', 'victory-gpu'))) 'non-cargo commands are not cargo-checked'
+$ev = Get-VictoryAdapterEvidenceProblems -ExpectedCrates @('victory-gpu', 'victory-shader') -Records @(
+    [PSCustomObject]@{ probe = 'd3d12-debug-layer'; crate = 'victory-gpu'; adapter = 'Microsoft Basic Render Driver'; software = $true },
+    [PSCustomObject]@{ probe = 'adapter'; crate = 'victory-shader'; label = 'hardware'; adapter = 'Microsoft Basic Render Driver'; software = $true })
+Assert-That (@($ev.Violations).Count -eq 0 -and @($ev.Missing).Count -eq 0) 'software adapters for every probed crate pass'
+$ev = Get-VictoryAdapterEvidenceProblems -ExpectedCrates @('victory-gpu') -Records @(
+    [PSCustomObject]@{ probe = 'd3d12-debug-layer'; crate = 'victory-gpu'; adapter = 'NVIDIA GeForce RTX 3070'; software = $false })
+Assert-That (@($ev.Violations).Count -eq 1) 'a hardware adapter is a violation'
+$ev = Get-VictoryAdapterEvidenceProblems -ExpectedCrates @('victory-gpu', 'victory-shader') -Records @(
+    [PSCustomObject]@{ probe = 'adapter'; crate = 'victory-shader'; label = 'warp'; adapter = 'Microsoft Basic Render Driver'; software = $true })
+Assert-That (@($ev.Missing) -match 'victory-gpu').Count 'a probed crate without adapter evidence is reported'
+Assert-That ((@(Get-VictoryProbedCrates -Command 'cargo' -Arguments @('test', '-p', 'victory-shader', '-p', 'victory-gpu', '--features', 'victory-gpu/diagnostics')) -join ',') -eq 'victory-shader,victory-gpu') 'probed crates follow the package selection'
+
+# ---------------------------------------------------------------------------
 Write-Host 'Script encoding (Windows PowerShell 5.1 reads BOM-less files as ANSI)'
 foreach ($ps in @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'tools') -Recurse -File | Where-Object { $_.Extension -eq '.ps1' })) {
     $bytes = [IO.File]::ReadAllBytes($ps.FullName)
@@ -185,6 +223,23 @@ $out = & $harness -SyntheticCommand 'powershell.exe' -SyntheticArgs @('-NoProfil
     -RepoRoot $RepoRoot -ResultsRoot $results -MaxDurationSeconds 60 -SampleIntervalSeconds 1 -SkipBuild -NoDiscord -TestLabel 'selftest-debug' 6>$null
 $sum = @($out | Where-Object { $null -ne $_ -and $_.PSObject.Properties['RunDirectory'] }) | Select-Object -Last 1
 Assert-That ($null -ne $sum -and $sum.Classification -eq 'DebugLayerNotVerified') "requested debug layer without a probe is not verified ($($sum.Classification))"
+
+# A probe reporting a hardware adapter in a CPU-only run fails the run.
+$hwProbeCmd = "Write-Output 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'; Add-Content -LiteralPath `$env:VICTORY_TEST_PROBE_FILE -Value '{`"probe`":`"adapter`",`"crate`":`"victory-shader`",`"label`":`"hardware`",`"adapter`":`"NVIDIA GeForce RTX 3070`",`"software`":false}'"
+$out = & $harness -SyntheticCommand 'powershell.exe' -SyntheticArgs @('-NoProfile', '-Command', $hwProbeCmd) -SyntheticCpuOnly `
+    -RepoRoot $RepoRoot -ResultsRoot $results -MaxDurationSeconds 60 -SampleIntervalSeconds 1 -SkipBuild -NoDiscord -TestLabel 'selftest-adapter-violation' 6>$null
+$sum = @($out | Where-Object { $null -ne $_ -and $_.PSObject.Properties['RunDirectory'] }) | Select-Object -Last 1
+Assert-That ($null -ne $sum -and $sum.Classification -eq 'CpuOnlyAdapterViolation') "hardware adapter in a CPU-only run fails it ($($sum.Classification))"
+
+$refused = $null
+try {
+    # CPU-only cargo run of victory-gpu without its diagnostics feature: refused before cargo starts.
+    & $harness -SyntheticCommand 'cargo' -SyntheticArgs @('test', '-p', 'victory-gpu', '--', '--test-threads=1') -SyntheticCpuOnly `
+        -RepoRoot $RepoRoot -ResultsRoot $results -SkipBuild -NoDiscord 6>$null | Out-Null
+} catch {
+    $refused = $_.Exception.Message
+}
+Assert-That ($null -ne $refused -and $refused -match 'diagnostics feature') 'CPU-only victory-gpu run without diagnostics refused before execution'
 
 $refused = $null
 try {

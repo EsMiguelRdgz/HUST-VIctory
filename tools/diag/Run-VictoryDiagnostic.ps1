@@ -232,6 +232,12 @@ if ($MinCommitHeadroomGB -lt 5.0 -and $hardwareRun) {
 if ($MinPreLaunchHeadroomGB -lt 10.0 -and $hardwareRun) {
     throw "Hard safety limit: MinPreLaunchHeadroomGB must be at least 10.0 GB for hardware launches."
 }
+# A CPU-only run must not be able to reach a physical GPU: refuse cargo
+# configurations in which victory-gpu would ignore VICTORY_D3D12_WARP.
+if ($isSynthetic -and -not $hardwareRun) {
+    $cpuOnlyProblem = Get-VictoryCpuOnlyCargoProblem -Command $SyntheticCommand -Arguments $SyntheticArgs
+    if ($null -ne $cpuOnlyProblem) { throw "Refusing launch: $cpuOnlyProblem" }
+}
 # Ignored tests include known-defect regressions (WARP only); they never run
 # on the hardware adapter through this harness.
 if ($isSynthetic -and $hardwareRun -and @($SyntheticArgs | Where-Object { $_ -in @('--ignored', '--include-ignored') }).Count -gt 0) {
@@ -662,8 +668,24 @@ if ($EnableDebugLayer) {
     }
 }
 
+# CPU-only runs must prove they stayed on the software adapter.
+$adapterViolations = @()
+$adapterMissing = @()
+if (-not $hardwareRun) {
+    $evidence = Get-VictoryAdapterEvidenceProblems -Records $probe.Records `
+        -ExpectedCrates @(Get-VictoryProbedCrates -Command $SyntheticCommand -Arguments $SyntheticArgs)
+    $adapterViolations = @($evidence.Violations)
+    $adapterMissing = @($evidence.Missing)
+}
+
 if (@($treeRemaining).Count -gt 0) {
     $classification = 'ProcessTreeNotTerminated'
+    $notifyStatus = 'Failure'
+} elseif ($adapterViolations.Count -gt 0) {
+    $classification = 'CpuOnlyAdapterViolation'
+    $notifyStatus = 'Failure'
+} elseif ($adapterMissing.Count -gt 0 -and $classification -eq 'CleanExit') {
+    $classification = 'AdapterNotVerified'
     $notifyStatus = 'Failure'
 } elseif ($testSummary.Failed -gt 0 -and $classification -in @('CleanExit', 'NonZeroExitOrCrash')) {
     $classification = 'TestFailures'
@@ -805,6 +827,8 @@ $summary = [ordered]@{
     DebugLayerRequested   = [bool]$EnableDebugLayer
     DebugLayerByCrate     = $debugVerdict
     ProbeAdapters         = @($probeAdapters)
+    AdapterViolations     = @($adapterViolations)
+    AdapterEvidenceMissing = @($adapterMissing)
     ProbeRecords          = @($probe.Records).Count
     ProbeUnparsable       = $probe.Unparsable
     TreeProcessesSeen     = $knownTree.Count
@@ -851,6 +875,7 @@ $mdLines = @(
     "- **Skipped tests reported through the probe file**: $(if ($probeSkips.Count -gt 0) { ($probeSkips | ForEach-Object { '``' + $_ + '``' }) -join '; ' } else { 'none' })",
     "- **Debug layer** (requested: $([bool]$EnableDebugLayer)): $(($debugVerdict.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', ')",
     "- **Adapters seen by probes**: $(if ($probeAdapters.Count -gt 0) { $probeAdapters -join '; ' } else { 'none recorded' })",
+    "- **CPU-only adapter check**: $(if ($hardwareRun) { 'n/a (hardware run)' } elseif ($adapterViolations.Count -gt 0) { 'VIOLATION: ' + ($adapterViolations -join '; ') } elseif ($adapterMissing.Count -gt 0) { 'NOT VERIFIED: ' + ($adapterMissing -join '; ') } else { 'software adapter only' })",
     "- **Process tree**: $($knownTree.Count) seen; terminated at stop: $(@($treeTerminated).Count); stragglers after exit: $(@($stragglers).Count); still running: $(@($treeRemaining).Count)",
     "",
     "## Progression & Input Evidence",

@@ -85,6 +85,8 @@ if ($null -ne $harness) {
         'synthetic runs are hardware runs unless CPU-only'    = '\$hardwareRun\s*=\s*-not\s+\$isSynthetic\s+-or\s+-not\s+\$SyntheticCpuOnly'
         'hardware preflight gate covers synthetic runs'       = 'if\s*\(\s*\$hardwareRun\s*\)\s*\{[\s\S]*?Get-VictoryPreflightProblems[\s\S]*?\{\s*throw'
         'CPU-only runs forced onto the software adapter'      = "EnvironmentVariables\['VICTORY_D3D12_WARP'\]\s*=\s*'1'"
+        'CPU-only cargo runs that could reach a GPU refused'  = 'Get-VictoryCpuOnlyCargoProblem[^\r\n]*\r?\n\s*if\s*\(\s*\$null\s+-ne\s+\$cpuOnlyProblem\s*\)\s*\{\s*throw'
+        'CPU-only adapter evidence required'                  = "'CpuOnlyAdapterViolation'[\s\S]*?'AdapterNotVerified'"
         'timeout terminates the whole process tree'           = "'MaxDurationReached'\s*\r?\n[^\r\n]*\r?\n\s*\`$stop\s*=\s*Stop-VictoryProcessTree"
         'guard stop terminates the whole process tree'        = "floor\.`"\s*-f[^\r\n]*\r?\n[^\r\n]*\r?\n\s*\`$stop\s*=\s*Stop-VictoryProcessTree"
     }
