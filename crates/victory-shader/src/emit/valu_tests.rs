@@ -933,6 +933,114 @@ fn s_buffer_load_reads_all_dwords_from_structured_srv() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 host ran");
 }
 
+/// Wave A 1A regression (behaviour identified by fxceless/victory-gta6;
+/// independently written). `s_buffer_load_dwordx4` through a descriptor whose
+/// heap index comes from data (a bindless `ResourceHeap` index, so the
+/// translator cannot know the slot's kind) must read the slot's contents
+/// whether the heap holds a raw buffer SRV, a structured buffer SRV or a CBV.
+///
+/// Today the translator lowers every such load through a CBV handle
+/// (`cbufferLoadLegacy` on `(13, 0x1_0000)`), so a buffer SRV in the slot is
+/// not read as a buffer. WARP only: the demonstration does not touch hardware.
+/// Ignored until the 1A fix lands; run it with
+/// `cargo test -p victory-shader -- --ignored --exact
+/// emit::valu_tests::wave_a_1a_bindless_s_buffer_load_reads_srv_and_cbv_slots`.
+#[test]
+#[ignore = "Wave A 1A: known defect (bindless s_buffer_load always reads through a CBV handle)"]
+fn wave_a_1a_bindless_s_buffer_load_reads_srv_and_cbv_slots() {
+    let mut words = vec![
+        s_mov_b32(5, 0x80), // s5 = 0: s[4:5] = the table address
+    ];
+    // s[8:11] = the output UAV at heap index 0 (a constant table offset).
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    // s6 = s0 << 5: the source slot's byte offset, from data.
+    words.push(sop2(0x1E, 6, 0, 0x85));
+    // s[12:15] = the descriptor at that data-dependent heap index.
+    words.extend_from_slice(&[s_load_dwordx4(12, 4)[0], 6 << 25]);
+    // s[16:19] = s_buffer_load_dwordx4 from it at byte offset 0.
+    words.extend_from_slice(&s_buffer_load_dwordx4(16, 12, 0));
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i, sgpr(16 + i))); // v_mov_b32 v[i], s[16+i]
+        words.extend_from_slice(&buffer_store_dword(i, 8, u16::from(i) * 4));
+    }
+    words.push(S_ENDPGM);
+    let shader = lower_cs(&words);
+    // The source descriptor really is data-indexed (bindless): the lowering
+    // passed it the heap guard, as for `a_heap_index_past_the_heap_reads_the_guard_slot`.
+    assert!(
+        shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::ResourceHeap),
+        "the load did not take the data-indexed heap path: {:?}",
+        shader.user_data
+    );
+
+    let want = [0x1111_0001u32, 0x2222_0002, 0x3333_0003, 0x4444_0004];
+    let views = [
+        View::RawUav(4),
+        View::Buffer {
+            data: &want,
+            stride: Stride::Raw,
+        },
+        View::Buffer {
+            data: &want,
+            stride: Stride::Structured(16),
+        },
+        View::Cbv(&want),
+    ];
+    // The CBV slot first: it is the control the current lowering handles.
+    let cases: [(u32, &str); 3] = [(3, "CBV"), (1, "raw SRV"), (2, "structured SRV")];
+
+    let mut wrong = Vec::new();
+    for (slot, what) in cases {
+        // A fresh WARP device per case: a wrong-kind read may remove the
+        // device, which must not hide the other cases' outcomes. No WARP is a
+        // failure, never a silent pass (and never a fallback to hardware).
+        let host = Host::new(true)
+            .unwrap_or_else(|e| panic!("no SM 6.6 WARP device; the regression did not run: {e}"));
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("warp: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => [slot, 0, 0, 0][u.dword as usize],
+                (RootType::Table, 1) => 0,
+                (root, _) => super::host::guard(root, views.len(), 0)
+                    .unwrap_or_else(|| panic!("unexpected user data {:?}", (root, u.slot))),
+            };
+        }
+        let got = match host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        ) {
+            Ok(got) => got,
+            Err(e) => {
+                eprintln!("1A warp slot {slot} ({what}): dispatch failed: {e}");
+                wrong.push(format!("{what} (slot {slot}): dispatch failed: {e}"));
+                continue;
+            }
+        };
+        let row: [u32; 4] = got[0][..4].try_into().expect("4 dwords");
+        eprintln!("1A warp slot {slot} ({what}): got {row:08x?} want {want:08x?}");
+        if row != want {
+            wrong.push(format!("{what} (slot {slot}): got {row:08x?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "bindless s_buffer_load read the wrong data from: {}",
+        wrong.join("; ")
+    );
+}
+
 /// The adapter behind a test host device, and whether it is software.
 fn adapter_of(host: &Host) -> Option<(String, bool)> {
     use windows::Win32::Graphics::Dxgi::{
