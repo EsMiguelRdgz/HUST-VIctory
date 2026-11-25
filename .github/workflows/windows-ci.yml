@@ -43,7 +43,8 @@ env:
   RUST_BACKTRACE: "1"
   # Keep test parallelism modest on the 4-vCPU hosted image.
   RUST_TEST_THREADS: "2"
-  LOG_DIR: ${{ github.workspace }}\ci-logs
+  # LOG_DIR is set by the first step to $RUNNER_TEMP\ci-logs: outside the
+  # checkout, where untracked logs would fail xtask's repository_passes_policy.
 
 jobs:
   windows:
@@ -62,6 +63,8 @@ jobs:
 
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         run: |
+          $env:LOG_DIR = Join-Path $env:RUNNER_TEMP 'ci-logs'
+          "LOG_DIR=$env:LOG_DIR" >> $env:GITHUB_ENV
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
           rustup --version
           # Installs exactly the channel, components and target named in rust-toolchain.toml.
@@ -280,7 +283,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-ci-logs-${{ github.run_id }}
-          path: ci-logs/
+          path: ${{ runner.temp }}/ci-logs/
           retention-days: 14
           if-no-files-found: warn
 
