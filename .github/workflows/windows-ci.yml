@@ -245,7 +245,10 @@ jobs:
           VICTORY_WARP: "1"
           VICTORY_D3D12_WARP: "1"
         run: |
-          cargo test --workspace 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\test-workspace.log"
+          # One test thread: victory-gpu's shadow/reclaim tests share
+          # process-wide state and race in parallel (as the shader-gpu scope and
+          # progress.md already run them). --no-fail-fast: every crate reports.
+          cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\test-workspace.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build diagnostic executable
