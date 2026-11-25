@@ -97,6 +97,59 @@ mod wave;
 #[cfg(test)]
 mod wave64_tests;
 
+/// Test-only reports for the diagnostic harness, appended as JSON lines to
+/// the file named by `VICTORY_TEST_PROBE_FILE` (set by
+/// `tools/diag/Run-VictoryDiagnostic.ps1`; nothing when unset).
+#[cfg(test)]
+pub(crate) mod test_probe {
+    use std::io::Write;
+
+    /// `text` as a JSON string literal.
+    pub(crate) fn json(text: &str) -> String {
+        let mut out = String::with_capacity(text.len() + 2);
+        out.push('"');
+        for c in text.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// Appends one line to the probe file, if the harness asked for one.
+    pub(crate) fn append(line: &str) {
+        let Some(path) = std::env::var_os("VICTORY_TEST_PROBE_FILE") else {
+            return;
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("VICTORY_TEST_PROBE_FILE is not writable");
+        writeln!(file, "{line}").expect("write the test probe");
+    }
+
+    /// A test returning early because a dependency is unavailable: says so
+    /// on stderr and, under the harness, in the probe file (cargo hides the
+    /// stderr of passing tests), so the pass is never mistaken for coverage.
+    pub(crate) fn skip(reason: &str) {
+        let test = std::thread::current()
+            .name()
+            .unwrap_or("unknown")
+            .to_owned();
+        eprintln!("{reason}; skipped");
+        append(&format!(
+            r#"{{"probe":"skip","crate":"victory-shader","test":{},"reason":{}}}"#,
+            json(&test),
+            json(reason)
+        ));
+    }
+}
+
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
@@ -548,7 +601,7 @@ mod tests {
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
         let Ok(host) = super::host::Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
+            super::test_probe::skip("no SM 6.6 device");
             return;
         };
         let ps = super::HostShader {
@@ -603,7 +656,7 @@ mod tests {
         let mut c = constant_color();
         let path = super::validator::Validator::default_path();
         let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
+            super::test_probe::skip("no dxil.dll");
             return;
         };
         let ours = c[4..20].to_vec();

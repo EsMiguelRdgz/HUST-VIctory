@@ -100,6 +100,18 @@ jobs:
           ./tools/ci/Test-HardwareSafety.ps1 -RepoRoot $env:GITHUB_WORKSPACE 2>&1 | Tee-Object -FilePath "$env:LOG_DIR\safety.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Diagnostic harness self-test (CPU only, Windows PowerShell 5.1)
+        if: ${{ !cancelled() }}
+        shell: powershell
+        run: |
+          # The home runner uses Windows PowerShell 5.1, so test there too.
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\diag\Test-VictoryDiagnostic.ps1 -RepoRoot $env:GITHUB_WORKSPACE |
+            Tee-Object -FilePath "$env:LOG_DIR\harness-selftest.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\ci\Test-HardwareSafety.ps1 -RepoRoot $env:GITHUB_WORKSPACE |
+            Tee-Object -FilePath "$env:LOG_DIR\safety-ps51.log"
+          exit $LASTEXITCODE
+
       - name: PowerShell syntax check (tools/)
         if: ${{ !cancelled() }}
         run: |
@@ -250,7 +262,7 @@ jobs:
           $s.Add("| Log | Result lines |")
           $s.Add("|---|---|")
           foreach ($f in Get-ChildItem $env:LOG_DIR -Filter *.log -ErrorAction SilentlyContinue | Sort-Object Name) {
-            $hits = @(Select-String -LiteralPath $f.FullName -Pattern '^test result:|asset policy:|hardware safety check:|PowerShell parse errors:|changed files needing rustfmt|^warning: .* generated \d+ warning|^error(\[|:)|victory\.exe:' |
+            $hits = @(Select-String -LiteralPath $f.FullName -Pattern '^test result:|asset policy:|hardware safety check:|diagnostic harness self-test:|PowerShell parse errors:|changed files needing rustfmt|^warning: .* generated \d+ warning|^error(\[|:)|victory\.exe:' |
               ForEach-Object { $_.Line.Trim() } | Select-Object -First 12)
             $s.Add("| ``$($f.Name)`` | $(($hits | ForEach-Object { $_ -replace '\|','/' }) -join '<br>') |")
           }

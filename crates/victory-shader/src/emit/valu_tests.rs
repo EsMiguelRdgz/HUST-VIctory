@@ -177,7 +177,7 @@ fn run_cases(
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+            super::test_probe::skip(&format!("no SM 6.6 {label} device"));
             continue;
         };
         let (root, pso) = host
@@ -915,7 +915,7 @@ fn s_buffer_load_reads_all_dwords_from_structured_srv() {
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+            super::test_probe::skip(&format!("no SM 6.6 {label} device"));
             continue;
         };
         let (root, pso) = host
@@ -931,4 +931,60 @@ fn s_buffer_load_reads_all_dwords_from_structured_srv() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 host ran");
+}
+
+/// The adapter behind a test host device, and whether it is software.
+fn adapter_of(host: &Host) -> Option<(String, bool)> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
+        IDXGIFactory4,
+    };
+    // SAFETY: plain adapter queries on a live device.
+    unsafe {
+        let luid = host.device.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        let end = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        Some((
+            String::from_utf16_lossy(&desc.Description[..end]),
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        ))
+    }
+}
+
+/// Reports the adapters the GPU tests of this crate run on, for the
+/// diagnostic harness (`VICTORY_TEST_PROBE_FILE`). This crate's test host
+/// never enables the D3D12 debug layer; the probe says so explicitly
+/// (`supported: false`) instead of letting a debug-layer run look covered.
+#[test]
+fn probe_reports_adapters_and_debug_layer_support() {
+    use super::test_probe::{append, json};
+    let requested = std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+    if std::env::var_os("VICTORY_TEST_PROBE_FILE").is_none() {
+        return; // nothing to report to outside the harness
+    }
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let line = match Host::new(warp) {
+            Ok(host) => {
+                let (name, software) = adapter_of(&host).unwrap_or(("unknown".into(), false));
+                format!(
+                    r#"{{"probe":"adapter","crate":"victory-shader","label":"{label}","adapter":{},"software":{software}}}"#,
+                    json(&name)
+                )
+            }
+            Err(e) => format!(
+                r#"{{"probe":"adapter","crate":"victory-shader","label":"{label}","unsupported":{}}}"#,
+                json(&e)
+            ),
+        };
+        append(&line);
+    }
+    append(&format!(
+        r#"{{"probe":"d3d12-debug-layer","crate":"victory-shader","supported":false,"requested":{requested},"active":false,"note":"the victory-shader test host does not enable the D3D12 debug layer"}}"#
+    ));
 }

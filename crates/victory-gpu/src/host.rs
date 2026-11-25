@@ -3756,9 +3756,57 @@ pub(crate) fn warp_device() -> Option<ID3D12Device> {
     }
 }
 
+/// Appends one JSON line for the diagnostic harness to the file named by
+/// `VICTORY_TEST_PROBE_FILE` (set by `tools/diag/Run-VictoryDiagnostic.ps1`);
+/// nothing when it is unset.
+#[cfg(test)]
+pub(crate) fn write_test_probe(line: &str) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("VICTORY_TEST_PROBE_FILE") else {
+        return;
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("VICTORY_TEST_PROBE_FILE is not writable");
+    writeln!(file, "{line}").expect("write the test probe");
+}
+
+/// `text` as a JSON string literal.
+#[cfg(test)]
+pub(crate) fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Whether this test process asked the host device for the debug layer: the
+/// same condition `create` applies.
+#[cfg(test)]
+pub(crate) fn debug_layer_requested() -> bool {
+    cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some()
+}
+
 #[cfg(test)]
 pub(crate) fn assert_no_debug_errors(device: &ID3D12Device) {
     let Ok(queue) = device.cast::<ID3D12InfoQueue>() else {
+        // Without the debug layer there is nothing to check; when it was
+        // requested, its absence must not read as "no errors".
+        assert!(
+            !debug_layer_requested(),
+            "VICTORY_D3D12_DEBUG is set but the device has no D3D12 debug layer \
+             (ID3D12InfoQueue): its errors cannot be checked"
+        );
         return;
     };
     let mut errors = Vec::new();
@@ -3794,6 +3842,49 @@ pub(crate) fn assert_no_debug_errors(device: &ID3D12Device) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reports what the host device really is, for the diagnostic harness:
+    /// the adapter (and whether it is software) and whether the debug layer
+    /// is active. When the layer was requested it must be active, so a run
+    /// "with the debug layer" can never silently run without it.
+    #[test]
+    fn probe_reports_adapter_and_debug_layer() {
+        let requested = debug_layer_requested();
+        let Some(host) = host() else {
+            write_test_probe(&format!(
+                r#"{{"probe":"d3d12-debug-layer","crate":"victory-gpu","supported":false,"requested":{requested},"active":false,"note":"no host device"}}"#
+            ));
+            // Every test needing the host device returns early (a silent pass).
+            write_test_probe(
+                r#"{"probe":"skip","crate":"victory-gpu","test":"(tests using the host device)","reason":"no host device"}"#,
+            );
+            assert!(
+                !requested,
+                "the debug layer was requested but there is no host device"
+            );
+            return;
+        };
+        let active = host.device.cast::<ID3D12InfoQueue>().is_ok();
+        // SAFETY: plain adapter queries on a live device.
+        let (name, software) = unsafe { adapter_info(&host.device) }
+            .map_or(("unknown".to_owned(), false), |(n, _, _, _, s)| (n, s));
+        write_test_probe(&format!(
+            r#"{{"probe":"d3d12-debug-layer","crate":"victory-gpu","supported":true,"requested":{requested},"active":{active},"adapter":{},"software":{software}}}"#,
+            json_string(&name)
+        ));
+        if requested {
+            assert!(
+                active,
+                "VICTORY_D3D12_DEBUG is set but the D3D12 debug layer is not active on the host device ({name})"
+            );
+        }
+    }
+
+    #[test]
+    fn json_strings_are_escaped() {
+        assert_eq!(json_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(json_string("x\ny"), r#""x\u000ay""#);
+    }
 
     #[test]
     fn video_memory_reports_a_local_budget() {
